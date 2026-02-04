@@ -26,10 +26,12 @@ from pathlib import Path
 from typing import Optional, Set
 
 from flask import Flask, jsonify
+from flask_cors import CORS
 
 import getvidyt  # make sure this is installed/importable
 
 app = Flask(__name__)
+CORS(app)  # Enable CORS for browser extension
 
 CHECK_FILE = Path("./archive.txt").expanduser().resolve()
 

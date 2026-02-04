@@ -7,10 +7,12 @@ from pathlib import Path
 from typing import Optional, Set
 
 from flask import Flask, jsonify
+from flask_cors import CORS
 
 import getvidyt  # must be importable in this environment
 
 app = Flask(__name__)
+CORS(app)  # Enable CORS for browser extension
 
 # Archive lines look like: "youtube <id>"
 CHECK_FILE = Path("./archive.txt").expanduser().resolve()
