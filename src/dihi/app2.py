@@ -129,6 +129,18 @@ def api_youtube_get(video_id: str):
     )
 
 
+@app.get("/api/youtube/status/<string:video_id>")
+def api_youtube_status(video_id: str):
+    vid = _normalize_id(video_id)
+    if not vid:
+        return jsonify(error="empty id"), 400
+
+    with _lock:
+        downloading = vid in _active_downloads
+
+    return jsonify(downloading=bool(downloading), id=vid)
+
+
 @app.get("/health")
 def health():
     return jsonify(
