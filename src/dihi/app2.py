@@ -7,20 +7,23 @@ import threading
 from pathlib import Path
 from typing import Optional, Set
 
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 from flask_cors import CORS
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 
 import getvidyt  # must be importable in this environment
 
 app = Flask(__name__)
+CORS(app)  # Allow all origins
 
-# CORS: Restrict to trusted origins
-CORS(app, origins=[
-    "https://www.youtube.com",
-    "https://youtube.com",
-    "chrome-extension://*",
-    "moz-extension://*",
-])
+# Rate limiting per IP address
+limiter = Limiter(
+    get_remote_address,
+    app=app,
+    default_limits=["100 per minute"],
+    storage_uri="memory://",
+)
 
 # Validate YouTube video IDs (11 chars: alphanumeric, underscore, dash)
 YOUTUBE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
@@ -104,6 +107,7 @@ def _download_worker(video_id: str) -> None:
 
 
 @app.get("/api/youtube/<string:video_id>")
+@limiter.limit("60 per minute")
 def api_youtube_check(video_id: str):
     """
     GET /api/youtube/<id>
@@ -121,6 +125,7 @@ def api_youtube_check(video_id: str):
 
 
 @app.post("/api/youtube/get/<string:video_id>")
+@limiter.limit("10 per minute")
 def api_youtube_get(video_id: str):
     """
     POST /api/youtube/get/<id>
@@ -153,6 +158,7 @@ def api_youtube_get(video_id: str):
 
 
 @app.get("/api/youtube/status/<string:video_id>")
+@limiter.limit("60 per minute")
 def api_youtube_status(video_id: str):
     vid = _normalize_id(video_id)
     if not vid:
@@ -165,6 +171,7 @@ def api_youtube_status(video_id: str):
 
 
 @app.get("/health")
+@limiter.limit("30 per minute")
 def health():
     return jsonify(
         ok=True,
