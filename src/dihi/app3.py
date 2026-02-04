@@ -21,7 +21,6 @@ _cached_ids: Set[str] = set()
 
 _active_downloads: Set[str] = set()  # prevent spamming duplicate downloads
 
-
 def _normalize_id(raw: str) -> str:
     return (raw or "").strip()
 
