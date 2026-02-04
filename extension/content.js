@@ -2,6 +2,7 @@
 // Detects video ID changes and notifies the background service worker
 
 let lastVideoId = null;
+let lastUrl = window.location.href;
 
 // Extract video ID from current URL
 function extractVideoId() {
@@ -25,41 +26,103 @@ function extractVideoId() {
   return null;
 }
 
-// Check for video ID changes
+// Debounce function to prevent excessive API calls
+function debounce(func, wait) {
+  let timeout;
+  return function executedFunction(...args) {
+    const later = () => {
+      clearTimeout(timeout);
+      func(...args);
+    };
+    clearTimeout(timeout);
+    timeout = setTimeout(later, wait);
+  };
+}
+
+// Check for video ID changes and notify background
 function checkVideoChange() {
+  const currentUrl = window.location.href;
   const videoId = extractVideoId();
 
-  if (videoId && videoId !== lastVideoId) {
-    lastVideoId = videoId;
+  // Check if URL or video ID changed
+  if (currentUrl !== lastUrl || (videoId && videoId !== lastVideoId)) {
+    lastUrl = currentUrl;
 
-    // Notify background script of video change
-    chrome.runtime.sendMessage({
-      type: 'VIDEO_CHANGED',
-      videoId: videoId
-    }).catch(() => {
-      // Ignore errors if background script isn't ready
-    });
+    if (videoId !== lastVideoId) {
+      lastVideoId = videoId;
+
+      // Notify background script of video change
+      chrome.runtime.sendMessage({
+        type: 'VIDEO_CHANGED',
+        videoId: videoId,
+        url: currentUrl
+      }).catch(() => {
+        // Ignore errors if background script isn't ready
+      });
+    }
   }
 }
+
+// Debounced version for observers
+const debouncedCheck = debounce(checkVideoChange, 100);
 
 // Initial check
 checkVideoChange();
 
-// YouTube is a SPA, so we need to watch for URL changes
-// Use MutationObserver to detect navigation
-const observer = new MutationObserver(() => {
-  checkVideoChange();
+// YouTube is a SPA, so we need multiple detection methods
+
+// 1. MutationObserver on the document body for DOM changes
+const bodyObserver = new MutationObserver(() => {
+  debouncedCheck();
 });
 
-// Observe the title element for changes (indicates page navigation)
-observer.observe(document.querySelector('title') || document.head, {
-  subtree: true,
-  characterData: true,
-  childList: true
+bodyObserver.observe(document.body, {
+  childList: true,
+  subtree: true
 });
 
-// Also listen for popstate events
+// 2. Observe the title element for changes
+const titleElement = document.querySelector('title');
+if (titleElement) {
+  const titleObserver = new MutationObserver(() => {
+    debouncedCheck();
+  });
+
+  titleObserver.observe(titleElement, {
+    subtree: true,
+    characterData: true,
+    childList: true
+  });
+}
+
+// 3. Listen for popstate events (browser back/forward)
 window.addEventListener('popstate', checkVideoChange);
 
-// Listen for YouTube's custom navigation events
+// 4. Listen for YouTube's custom navigation events
 window.addEventListener('yt-navigate-finish', checkVideoChange);
+window.addEventListener('yt-navigate-start', checkVideoChange);
+window.addEventListener('yt-page-data-updated', checkVideoChange);
+
+// 5. Intercept history API to catch programmatic navigation
+const originalPushState = history.pushState;
+const originalReplaceState = history.replaceState;
+
+history.pushState = function(...args) {
+  originalPushState.apply(this, args);
+  setTimeout(checkVideoChange, 0);
+};
+
+history.replaceState = function(...args) {
+  originalReplaceState.apply(this, args);
+  setTimeout(checkVideoChange, 0);
+};
+
+// 6. Periodic check as a fallback (every 2 seconds)
+setInterval(checkVideoChange, 2000);
+
+// 7. Check on visibility change (when tab becomes visible)
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') {
+    checkVideoChange();
+  }
+});
