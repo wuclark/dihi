@@ -1,4 +1,6 @@
 brotli==1.2.0
+flask
+flask-cors
 certifi==2026.1.4
 cffi==2.0.0
 charset-normalizer==3.4.4
