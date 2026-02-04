@@ -1,5 +1,5 @@
 // Default API URL
-const DEFAULT_API_URL = 'http://localhost:5000';
+const DEFAULT_API_URL = 'https://dihi.i.apiskpis.com';
 
 // DOM elements
 const youtubeContent = document.getElementById('youtube-content');
