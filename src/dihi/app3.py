@@ -2,15 +2,34 @@
 from __future__ import annotations
 
 import os
+import re
 import threading
 from pathlib import Path
 from typing import Optional, Set
 
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
+from flask_cors import CORS
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 
 import getvidyt  # must be importable in this environment
 
 app = Flask(__name__)
+CORS(app)  # Allow all origins
+
+# Rate limiting per IP address
+limiter = Limiter(
+    get_remote_address,
+    app=app,
+    default_limits=["100 per minute"],
+    storage_uri="memory://",
+)
+
+# Validate YouTube video IDs (11 chars: alphanumeric, underscore, dash)
+YOUTUBE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
+
+# Max concurrent downloads to prevent resource exhaustion
+MAX_CONCURRENT_DOWNLOADS = 5
 
 # Archive lines look like: "youtube <id>"
 CHECK_FILE = Path("./archive.txt").expanduser().resolve()
@@ -21,8 +40,13 @@ _cached_ids: Set[str] = set()
 
 _active_downloads: Set[str] = set()  # prevent spamming duplicate downloads
 
-def _normalize_id(raw: str) -> str:
-    return (raw or "").strip()
+
+def _normalize_id(raw: str) -> Optional[str]:
+    """Normalize and validate YouTube video ID."""
+    vid = (raw or "").strip()
+    if not vid or not YOUTUBE_ID_RE.match(vid):
+        return None
+    return vid
 
 
 def _parse_archive_line(line: str) -> Optional[str]:
@@ -83,6 +107,7 @@ def _download_worker(video_id: str) -> None:
 
 
 @app.get("/api/youtube/<string:video_id>")
+@limiter.limit("60 per minute")
 def api_youtube_check(video_id: str):
     """
     GET /api/youtube/<id>
@@ -90,7 +115,7 @@ def api_youtube_check(video_id: str):
     """
     vid = _normalize_id(video_id)
     if not vid:
-        return jsonify(error="empty id"), 400
+        return jsonify(error="invalid video id"), 400
 
     _ensure_cache()
     with _lock:
@@ -100,6 +125,7 @@ def api_youtube_check(video_id: str):
 
 
 @app.post("/api/youtube/get/<string:video_id>")
+@limiter.limit("10 per minute")
 def api_youtube_get(video_id: str):
     """
     POST /api/youtube/get/<id>
@@ -112,11 +138,14 @@ def api_youtube_get(video_id: str):
     """
     vid = _normalize_id(video_id)
     if not vid:
-        return jsonify(ok=False, error="empty id"), 400
+        return jsonify(ok=False, error="invalid video id"), 400
 
     with _lock:
         already_running = vid in _active_downloads
         if not already_running:
+            # Check max concurrent downloads limit
+            if len(_active_downloads) >= MAX_CONCURRENT_DOWNLOADS:
+                return jsonify(ok=False, error="too many concurrent downloads"), 429
             _active_downloads.add(vid)
             threading.Thread(target=_download_worker, args=(vid,), daemon=True).start()
 
@@ -128,14 +157,27 @@ def api_youtube_get(video_id: str):
     )
 
 
+@app.get("/api/youtube/status/<string:video_id>")
+@limiter.limit("60 per minute")
+def api_youtube_status(video_id: str):
+    vid = _normalize_id(video_id)
+    if not vid:
+        return jsonify(error="invalid video id"), 400
+
+    with _lock:
+        downloading = vid in _active_downloads
+
+    return jsonify(downloading=bool(downloading), id=vid)
+
+
 @app.get("/health")
+@limiter.limit("30 per minute")
 def health():
     return jsonify(
         ok=True,
-        file=str(CHECK_FILE),
-        exists=CHECK_FILE.exists(),
-        cached_ids=len(_cached_ids),
-        active_downloads_count=len(_active_downloads),
+        archive_exists=CHECK_FILE.exists(),
+        active_downloads=len(_active_downloads),
+        max_concurrent=MAX_CONCURRENT_DOWNLOADS,
     )
 
 
@@ -143,4 +185,3 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000"))
     # threaded=True allows concurrent requests while a download thread runs
     app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
-
