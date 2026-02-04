@@ -58,9 +58,13 @@ def build_ydl_opts(
         "nooverwrites": True,
         "continuedl": True,
         "concurrent_fragment_downloads": 8,
-        "retries": math.inf,           # Python API expects numeric, not "infinite"
-        "fragment_retries": math.inf,
+        #"retries": math.inf,           # Python API expects numeric, not "infinite"
+        "retries": 10,           # Python API expects numeric, not "infinite"
+        #"fragment_retries": math.inf,
+        "fragment_retries": 10,
         "download_archive": str(archive_path),
+
+        "retry_sleep_functions": {"http": lambda n: min(60, 2 ** n)},
 
         # --- Delay between downloads ---
         "sleep_interval": 5,
@@ -96,16 +100,19 @@ def build_ydl_opts(
         "outtmpl": "%(id)s/%(uploader)s.%(playlist_title,channel)s.%(upload_date)s - %(title)s [%(id)s].%(ext)s",
     }
 
+    cookies_browser = True
     if cookies_browser:
         # In yt-dlp Python API, cookiesfrombrowser can be:
         #   "firefox"
         # or ("firefox", {"profile": "default-release"})
-        ydl_opts["cookiesfrombrowser"] = cookies_browser
-
+        #ydl_opts["cookiesfrombrowser"] = cookies_browser
+        ydl_opts.update({"cookiefile": "cookies.txt"})
     if not no_js:
         # Your yt-dlp build expects dict {runtime: {config}}
-        ydl_opts["js_runtimes"] = {"node": {}}
-
+        #ydl_opts["js_runtimes"] = {"node": {}}
+        #ydl_opts["js_runtimes"] = {"deno": {"path": "deno"}}
+        ydl_opts["js_runtimes"] = {"deno": {"path": "./venv/bin/deno/bin/deno"}}
+        ydl_opts["remote_components"] = ["ejs:github", "ejs:npm"]
     if extra_opts:
         # Allow caller to override anything (format, outtmpl, paths, etc.)
         ydl_opts.update(extra_opts)
