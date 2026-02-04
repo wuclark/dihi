@@ -21,6 +21,7 @@ Notes:
 from __future__ import annotations
 
 import os
+import re
 import threading
 from pathlib import Path
 from typing import Optional, Set
@@ -31,7 +32,20 @@ from flask_cors import CORS
 import getvidyt  # make sure this is installed/importable
 
 app = Flask(__name__)
-CORS(app)  # Enable CORS for browser extension
+
+# CORS: Restrict to trusted origins
+CORS(app, origins=[
+    "https://www.youtube.com",
+    "https://youtube.com",
+    "chrome-extension://*",
+    "moz-extension://*",
+])
+
+# Validate YouTube video IDs (11 chars: alphanumeric, underscore, dash)
+YOUTUBE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
+
+# Max concurrent downloads to prevent resource exhaustion
+MAX_CONCURRENT_DOWNLOADS = 5
 
 CHECK_FILE = Path("./archive.txt").expanduser().resolve()
 
@@ -41,8 +55,12 @@ _cached_ids: Set[str] = set()          # IDs from lines: "youtube <id>"
 _active_downloads: Set[str] = set()    # IDs currently downloading
 
 
-def _normalize_id(raw: str) -> str:
-    return (raw or "").strip()
+def _normalize_id(raw: str) -> Optional[str]:
+    """Normalize and validate YouTube video ID."""
+    vid = (raw or "").strip()
+    if not vid or not YOUTUBE_ID_RE.match(vid):
+        return None
+    return vid
 
 
 def _parse_archive_line(line: str) -> Optional[str]:
@@ -99,7 +117,7 @@ def _download_worker(video_id: str) -> None:
 def api_youtube_check(video_id: str):
     vid = _normalize_id(video_id)
     if not vid:
-        return jsonify(error="empty id"), 400
+        return jsonify(error="invalid video id"), 400
 
     _ensure_cache()
     with _lock:
@@ -117,11 +135,14 @@ def api_youtube_get(video_id: str):
     """
     vid = _normalize_id(video_id)
     if not vid:
-        return jsonify(ok=False, error="empty id"), 400
+        return jsonify(ok=False, error="invalid video id"), 400
 
     with _lock:
         already_running = vid in _active_downloads
         if not already_running:
+            # Check max concurrent downloads limit
+            if len(_active_downloads) >= MAX_CONCURRENT_DOWNLOADS:
+                return jsonify(ok=False, error="too many concurrent downloads"), 429
             _active_downloads.add(vid)
             threading.Thread(target=_download_worker, args=(vid,), daemon=True).start()
 
@@ -132,7 +153,7 @@ def api_youtube_get(video_id: str):
 def api_youtube_status(video_id: str):
     vid = _normalize_id(video_id)
     if not vid:
-        return jsonify(error="empty id"), 400
+        return jsonify(error="invalid video id"), 400
 
     with _lock:
         downloading = vid in _active_downloads
@@ -144,10 +165,9 @@ def api_youtube_status(video_id: str):
 def health():
     return jsonify(
         ok=True,
-        file=str(CHECK_FILE),
-        exists=CHECK_FILE.exists(),
-        cached_ids=len(_cached_ids),
-        active_downloads_count=len(_active_downloads),
+        archive_exists=CHECK_FILE.exists(),
+        active_downloads=len(_active_downloads),
+        max_concurrent=MAX_CONCURRENT_DOWNLOADS,
     )
 
 
