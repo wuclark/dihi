@@ -32,14 +32,7 @@ from flask_cors import CORS
 import getvidyt  # make sure this is installed/importable
 
 app = Flask(__name__)
-
-# CORS: Restrict to trusted origins
-CORS(app, origins=[
-    "https://www.youtube.com",
-    "https://youtube.com",
-    "chrome-extension://*",
-    "moz-extension://*",
-])
+CORS(app)  # Allow all origins
 
 # Validate YouTube video IDs (11 chars: alphanumeric, underscore, dash)
 YOUTUBE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
