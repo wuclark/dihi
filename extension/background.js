@@ -1,7 +1,7 @@
 // Background service worker
 // Handles badge updates and API communication
 
-const DEFAULT_API_URL = 'http://localhost:5000';
+const DEFAULT_API_URL = 'https://dihi.i.apiskpis.com';
 
 // Badge colors
 const BADGE_COLORS = {
