@@ -209,6 +209,3 @@ __marimo__/
 
 
 merged/
-
-# Sensitive files - never commit
-**/cookies.txt
