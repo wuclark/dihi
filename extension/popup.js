@@ -232,21 +232,9 @@ function startStatusPolling() {
         const data = await response.json();
 
         if (!data.downloading) {
-          // Download finished
+          // Download finished, check archive status
           clearInterval(statusPollInterval);
-
-          if (data.in_archive) {
-            // Successfully archived
-            setStatus('green', 'In archive');
-            showMessage('Download completed successfully', 'success');
-          } else if (data.result === 'failed') {
-            // Download failed
-            setStatus('red', 'Not in archive');
-            showMessage('Download failed', 'error');
-          } else {
-            // Unknown state, check archive status
-            await checkStatus();
-          }
+          await checkStatus();
         }
       }
     } catch {

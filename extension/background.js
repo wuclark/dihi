@@ -92,22 +92,10 @@ function startDownloadPolling(tabId, videoId) {
         const data = await response.json();
 
         if (!data.downloading) {
-          // Download finished - use in_archive from status response
+          // Download finished - check archive status
           stopDownloadPolling(tabId);
           clearCachedStatus(videoId);
-
-          if (data.in_archive) {
-            // Successfully archived
-            await updateBadge(tabId, 'green');
-            setCachedStatus(videoId, 'green');
-          } else if (data.result === 'failed') {
-            // Download failed
-            await updateBadge(tabId, 'red');
-            setCachedStatus(videoId, 'red');
-          } else {
-            // Unknown state, refresh from archive endpoint
-            await checkVideoStatus(tabId, videoId, true);
-          }
+          await checkVideoStatus(tabId, videoId, true); // Force refresh
         }
       }
     } catch {
