@@ -1,11 +1,35 @@
 #!/usr/bin/env python3
 import argparse
 import re
+import shutil
 from pathlib import Path
 import math
 from typing import Optional, Dict, Any, Union
 
 from yt_dlp import YoutubeDL
+
+
+def _find_deno_path() -> str:
+    """Find deno binary path, checking common locations and PATH."""
+    # First check if deno is in PATH
+    deno_in_path = shutil.which("deno")
+    if deno_in_path:
+        return deno_in_path
+
+    # Check common installation locations
+    common_paths = [
+        "/root/.deno/bin/deno",  # Docker/root install
+        Path.home() / ".deno" / "bin" / "deno",  # User install
+        "./venv/bin/deno/bin/deno",  # Local venv install
+    ]
+
+    for path in common_paths:
+        path = Path(path)
+        if path.exists():
+            return str(path)
+
+    # Fall back to "deno" and let subprocess handle PATH resolution
+    return "deno"
 
 YOUTUBE_VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 PLAUSIBLE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{10,}$")
@@ -109,9 +133,8 @@ def build_ydl_opts(
         ydl_opts.update({"cookiefile": "cookies.txt"})
     if not no_js:
         # Your yt-dlp build expects dict {runtime: {config}}
-        #ydl_opts["js_runtimes"] = {"node": {}}
-        #ydl_opts["js_runtimes"] = {"deno": {"path": "deno"}}
-        ydl_opts["js_runtimes"] = {"deno": {"path": "./venv/bin/deno/bin/deno"}}
+        deno_path = _find_deno_path()
+        ydl_opts["js_runtimes"] = {"deno": {"path": deno_path}}
         ydl_opts["remote_components"] = ["ejs:github", "ejs:npm"]
     if extra_opts:
         # Allow caller to override anything (format, outtmpl, paths, etc.)
