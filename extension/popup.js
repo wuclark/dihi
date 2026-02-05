@@ -12,6 +12,7 @@ const messageEl = document.getElementById('message');
 const apiUrlInput = document.getElementById('api-url');
 
 let currentVideoId = null;
+let currentTabId = null;
 let statusPollInterval = null;
 
 // Initialize
@@ -31,6 +32,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   if (tab && tab.url) {
     const videoId = extractVideoId(tab.url);
+    currentTabId = tab.id;
 
     if (videoId) {
       currentVideoId = videoId;
@@ -190,6 +192,13 @@ async function initiateDownload() {
       }
       setStatus('yellow', 'Download in progress');
       startStatusPolling();
+
+      // Notify background script to update badge and start polling
+      chrome.runtime.sendMessage({
+        type: 'DOWNLOAD_STARTED',
+        tabId: currentTabId,
+        videoId: currentVideoId
+      }).catch(() => {});
     } else {
       throw new Error(data.error || 'Unknown error');
     }
