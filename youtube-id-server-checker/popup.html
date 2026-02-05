@@ -1,0 +1,48 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>YouTube ID Check</title>
+  <style>
+    body { font-family: system-ui, Arial, sans-serif; width: 320px; margin: 0; padding: 12px; }
+    .row { margin-bottom: 10px; }
+    .label { font-size: 12px; opacity: 0.7; margin-bottom: 4px; }
+    .value { font-size: 13px; word-break: break-word; }
+    .status { font-weight: 700; }
+    .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px; }
+    .ok { background: #e8ffe8; }
+    .no { background: #ffe8e8; }
+    .dl { background: #fff4cc; }
+    .err { background: #ffe8e8; }
+    .muted { opacity: 0.7; }
+    button { cursor: pointer; padding: 8px 10px; border: 1px solid #ccc; border-radius: 8px; background: #fff; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .btns { display: flex; gap: 8px; }
+    a { color: #1a73e8; text-decoration: none; }
+    .footer { margin-top: 10px; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <div class="row">
+    <div class="label">Video ID</div>
+    <div class="value" id="videoId">—</div>
+  </div>
+
+  <div class="row">
+    <div class="label">Status</div>
+    <div class="value status"><span id="statusPill" class="pill">…</span></div>
+  </div>
+
+  <div class="row btns">
+    <button id="recheckBtn">Recheck</button>
+    <button id="downloadBtn">Download</button>
+  </div>
+
+  <div class="footer">
+    <span class="muted">Configure server in</span> <a href="#" id="openOptions">Options</a>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
