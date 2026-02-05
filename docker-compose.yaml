@@ -8,7 +8,7 @@ services:
     volumes:
       # Persistent data
       - ./data/archive.txt:/app/archive.txt
-      - ./data/cookies.txt:/app/cookies.txt:ro
+      - ./data/cookies.txt:/app/cookies.txt
       - ./data/merged:/app/merged
     environment:
       - PORT=5000
