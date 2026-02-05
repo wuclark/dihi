@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import re
 import threading
+import time
 from pathlib import Path
 from typing import Optional, Set
 
@@ -39,6 +40,9 @@ _cached_mtime: Optional[float] = None
 _cached_ids: Set[str] = set()
 
 _active_downloads: Set[str] = set()  # prevent spamming duplicate downloads
+_download_results: dict[str, str] = {}  # video_id -> "completed" | "failed"
+_RESULT_TTL = 300  # Keep results for 5 minutes
+_result_timestamps: dict[str, float] = {}
 
 
 def _normalize_id(raw: str) -> Optional[str]:
@@ -92,18 +96,44 @@ def _ensure_cache() -> None:
         _cached_mtime = mtime
 
 
+def _cleanup_old_results() -> None:
+    """Remove download results older than TTL. Must be called with _lock held."""
+    now = time.time()
+    expired = [vid for vid, ts in _result_timestamps.items() if now - ts > _RESULT_TTL]
+    for vid in expired:
+        _download_results.pop(vid, None)
+        _result_timestamps.pop(vid, None)
+
+
 def _download_worker(video_id: str) -> None:
     """
     Actually runs:
       getvidyt.download_youtube(video_id)
+    Tracks completion status for proper UI feedback.
     """
+    success = False
     try:
         getvidyt.download_youtube(video_id)
+        # Give filesystem time to sync archive.txt
+        time.sleep(0.5)
+        # Force cache refresh and check if video is now in archive
+        global _cached_mtime
+        with _lock:
+            _cached_mtime = None  # Force refresh
+        _ensure_cache()
+        with _lock:
+            success = video_id in _cached_ids
     except Exception as e:
         app.logger.exception("Download failed for %s: %s", video_id, e)
+        success = False
     finally:
         with _lock:
             _active_downloads.discard(video_id)
+            # Store result for status endpoint
+            _download_results[video_id] = "completed" if success else "failed"
+            _result_timestamps[video_id] = time.time()
+            # Cleanup old results
+            _cleanup_old_results()
 
 
 @app.get("/api/youtube/<string:video_id>")
@@ -166,8 +196,23 @@ def api_youtube_status(video_id: str):
 
     with _lock:
         downloading = vid in _active_downloads
+        result = _download_results.get(vid)
+        # Clear result after reading (one-time consumption)
+        if result and not downloading:
+            _download_results.pop(vid, None)
+            _result_timestamps.pop(vid, None)
 
-    return jsonify(downloading=bool(downloading), id=vid)
+    # Also check archive status for complete picture
+    _ensure_cache()
+    with _lock:
+        in_archive = vid in _cached_ids
+
+    return jsonify(
+        downloading=bool(downloading),
+        id=vid,
+        result=result,  # "completed", "failed", or None
+        in_archive=in_archive,
+    )
 
 
 @app.get("/health")
