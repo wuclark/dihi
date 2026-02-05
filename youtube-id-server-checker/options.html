@@ -1,0 +1,52 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>YouTube ID Server Checker — Options</title>
+  <style>
+    body { font-family: system-ui, Arial, sans-serif; max-width: 720px; margin: 24px auto; padding: 0 16px; }
+    h1 { margin: 0 0 12px; }
+    .card { border: 1px solid #ddd; border-radius: 12px; padding: 16px; }
+    .row { margin: 12px 0; }
+    label { display: block; font-size: 12px; opacity: 0.7; margin-bottom: 6px; }
+    input { width: 100%; padding: 10px; border: 1px solid #ccc; border-radius: 10px; font-size: 14px; }
+    .actions { display: flex; gap: 10px; margin-top: 14px; }
+    button { cursor: pointer; padding: 10px 12px; border: 1px solid #ccc; border-radius: 10px; background: #fff; }
+    .note { font-size: 12px; opacity: 0.7; margin-top: 10px; }
+    .ok { color: #0a7a0a; font-weight: 700; }
+  </style>
+</head>
+<body>
+  <h1>Options</h1>
+
+  <div class="card">
+    <div class="row">
+      <label for="serverOrigin">Server Origin (no trailing slash)</label>
+      <input id="serverOrigin" placeholder="https://example.com" />
+    </div>
+
+    <div class="row">
+      <label for="timeoutMs">Timeout (ms)</label>
+      <input id="timeoutMs" type="number" min="500" step="100" />
+    </div>
+
+    <div class="row">
+      <label for="debounceMs">Debounce (ms)</label>
+      <input id="debounceMs" type="number" min="0" step="50" />
+    </div>
+
+    <div class="actions">
+      <button id="saveBtn">Save</button>
+      <button id="resetBtn">Reset to defaults</button>
+      <div id="savedMsg" class="ok" style="display:none; align-self:center;">Saved</div>
+    </div>
+
+    <div class="note">
+      The extension checks <code>GET /api/youtube/&lt;id&gt;</code> and triggers <code>POST /api/youtube/get/&lt;id&gt;</code> when a video is missing. When the server reports <code>downloading:false</code>, a notification is shown.
+    </div>
+  </div>
+
+  <script src="options.js"></script>
+</body>
+</html>
