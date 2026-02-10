@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 import argparse
+import glob as _glob
+import math
 import re
 import shutil
+import subprocess as _subprocess
 from pathlib import Path
-import math
 from typing import Optional, Dict, Any, Union
 
 from yt_dlp import YoutubeDL
+from yt_dlp.postprocessor import PostProcessor
 
 
 def _find_deno_path() -> str:
@@ -33,6 +36,165 @@ def _find_deno_path() -> str:
 
 YOUTUBE_VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 PLAUSIBLE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{10,}$")
+
+
+class AudioMetadataPostProcessor(PostProcessor):
+    """Create metadata-enriched audio files from kept pre-merge streams.
+
+    yt-dlp's built-in postprocessors only operate on the final merged output.
+    With ``keepvideo: True`` the original audio streams (``.f140.m4a``,
+    ``.f251.webm``, etc.) are preserved but receive no embedded metadata.
+
+    This PP runs last, finds every kept audio sidecar, and writes a **new**
+    copy with the ``.f<id>`` stripped from the filename (e.g.
+    ``Title [abc].f140.m4a`` → ``Title [abc].m4a``) while embedding tags,
+    cover art, and chapter markers.  The originals are left untouched.
+    """
+
+    _AUDIO_EXTS = ('.m4a', '.webm', '.opus', '.ogg')
+    _FORMAT_ID_RE = re.compile(r'\.f\d+(?=\.\w+$)')
+    _THUMB_MIME = {
+        '.png': 'image/png', '.jpg': 'image/jpeg',
+        '.jpeg': 'image/jpeg', '.webp': 'image/webp',
+    }
+
+    def run(self, info):
+        final = info.get('filepath', '')
+        if not final:
+            return [], info
+
+        final_path = Path(final)
+        audio_files = self._find_audio_files(final_path)
+        if not audio_files:
+            return [], info
+
+        thumb_path = self._find_thumbnail(info, final_path)
+        chapters = info.get('chapters') or []
+
+        for src in audio_files:
+            dst = self._clean_filename(src)
+            if dst.exists():
+                self.to_screen(f'Already exists, skipping: {dst.name}')
+                continue
+            self._embed(info, src, dst, thumb_path, chapters)
+
+        return [], info
+
+    # ------------------------------------------------------------------
+    def _find_audio_files(self, final_path: Path) -> list:
+        results = []
+        stem_escaped = _glob.escape(str(final_path.with_suffix('')))
+        for ext in self._AUDIO_EXTS:
+            for p in _glob.glob(stem_escaped + '.f*' + ext):
+                results.append(Path(p))
+        return results
+
+    @classmethod
+    def _clean_filename(cls, src: Path) -> Path:
+        """``Title [id].f140.m4a`` → ``Title [id].m4a``."""
+        return src.with_name(cls._FORMAT_ID_RE.sub('', src.name))
+
+    @staticmethod
+    def _find_thumbnail(info: dict, final_path: Path) -> Optional[Path]:
+        for thumb in reversed(info.get('thumbnails') or []):
+            fp = thumb.get('filepath')
+            if fp and Path(fp).exists():
+                return Path(fp)
+        base = str(final_path.with_suffix(''))
+        for ext in ('.png', '.jpg', '.jpeg', '.webp'):
+            p = Path(base + ext)
+            if p.exists():
+                return p
+        return None
+
+    # ------------------------------------------------------------------
+    def _embed(self, info, src: Path, dst: Path, thumb_path, chapters):
+        ext = dst.suffix.lower()
+        is_mp4 = ext in ('.m4a', '.mp4')
+        is_matroska = ext in ('.webm', '.mkv')
+
+        cmd = ['ffmpeg', '-y', '-i', str(src)]
+        input_count = 1
+
+        # -- cover art (mp4: attached_pic video stream) --
+        thumb_idx = None
+        if thumb_path and is_mp4:
+            cmd.extend(['-i', str(thumb_path)])
+            thumb_idx = input_count
+            input_count += 1
+
+        # -- chapters via ffmetadata --
+        chap_file = None
+        chap_idx = None
+        if chapters:
+            chap_file = str(dst) + '.ffmeta'
+            with open(chap_file, 'w') as f:
+                f.write(';FFMETADATA1\n')
+                for ch in chapters:
+                    s = int(ch['start_time'] * 1000)
+                    e = int(ch['end_time'] * 1000)
+                    t = (ch.get('title', '')
+                         .replace('\\', '\\\\')
+                         .replace('=', r'\=')
+                         .replace(';', r'\;')
+                         .replace('#', r'\#')
+                         .replace('\n', r'\n'))
+                    f.write(f'\n[CHAPTER]\nTIMEBASE=1/1000\n'
+                            f'START={s}\nEND={e}\ntitle={t}\n')
+            cmd.extend(['-f', 'ffmetadata', '-i', chap_file])
+            chap_idx = input_count
+            input_count += 1
+
+        # -- stream mappings --
+        cmd.extend(['-map', '0:a'])
+        if thumb_idx is not None:
+            cmd.extend(['-map', f'{thumb_idx}:0'])
+
+        # -- codecs --
+        cmd.extend(['-c:a', 'copy'])
+        if thumb_idx is not None:
+            cmd.extend(['-c:v', 'copy', '-disposition:v:0', 'attached_pic'])
+
+        # -- cover art (matroska/webm: attachment) --
+        if thumb_path and is_matroska:
+            mime = self._THUMB_MIME.get(
+                thumb_path.suffix.lower(), 'image/png')
+            cmd.extend(['-attach', str(thumb_path),
+                        '-metadata:s:t', f'mimetype={mime}'])
+
+        if chap_idx is not None:
+            cmd.extend(['-map_chapters', str(chap_idx)])
+
+        # -- metadata tags --
+        for key, val in [
+            ('title', info.get('title')),
+            ('artist', info.get('uploader') or info.get('channel')),
+            ('album_artist', info.get('channel')),
+            ('album', info.get('playlist_title') or info.get('channel')),
+            ('date', info.get('upload_date')),
+            ('comment', info.get('webpage_url')),
+            ('description', info.get('description')),
+            ('episode_id', info.get('id')),
+            ('track', str(info['playlist_index'])
+             if info.get('playlist_index') else None),
+        ]:
+            if val:
+                cmd.extend(['-metadata', f'{key}={val}'])
+
+        cmd.append(str(dst))
+
+        self.to_screen(f'Creating {dst.name}')
+        try:
+            _subprocess.run(cmd, check=True, capture_output=True)
+            self.to_screen(f'Done: {dst.name}')
+        except _subprocess.CalledProcessError as e:
+            self.to_screen(
+                f'Failed: {e.stderr.decode(errors="replace")[:500]}')
+            if dst.exists():
+                dst.unlink()
+        finally:
+            if chap_file and Path(chap_file).exists():
+                Path(chap_file).unlink()
 
 
 def to_youtube_url(user_input: str) -> str:
@@ -190,6 +352,7 @@ def download_youtube(
         ydl_opts.setdefault("no_warnings", True)
 
     with YoutubeDL(ydl_opts) as ydl:
+        ydl.add_post_processor(AudioMetadataPostProcessor(), when='post_process')
         return ydl.download([target_url])
 
 
