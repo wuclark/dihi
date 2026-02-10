@@ -82,10 +82,8 @@ def build_ydl_opts(
         "nooverwrites": True,
         "continuedl": True,
         "concurrent_fragment_downloads": 8,
-        #"retries": math.inf,           # Python API expects numeric, not "infinite"
-        "retries": 10,           # Python API expects numeric, not "infinite"
-        #"fragment_retries": math.inf,
-        "fragment_retries": 10,
+        "retries": math.inf,
+        "fragment_retries": math.inf,
         "download_archive": str(archive_path),
 
         "retry_sleep_functions": {"http": lambda n: min(60, 2 ** n)},
@@ -100,37 +98,36 @@ def build_ydl_opts(
         "user_agent": "Mozilla/5.0 (X11; Linux x86_64; rv:147.0) Gecko/20100101 Firefox/147.0",
 
         # --- Format / merge ---
-        "format": "399+140/299+140/137+140/298+140/136+140/135+140/134+140/133+140/160+140",
+        "format": "399+140/299+140/137+140/298+140/136+140/135+140/134+140/133+140/160+140/best",
         "merge_output_format": "mkv",
         "keepvideo": True,
 
-        # --- “All data” sidecars ---
+        # --- "All data" sidecars ---
         "writeinfojson": True,
         "writedescription": True,
         "writethumbnail": True,
-        "convertthumbnails": "png",
         "writesubtitles": True,
         "writeautomaticsub": True,
         "subtitleslangs": ["en"],
-        "embedsubtitles": True,
-        "embedthumbnail": True,
-        "embedchapters": True,
-        "addmetadata": True,
         "writeplaylistmetafiles": True,
 
+        # --- Postprocessors (explicit — the Python API does NOT auto-create
+        #     these from boolean flags like the CLI does) ---
+        "postprocessors": [
+            {"key": "FFmpegThumbnailsConvertor", "format": "png", "when": "before_dl"},
+            {"key": "FFmpegEmbedSubtitle"},
+            {"key": "EmbedThumbnail", "already_have_thumbnail": False},
+            {"key": "FFmpegMetadata", "add_metadata": True, "add_chapters": True,
+             "add_infojson": "if_exists"},
+        ],
+
         # --- Output paths / template ---
-        "paths": {"home": str(merged_dir)},
-        #"outtmpl": "[%(id)s].%(uploader)s.%(playlist_title,channel)s/%(upload_date)s - %(title)s [%(id)s].%(ext)s",
-        "outtmpl": "%(id)s/%(uploader)s.%(playlist_title,channel)s.%(upload_date)s - %(title)s [%(id)s].%(ext)s",
+        "paths": {"home": str(merged_dir), "temp": "streams/_tmp"},
+        "outtmpl": "%(uploader)s/%(playlist_title,channel)s/%(upload_date)s - %(title)s [%(id)s].%(ext)s",
     }
 
-    cookies_browser = True
     if cookies_browser:
-        # In yt-dlp Python API, cookiesfrombrowser can be:
-        #   "firefox"
-        # or ("firefox", {"profile": "default-release"})
-        #ydl_opts["cookiesfrombrowser"] = cookies_browser
-        ydl_opts.update({"cookiefile": "cookies.txt"})
+        ydl_opts["cookiesfrombrowser"] = (cookies_browser,)
     if not no_js:
         # Your yt-dlp build expects dict {runtime: {config}}
         deno_path = _find_deno_path()
@@ -203,7 +200,7 @@ def main() -> int:
     ap.add_argument("target", help="YouTube URL or ID (video id or playlist id).")
     ap.add_argument("--archive", default="archive.txt", help="Download archive file (default: archive.txt).")
     ap.add_argument("--merged-dir", default="merged", help='Output base directory for "home" path (default: merged).')
-    ap.add_argument("--cookies-browser", default=None, help='Enable cookies-from-browser (e.g. "firefox").')
+    ap.add_argument("--cookies-browser", default="firefox", help='Enable cookies-from-browser (default: "firefox"). Pass "" to disable.')
     ap.add_argument("--no-js", action="store_true", help="Disable js_runtimes config.")
     ap.add_argument("--quiet", action="store_true", help="Suppress yt-dlp output.")
     args = ap.parse_args()
