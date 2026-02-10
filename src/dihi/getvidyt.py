@@ -38,14 +38,25 @@ YOUTUBE_VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 PLAUSIBLE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{10,}$")
 
 
-class M4AMetadataPostProcessor(PostProcessor):
-    """Embed metadata, thumbnail, and chapters into the kept .m4a audio file.
+class AudioMetadataPostProcessor(PostProcessor):
+    """Create metadata-enriched audio files from kept pre-merge streams.
 
     yt-dlp's built-in postprocessors only operate on the final merged output.
-    With ``keepvideo: True`` the original .m4a stream is preserved on disk but
-    receives none of the embedded metadata.  This PP runs last and applies the
-    same tags, cover art, and chapter markers to that .m4a sidecar.
+    With ``keepvideo: True`` the original audio streams (``.f140.m4a``,
+    ``.f251.webm``, etc.) are preserved but receive no embedded metadata.
+
+    This PP runs last, finds every kept audio sidecar, and writes a **new**
+    copy with the ``.f<id>`` stripped from the filename (e.g.
+    ``Title [abc].f140.m4a`` → ``Title [abc].m4a``) while embedding tags,
+    cover art, and chapter markers.  The originals are left untouched.
     """
+
+    _AUDIO_EXTS = ('.m4a', '.webm', '.opus', '.ogg')
+    _FORMAT_ID_RE = re.compile(r'\.f\d+(?=\.\w+$)')
+    _THUMB_MIME = {
+        '.png': 'image/png', '.jpg': 'image/jpeg',
+        '.jpeg': 'image/jpeg', '.webp': 'image/webp',
+    }
 
     def run(self, info):
         final = info.get('filepath', '')
@@ -53,21 +64,35 @@ class M4AMetadataPostProcessor(PostProcessor):
             return [], info
 
         final_path = Path(final)
-        m4a_path = self._find_m4a(final_path)
-        if not m4a_path:
+        audio_files = self._find_audio_files(final_path)
+        if not audio_files:
             return [], info
 
         thumb_path = self._find_thumbnail(info, final_path)
         chapters = info.get('chapters') or []
-        self._embed(info, m4a_path, thumb_path, chapters)
+
+        for src in audio_files:
+            dst = self._clean_filename(src)
+            if dst.exists():
+                self.to_screen(f'Already exists, skipping: {dst.name}')
+                continue
+            self._embed(info, src, dst, thumb_path, chapters)
+
         return [], info
 
     # ------------------------------------------------------------------
-    @staticmethod
-    def _find_m4a(final_path: Path) -> Optional[Path]:
-        pattern = _glob.escape(str(final_path.with_suffix(''))) + '.f*.m4a'
-        matches = _glob.glob(pattern)
-        return Path(matches[0]) if matches else None
+    def _find_audio_files(self, final_path: Path) -> list:
+        results = []
+        stem_escaped = _glob.escape(str(final_path.with_suffix('')))
+        for ext in self._AUDIO_EXTS:
+            for p in _glob.glob(stem_escaped + '.f*' + ext):
+                results.append(Path(p))
+        return results
+
+    @classmethod
+    def _clean_filename(cls, src: Path) -> Path:
+        """``Title [id].f140.m4a`` → ``Title [id].m4a``."""
+        return src.with_name(cls._FORMAT_ID_RE.sub('', src.name))
 
     @staticmethod
     def _find_thumbnail(info: dict, final_path: Path) -> Optional[Path]:
@@ -83,23 +108,26 @@ class M4AMetadataPostProcessor(PostProcessor):
         return None
 
     # ------------------------------------------------------------------
-    def _embed(self, info, m4a_path, thumb_path, chapters):
-        tmp = str(m4a_path) + '.tmp.m4a'
-        cmd = ['ffmpeg', '-y', '-i', str(m4a_path)]
+    def _embed(self, info, src: Path, dst: Path, thumb_path, chapters):
+        ext = dst.suffix.lower()
+        is_mp4 = ext in ('.m4a', '.mp4')
+        is_matroska = ext in ('.webm', '.mkv')
+
+        cmd = ['ffmpeg', '-y', '-i', str(src)]
         input_count = 1
 
-        # -- thumbnail input --
+        # -- cover art (mp4: attached_pic video stream) --
         thumb_idx = None
-        if thumb_path:
+        if thumb_path and is_mp4:
             cmd.extend(['-i', str(thumb_path)])
             thumb_idx = input_count
             input_count += 1
 
-        # -- chapters metadata input --
+        # -- chapters via ffmetadata --
         chap_file = None
         chap_idx = None
         if chapters:
-            chap_file = str(m4a_path) + '.ffmeta'
+            chap_file = str(dst) + '.ffmeta'
             with open(chap_file, 'w') as f:
                 f.write(';FFMETADATA1\n')
                 for ch in chapters:
@@ -127,6 +155,13 @@ class M4AMetadataPostProcessor(PostProcessor):
         if thumb_idx is not None:
             cmd.extend(['-c:v', 'copy', '-disposition:v:0', 'attached_pic'])
 
+        # -- cover art (matroska/webm: attachment) --
+        if thumb_path and is_matroska:
+            mime = self._THUMB_MIME.get(
+                thumb_path.suffix.lower(), 'image/png')
+            cmd.extend(['-attach', str(thumb_path),
+                        '-metadata:s:t', f'mimetype={mime}'])
+
         if chap_idx is not None:
             cmd.extend(['-map_chapters', str(chap_idx)])
 
@@ -146,18 +181,17 @@ class M4AMetadataPostProcessor(PostProcessor):
             if val:
                 cmd.extend(['-metadata', f'{key}={val}'])
 
-        cmd.append(tmp)
+        cmd.append(str(dst))
 
-        self.to_screen(f'Embedding metadata into {m4a_path.name}')
+        self.to_screen(f'Creating {dst.name}')
         try:
             _subprocess.run(cmd, check=True, capture_output=True)
-            Path(tmp).replace(m4a_path)
-            self.to_screen(f'Done: {m4a_path.name}')
+            self.to_screen(f'Done: {dst.name}')
         except _subprocess.CalledProcessError as e:
             self.to_screen(
                 f'Failed: {e.stderr.decode(errors="replace")[:500]}')
-            if Path(tmp).exists():
-                Path(tmp).unlink()
+            if dst.exists():
+                dst.unlink()
         finally:
             if chap_file and Path(chap_file).exists():
                 Path(chap_file).unlink()
@@ -318,7 +352,7 @@ def download_youtube(
         ydl_opts.setdefault("no_warnings", True)
 
     with YoutubeDL(ydl_opts) as ydl:
-        ydl.add_post_processor(M4AMetadataPostProcessor(), when='post_process')
+        ydl.add_post_processor(AudioMetadataPostProcessor(), when='post_process')
         return ydl.download([target_url])
 
 
