@@ -316,7 +316,7 @@ def build_ydl_opts(
         ],
 
         # --- Output paths / template ---
-        "paths": {"home": str(merged_dir), "temp": "streams/_tmp"},
+        "paths": {"home": str(merged_dir)},
         "outtmpl": "%(uploader)s/%(playlist_title,channel)s/%(upload_date)s - %(title)s [%(id)s].%(ext)s",
     }
 
