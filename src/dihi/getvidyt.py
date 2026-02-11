@@ -314,7 +314,8 @@ def build_ydl_opts(
             {"key": "FFmpegThumbnailsConvertor", "format": "png", "when": "before_dl"},
             {"key": "FFmpegEmbedSubtitle"},
             {"key": "EmbedThumbnail", "already_have_thumbnail": False},
-            {"key": "FFmpegMetadata", "add_metadata": True, "add_chapters": True},
+            {"key": "FFmpegMetadata", "add_metadata": True, "add_chapters": True,
+             "add_infojson": "if_exists"},
         ],
 
         # --- Output paths / template ---
@@ -389,6 +390,24 @@ def download_youtube(
         ydl_opts.setdefault("no_warnings", True)
 
     with YoutubeDL(ydl_opts) as ydl:
+        # FFmpegMetadata's add_infojson works for MKV (attachments) but the
+        # MP4/M4A muxer has no data-stream support, causing "Encoder not
+        # found".  Wrap its run() to skip infojson for MP4 containers.
+        for pps in ydl._pps.values():
+            for pp in pps:
+                if type(pp).__name__ == 'FFmpegMetadataPP':
+                    _orig_run = pp.run
+                    def _patched(info, _orig=_orig_run):
+                        if info.get('filepath', '').lower().endswith(('.m4a', '.mp4')):
+                            saved = info.pop('infojson_filename', None)
+                            try:
+                                return _orig(info)
+                            finally:
+                                if saved is not None:
+                                    info['infojson_filename'] = saved
+                        return _orig(info)
+                    pp.run = _patched
+                    break
         ydl.add_post_processor(AudioMetadataPostProcessor(), when='post_process')
         return ydl.download([target_url])
 
