@@ -97,7 +97,7 @@ class AudioMetadataPostProcessor(PostProcessor):
                 path = Path(p)
                 # Extract format ID using regex (suffixes[0] is wrong
                 # when the filename contains dots from channel/date/title)
-                m = cls._FORMAT_ID_RE.search(path.name)
+                m = self._FORMAT_ID_RE.search(path.name)
                 fid = m.group(0)[2:] if m else ''  # strip leading '.f'
                 if fid in audio_fids:
                     results.append(path)
