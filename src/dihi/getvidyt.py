@@ -317,14 +317,7 @@ def build_ydl_opts(
 
         # --- Output paths / template ---
         "paths": {"home": str(merged_dir)},
-        "outtmpl": {
-            "default": "%(channel_id)s/%(id)s/CID_%(channel_id)s.%(upload_date|NA)s.%(title)s [%(id)s].out.%(ext)s",
-            "description": "%(channel_id)s/%(id)s/CID_%(channel_id)s.%(upload_date|NA)s.%(title)s [%(id)s].%(ext)s",
-            "subtitle": "%(channel_id)s/%(id)s/CID_%(channel_id)s.%(upload_date|NA)s.%(title)s [%(id)s].%(ext)s",
-            "thumbnail": "%(channel_id)s/%(id)s/CID_%(channel_id)s.%(upload_date|NA)s.%(title)s [%(id)s].%(ext)s",
-            "infojson": "%(channel_id)s/%(id)s/CID_%(channel_id)s.%(upload_date|NA)s.%(title)s [%(id)s].%(ext)s",
-            "pl_infojson": "%(channel_id)s/%(id)s/CID_%(channel_id)s.%(upload_date|NA)s.%(title)s [%(id)s].%(ext)s",
-        },
+        "outtmpl": "%(channel_id)s/%(id)s/CID_%(channel_id)s.%(upload_date|NA)s.%(title)s [%(id)s].out.%(ext)s",
     }
 
     cookies_file = archive_path.parent / "cookies.txt"
