@@ -309,7 +309,7 @@ def build_ydl_opts(
         #     these from boolean flags like the CLI does) ---
         "postprocessors": [
             {"key": "FFmpegThumbnailsConvertor", "format": "png", "when": "before_dl"},
-            {"key": "FFmpegSubtitlesConvertor", "format": "srt"},
+            {"key": "FFmpegSubtitlesConvertor", "format": "ass"},
             {"key": "FFmpegEmbedSubtitle"},
             {"key": "EmbedThumbnail", "already_have_thumbnail": False},
             {"key": "FFmpegMetadata", "add_metadata": True, "add_chapters": True,
