@@ -64,7 +64,7 @@ class AudioMetadataPostProcessor(PostProcessor):
             return [], info
 
         final_path = Path(final)
-        audio_files = self._find_audio_files(final_path)
+        audio_files = self._find_audio_files(info, final_path)
         if not audio_files:
             return [], info
 
@@ -81,12 +81,24 @@ class AudioMetadataPostProcessor(PostProcessor):
         return [], info
 
     # ------------------------------------------------------------------
-    def _find_audio_files(self, final_path: Path) -> list:
+    def _find_audio_files(self, info: dict, final_path: Path) -> list:
+        # Collect format IDs that are audio-only (no video)
+        audio_fids = set()
+        for fmt in info.get('requested_formats') or []:
+            if fmt.get('acodec', 'none') != 'none' and fmt.get('vcodec', 'none') in ('none', None):
+                fid = str(fmt.get('format_id', ''))
+                if fid:
+                    audio_fids.add(fid)
+
         results = []
         stem_escaped = _glob.escape(str(final_path.with_suffix('')))
         for ext in self._AUDIO_EXTS:
             for p in _glob.glob(stem_escaped + '.f*' + ext):
-                results.append(Path(p))
+                path = Path(p)
+                # Extract format ID from .f<id>.ext pattern
+                fid = path.suffixes[0].lstrip('.f') if len(path.suffixes) >= 2 else ''
+                if fid in audio_fids:
+                    results.append(path)
         return results
 
     @classmethod
@@ -166,6 +178,9 @@ class AudioMetadataPostProcessor(PostProcessor):
             cmd.extend(['-map_chapters', str(chap_idx)])
 
         # -- metadata tags --
+        desc = info.get('description') or ''
+        if len(desc) > 4000:
+            desc = desc[:4000] + '\n[truncated]'
         for key, val in [
             ('title', info.get('title')),
             ('artist', info.get('uploader') or info.get('channel')),
@@ -173,7 +188,7 @@ class AudioMetadataPostProcessor(PostProcessor):
             ('album', info.get('playlist_title') or info.get('channel')),
             ('date', info.get('upload_date')),
             ('comment', info.get('webpage_url')),
-            ('description', info.get('description')),
+            ('description', desc),
             ('episode_id', info.get('id')),
             ('track', str(info['playlist_index'])
              if info.get('playlist_index') else None),
@@ -188,8 +203,9 @@ class AudioMetadataPostProcessor(PostProcessor):
             _subprocess.run(cmd, check=True, capture_output=True)
             self.to_screen(f'Done: {dst.name}')
         except _subprocess.CalledProcessError as e:
-            self.to_screen(
-                f'Failed: {e.stderr.decode(errors="replace")[:500]}')
+            stderr = e.stderr.decode(errors='replace')
+            # ffmpeg prints its banner first; the real error is at the end
+            self.to_screen(f'Failed: {stderr[-500:]}')
             if dst.exists():
                 dst.unlink()
         finally:
