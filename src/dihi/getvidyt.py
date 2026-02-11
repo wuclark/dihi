@@ -125,12 +125,26 @@ class AudioMetadataPostProcessor(PostProcessor):
         is_mp4 = ext in ('.m4a', '.mp4')
         is_matroska = ext in ('.webm', '.mkv')
 
+        # m4a/mp4 only supports PNG/JPEG cover art — convert if needed
+        converted_thumb = None
+        if thumb_path and is_mp4 and thumb_path.suffix.lower() not in ('.png', '.jpg', '.jpeg'):
+            converted_thumb = thumb_path.with_suffix('.cover.png')
+            if not converted_thumb.exists():
+                try:
+                    _subprocess.run(
+                        ['ffmpeg', '-y', '-i', str(thumb_path), str(converted_thumb)],
+                        check=True, capture_output=True)
+                except _subprocess.CalledProcessError:
+                    converted_thumb = None
+            if converted_thumb and converted_thumb.exists():
+                thumb_path = converted_thumb
+
         cmd = ['ffmpeg', '-y', '-i', str(src)]
         input_count = 1
 
         # -- cover art (mp4: attached_pic video stream) --
         thumb_idx = None
-        if thumb_path and is_mp4:
+        if thumb_path and is_mp4 and thumb_path.suffix.lower() in ('.png', '.jpg', '.jpeg'):
             cmd.extend(['-i', str(thumb_path)])
             thumb_idx = input_count
             input_count += 1
@@ -211,6 +225,8 @@ class AudioMetadataPostProcessor(PostProcessor):
         finally:
             if chap_file and Path(chap_file).exists():
                 Path(chap_file).unlink()
+            if converted_thumb and converted_thumb.exists():
+                converted_thumb.unlink()
 
 
 def to_youtube_url(user_input: str) -> str:
@@ -304,6 +320,9 @@ def build_ydl_opts(
         "outtmpl": "%(uploader)s/%(playlist_title,channel)s/%(upload_date)s - %(title)s [%(id)s].%(ext)s",
     }
 
+    cookies_file = archive_path.parent / "cookies.txt"
+    if cookies_file.exists():
+        ydl_opts["cookiefile"] = str(cookies_file)
     if cookies_browser:
         ydl_opts["cookiesfrombrowser"] = (cookies_browser,)
     if not no_js:
