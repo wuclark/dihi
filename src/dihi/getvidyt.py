@@ -34,6 +34,38 @@ def _find_deno_path() -> str:
     # Fall back to "deno" and let subprocess handle PATH resolution
     return "deno"
 
+_SUB_TIMESTAMP_RE = re.compile(r'^\d{2}:\d{2}:\d{2}[.,]\d{3}\s*-->')
+_SUB_TAG_RE = re.compile(r'<[^>]+>')
+
+
+def _sub_to_text(sub_path: Path) -> Optional[str]:
+    """Extract deduplicated plain text from a VTT or SRT subtitle file."""
+    try:
+        raw = sub_path.read_text(encoding='utf-8', errors='replace')
+    except OSError:
+        return None
+
+    lines = []
+    prev = None
+    for line in raw.splitlines():
+        line = line.strip()
+        # skip header, metadata, timestamps, cue numbers, and blank lines
+        if (not line
+                or line.startswith('WEBVTT')
+                or line.startswith('Kind:')
+                or line.startswith('Language:')
+                or line.startswith('NOTE')
+                or _SUB_TIMESTAMP_RE.match(line)
+                or line.isdigit()):
+            continue
+        clean = _SUB_TAG_RE.sub('', line).strip()
+        if clean and clean != prev:
+            lines.append(clean)
+            prev = clean
+
+    return '\n'.join(lines) if lines else None
+
+
 YOUTUBE_VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 PLAUSIBLE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{10,}$")
 
@@ -69,6 +101,7 @@ class AudioMetadataPostProcessor(PostProcessor):
             return [], info
 
         thumb_path = self._find_thumbnail(info, final_path)
+        sub_path = self._find_subtitle(info, final_path)
         chapters = info.get('chapters') or []
 
         for src in audio_files:
@@ -76,7 +109,7 @@ class AudioMetadataPostProcessor(PostProcessor):
             if dst.exists():
                 self.to_screen(f'Already exists, skipping: {dst.name}')
                 continue
-            self._embed(info, src, dst, thumb_path, chapters)
+            self._embed(info, src, dst, thumb_path, chapters, sub_path)
 
         return [], info
 
@@ -109,6 +142,20 @@ class AudioMetadataPostProcessor(PostProcessor):
         return src.with_name(cls._FORMAT_ID_RE.sub('', src.name))
 
     @staticmethod
+    def _find_subtitle(info: dict, final_path: Path) -> Optional[Path]:
+        """Find the first VTT or SRT subtitle file for this download."""
+        for lang, sub in (info.get('requested_subtitles') or {}).items():
+            fp = sub.get('filepath')
+            if fp and Path(fp).exists() and sub.get('ext') in ('vtt', 'srt'):
+                return Path(fp)
+        # Fallback: glob next to the output (prefer vtt, then srt)
+        base = _glob.escape(str(final_path.with_suffix('')))
+        for ext in ('vtt', 'srt'):
+            for p in sorted(_glob.glob(base + f'.*.{ext}')):
+                return Path(p)
+        return None
+
+    @staticmethod
     def _find_thumbnail(info: dict, final_path: Path) -> Optional[Path]:
         for thumb in reversed(info.get('thumbnails') or []):
             fp = thumb.get('filepath')
@@ -122,10 +169,12 @@ class AudioMetadataPostProcessor(PostProcessor):
         return None
 
     # ------------------------------------------------------------------
-    def _embed(self, info, src: Path, dst: Path, thumb_path, chapters):
+    def _embed(self, info, src: Path, dst: Path, thumb_path, chapters,
+               sub_path: Optional[Path] = None):
         ext = dst.suffix.lower()
         is_mp4 = ext in ('.m4a', '.mp4')
         is_matroska = ext in ('.webm', '.mkv')
+        is_ogg = ext in ('.opus', '.ogg')
 
         # m4a/mp4 only supports PNG/JPEG cover art — convert if needed
         converted_thumb = None
@@ -212,11 +261,45 @@ class AudioMetadataPostProcessor(PostProcessor):
             if val:
                 cmd.extend(['-metadata', f'{key}={val}'])
 
+        # -- lyrics via ffmpeg metadata for webm/mkv --
+        if is_matroska and sub_path:
+            webm_lyrics = _sub_to_text(sub_path)
+            if webm_lyrics:
+                cmd.extend(['-metadata', f'LYRICS={webm_lyrics}'])
+
         cmd.append(str(dst))
 
         self.to_screen(f'Creating {dst.name}')
         try:
             _subprocess.run(cmd, check=True, capture_output=True)
+            # -- embed lyrics via mutagen for m4a (©lyr atom) --
+            if is_mp4 and sub_path:
+                lyrics = _sub_to_text(sub_path)
+                if lyrics:
+                    try:
+                        from mutagen.mp4 import MP4
+                        mp4 = MP4(str(dst))
+                        mp4['\xa9lyr'] = [lyrics]
+                        mp4.save()
+                        self.to_screen(f'Lyrics embedded: {dst.name}')
+                    except Exception as e:
+                        self.to_screen(f'Lyrics failed: {e}')
+            # -- embed lyrics via mutagen for opus/ogg (LYRICS vorbis comment) --
+            if is_ogg and sub_path:
+                lyrics = _sub_to_text(sub_path)
+                if lyrics:
+                    try:
+                        if ext == '.opus':
+                            from mutagen.oggopus import OggOpus
+                            audio = OggOpus(str(dst))
+                        else:
+                            from mutagen.oggvorbis import OggVorbis
+                            audio = OggVorbis(str(dst))
+                        audio['LYRICS'] = [lyrics]
+                        audio.save()
+                        self.to_screen(f'Lyrics embedded: {dst.name}')
+                    except Exception as e:
+                        self.to_screen(f'Lyrics failed: {e}')
             self.to_screen(f'Done: {dst.name}')
         except _subprocess.CalledProcessError as e:
             stderr = e.stderr.decode(errors='replace')
