@@ -394,7 +394,8 @@ def download_youtube(
         # without ext=, so subtitles embedded by EmbedSubtitle are mapped
         # (-map 0) but no subtitle codec is specified, causing ffmpeg to
         # fail with "Encoder not found".  Patch _options on the instance
-        # to add -sn for audio-only containers.
+        # to copy subtitle streams as-is (they're already mov_text from
+        # the EmbedSubtitle step).
         for pps in ydl._pps.values():
             for pp in pps:
                 if type(pp).__name__ == 'FFmpegMetadataPP':
@@ -402,7 +403,7 @@ def download_youtube(
                     def _patched_options(target_ext, _orig=_orig_options):
                         yield from _orig(target_ext)
                         if target_ext in ('m4a', 'mp4'):
-                            yield '-sn'
+                            yield from ('-c:s', 'copy')
                     pp._options = _patched_options
                     break
         ydl.add_post_processor(AudioMetadataPostProcessor(), when='post_process')
