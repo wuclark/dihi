@@ -64,7 +64,7 @@ class AudioMetadataPostProcessor(PostProcessor):
             return [], info
 
         final_path = Path(final)
-        audio_files = self._find_audio_files(final_path)
+        audio_files = self._find_audio_files(info, final_path)
         if not audio_files:
             return [], info
 
@@ -81,12 +81,24 @@ class AudioMetadataPostProcessor(PostProcessor):
         return [], info
 
     # ------------------------------------------------------------------
-    def _find_audio_files(self, final_path: Path) -> list:
+    def _find_audio_files(self, info: dict, final_path: Path) -> list:
+        # Collect format IDs that are audio-only (no video)
+        audio_fids = set()
+        for fmt in info.get('requested_formats') or []:
+            if fmt.get('acodec', 'none') != 'none' and fmt.get('vcodec', 'none') in ('none', None):
+                fid = str(fmt.get('format_id', ''))
+                if fid:
+                    audio_fids.add(fid)
+
         results = []
         stem_escaped = _glob.escape(str(final_path.with_suffix('')))
         for ext in self._AUDIO_EXTS:
             for p in _glob.glob(stem_escaped + '.f*' + ext):
-                results.append(Path(p))
+                path = Path(p)
+                # Extract format ID from .f<id>.ext pattern
+                fid = path.suffixes[0].lstrip('.f') if len(path.suffixes) >= 2 else ''
+                if fid in audio_fids:
+                    results.append(path)
         return results
 
     @classmethod
