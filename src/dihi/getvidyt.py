@@ -378,7 +378,7 @@ def build_ydl_opts(
 
         # --- Format / merge ---
         # "format": "399+140/299+140/137+140/298+140/136+140/135+140/134+140/133+140/160+140/best",
-        "format": "bestvideo[height<=1080][vcodec^=av01]+251/bestvideo[height<=1080]+251/bestvideo[height<=1080]+bestaudio/best,140/bestaudio",
+        "format": "bestvideo[height<=1080][vcodec^=av01]+251/bestvideo[height<=1080]+251/bestvideo[height<=1080]+bestaudio/best,140",
         "merge_output_format": "mkv",
         "keepvideo": True,
 
