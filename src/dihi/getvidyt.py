@@ -91,8 +91,8 @@ class AudioMetadataPostProcessor(PostProcessor):
 
     @classmethod
     def _clean_filename(cls, src: Path) -> Path:
-        """``Title [id].f140.m4a`` → ``Title [id].m4a``."""
-        return src.with_name(cls._FORMAT_ID_RE.sub('', src.name))
+        """``Title [id].f140.m4a`` → ``Title [id].ebmd.m4a``."""
+        return src.with_name(cls._FORMAT_ID_RE.sub('.ebmd', src.name))
 
     @staticmethod
     def _find_thumbnail(info: dict, final_path: Path) -> Optional[Path]:
