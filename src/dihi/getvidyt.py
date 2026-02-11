@@ -317,7 +317,7 @@ def build_ydl_opts(
 
         # --- Output paths / template ---
         "paths": {"home": str(merged_dir)},
-        "outtmpl": "%(uploader)s/%(playlist_title,channel)s/%(upload_date)s - %(title)s [%(id)s].%(ext)s",
+        "outtmpl": "%(id)s/%(uploader)s.%(playlist_title,channel)s.%(upload_date)s - %(title)s [%(id)s].%(ext)s",
     }
 
     cookies_file = archive_path.parent / "cookies.txt"
