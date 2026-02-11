@@ -111,9 +111,18 @@ Include playlist download count:
 
 ---
 
-## Extension: Add "Download Playlist" Button
+## Extension: New Extension in `extension2/`
 
-### Current extension behavior
+This is a **new, separate extension** created in the `extension2/` folder in the repo.
+It is based on the existing `extension/` code but adds playlist download support.
+The original `extension/` folder is left untouched.
+
+### Starting point
+
+Copy `extension/` to `extension2/` as the base, then apply all changes below.
+Update `manifest.json` name/description to distinguish it (e.g., "YouTube ID + Playlist Checker").
+
+### Current base extension behavior (from `extension/`)
 
 - `extractYouTubeId()` only extracts the `v=` param (video ID) from YouTube URLs
 - Popup shows: Video ID, status pill, Recheck / Download buttons
@@ -245,11 +254,14 @@ if (msg?.type === "GET_PLAYLIST_STATUS") {
 | File | Change |
 |------|--------|
 | `src/dihi/app3.py` | Playlist endpoints, validation, state tracking, worker |
-| `extension/service_worker.js` | Playlist ID extraction, download flow, polling, messages |
-| `extension/popup.html` | Playlist ID row, Download Playlist button, progress row |
-| `extension/popup.js` | Playlist-aware rendering, new button handler, new messages |
+| `extension2/` | **New folder** — copy of `extension/` with playlist support |
+| `extension2/manifest.json` | Updated name/description for playlist variant |
+| `extension2/service_worker.js` | Playlist ID extraction, download flow, polling, messages |
+| `extension2/popup.html` | Playlist ID row, Download Playlist button, progress row |
+| `extension2/popup.js` | Playlist-aware rendering, new button handler, new messages |
 
-**No changes needed to `getvidyt.py`** — it already supports playlists.
+**No changes to `extension/`** — original extension is left untouched.
+**No changes to `getvidyt.py`** — it already supports playlists.
 
 ## Testing approach
 
@@ -257,6 +269,6 @@ if (msg?.type === "GET_PLAYLIST_STATUS") {
 - **API**: Verify archive.txt gets populated with video IDs from the playlist
 - **API**: Verify concurrent download limits are enforced
 - **API**: Verify invalid playlist IDs return 400
-- **Extension**: Load unpacked in Edge, navigate to a YouTube playlist page, verify "Download Playlist" button appears
+- **Extension**: Load `extension2/` unpacked in Edge, navigate to a YouTube playlist page, verify "Download Playlist" button appears
 - **Extension**: Click Download Playlist, verify badge shows progress, notification on completion
 - **Extension**: Navigate to a video within a playlist (`?v=...&list=...`), verify both buttons appear
