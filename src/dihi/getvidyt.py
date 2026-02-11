@@ -314,8 +314,7 @@ def build_ydl_opts(
             {"key": "FFmpegThumbnailsConvertor", "format": "png", "when": "before_dl"},
             {"key": "FFmpegEmbedSubtitle"},
             {"key": "EmbedThumbnail", "already_have_thumbnail": False},
-            {"key": "FFmpegMetadata", "add_metadata": True, "add_chapters": True,
-             "add_infojson": "if_exists"},
+            {"key": "FFmpegMetadata", "add_metadata": True, "add_chapters": True},
         ],
 
         # --- Output paths / template ---
