@@ -294,7 +294,8 @@ def build_ydl_opts(
         "user_agent": "Mozilla/5.0 (X11; Linux x86_64; rv:147.0) Gecko/20100101 Firefox/147.0",
 
         # --- Format / merge ---
-        "format": "399+140/299+140/137+140/298+140/136+140/135+140/134+140/133+140/160+140/best",
+        # "format": "399+140/299+140/137+140/298+140/136+140/135+140/134+140/133+140/160+140/best",
+        "format": "bestvideo[height<=1080][vcodec^=av01]+251/bestvideo[height<=1080]+251/bestvideo[height<=1080]+bestaudio/best,140/bestaudio",
         "merge_output_format": "mkv",
         "keepvideo": True,
 
