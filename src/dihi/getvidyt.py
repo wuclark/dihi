@@ -174,6 +174,7 @@ class AudioMetadataPostProcessor(PostProcessor):
         ext = dst.suffix.lower()
         is_mp4 = ext in ('.m4a', '.mp4')
         is_matroska = ext in ('.webm', '.mkv')
+        is_ogg = ext in ('.opus', '.ogg')
 
         # m4a/mp4 only supports PNG/JPEG cover art — convert if needed
         converted_thumb = None
@@ -260,6 +261,12 @@ class AudioMetadataPostProcessor(PostProcessor):
             if val:
                 cmd.extend(['-metadata', f'{key}={val}'])
 
+        # -- lyrics via ffmpeg metadata for webm/mkv --
+        if is_matroska and sub_path:
+            webm_lyrics = _sub_to_text(sub_path)
+            if webm_lyrics:
+                cmd.extend(['-metadata', f'LYRICS={webm_lyrics}'])
+
         cmd.append(str(dst))
 
         self.to_screen(f'Creating {dst.name}')
@@ -274,6 +281,22 @@ class AudioMetadataPostProcessor(PostProcessor):
                         mp4 = MP4(str(dst))
                         mp4['\xa9lyr'] = [lyrics]
                         mp4.save()
+                        self.to_screen(f'Lyrics embedded: {dst.name}')
+                    except Exception as e:
+                        self.to_screen(f'Lyrics failed: {e}')
+            # -- embed lyrics via mutagen for opus/ogg (LYRICS vorbis comment) --
+            if is_ogg and sub_path:
+                lyrics = _sub_to_text(sub_path)
+                if lyrics:
+                    try:
+                        if ext == '.opus':
+                            from mutagen.oggopus import OggOpus
+                            audio = OggOpus(str(dst))
+                        else:
+                            from mutagen.oggvorbis import OggVorbis
+                            audio = OggVorbis(str(dst))
+                        audio['LYRICS'] = [lyrics]
+                        audio.save()
                         self.to_screen(f'Lyrics embedded: {dst.name}')
                     except Exception as e:
                         self.to_screen(f'Lyrics failed: {e}')
