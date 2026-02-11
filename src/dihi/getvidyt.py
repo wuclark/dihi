@@ -178,6 +178,9 @@ class AudioMetadataPostProcessor(PostProcessor):
             cmd.extend(['-map_chapters', str(chap_idx)])
 
         # -- metadata tags --
+        desc = info.get('description') or ''
+        if len(desc) > 4000:
+            desc = desc[:4000] + '\n[truncated]'
         for key, val in [
             ('title', info.get('title')),
             ('artist', info.get('uploader') or info.get('channel')),
@@ -185,7 +188,7 @@ class AudioMetadataPostProcessor(PostProcessor):
             ('album', info.get('playlist_title') or info.get('channel')),
             ('date', info.get('upload_date')),
             ('comment', info.get('webpage_url')),
-            ('description', info.get('description')),
+            ('description', desc),
             ('episode_id', info.get('id')),
             ('track', str(info['playlist_index'])
              if info.get('playlist_index') else None),
@@ -200,8 +203,9 @@ class AudioMetadataPostProcessor(PostProcessor):
             _subprocess.run(cmd, check=True, capture_output=True)
             self.to_screen(f'Done: {dst.name}')
         except _subprocess.CalledProcessError as e:
-            self.to_screen(
-                f'Failed: {e.stderr.decode(errors="replace")[:500]}')
+            stderr = e.stderr.decode(errors='replace')
+            # ffmpeg prints its banner first; the real error is at the end
+            self.to_screen(f'Failed: {stderr[-500:]}')
             if dst.exists():
                 dst.unlink()
         finally:
