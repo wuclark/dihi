@@ -34,14 +34,14 @@ def _find_deno_path() -> str:
     # Fall back to "deno" and let subprocess handle PATH resolution
     return "deno"
 
-_VTT_TIMESTAMP_RE = re.compile(r'^\d{2}:\d{2}:\d{2}\.\d{3}\s*-->')
-_VTT_TAG_RE = re.compile(r'<[^>]+>')
+_SUB_TIMESTAMP_RE = re.compile(r'^\d{2}:\d{2}:\d{2}[.,]\d{3}\s*-->')
+_SUB_TAG_RE = re.compile(r'<[^>]+>')
 
 
-def _vtt_to_text(vtt_path: Path) -> Optional[str]:
-    """Extract deduplicated plain text from a WebVTT subtitle file."""
+def _sub_to_text(sub_path: Path) -> Optional[str]:
+    """Extract deduplicated plain text from a VTT or SRT subtitle file."""
     try:
-        raw = vtt_path.read_text(encoding='utf-8', errors='replace')
+        raw = sub_path.read_text(encoding='utf-8', errors='replace')
     except OSError:
         return None
 
@@ -49,16 +49,16 @@ def _vtt_to_text(vtt_path: Path) -> Optional[str]:
     prev = None
     for line in raw.splitlines():
         line = line.strip()
-        # skip header, metadata, timestamps, and blank lines
+        # skip header, metadata, timestamps, cue numbers, and blank lines
         if (not line
                 or line.startswith('WEBVTT')
                 or line.startswith('Kind:')
                 or line.startswith('Language:')
                 or line.startswith('NOTE')
-                or _VTT_TIMESTAMP_RE.match(line)
+                or _SUB_TIMESTAMP_RE.match(line)
                 or line.isdigit()):
             continue
-        clean = _VTT_TAG_RE.sub('', line).strip()
+        clean = _SUB_TAG_RE.sub('', line).strip()
         if clean and clean != prev:
             lines.append(clean)
             prev = clean
@@ -143,15 +143,16 @@ class AudioMetadataPostProcessor(PostProcessor):
 
     @staticmethod
     def _find_subtitle(info: dict, final_path: Path) -> Optional[Path]:
-        """Find the first VTT subtitle file for this download."""
+        """Find the first VTT or SRT subtitle file for this download."""
         for lang, sub in (info.get('requested_subtitles') or {}).items():
             fp = sub.get('filepath')
-            if fp and Path(fp).exists() and sub.get('ext') == 'vtt':
+            if fp and Path(fp).exists() and sub.get('ext') in ('vtt', 'srt'):
                 return Path(fp)
-        # Fallback: glob for *.vtt next to the output
+        # Fallback: glob next to the output (prefer vtt, then srt)
         base = _glob.escape(str(final_path.with_suffix('')))
-        for p in sorted(_glob.glob(base + '.*.vtt')):
-            return Path(p)
+        for ext in ('vtt', 'srt'):
+            for p in sorted(_glob.glob(base + f'.*.{ext}')):
+                return Path(p)
         return None
 
     @staticmethod
@@ -266,7 +267,7 @@ class AudioMetadataPostProcessor(PostProcessor):
             _subprocess.run(cmd, check=True, capture_output=True)
             # -- embed lyrics via mutagen for m4a (©lyr atom) --
             if is_mp4 and sub_path:
-                lyrics = _vtt_to_text(sub_path)
+                lyrics = _sub_to_text(sub_path)
                 if lyrics:
                     try:
                         from mutagen.mp4 import MP4
