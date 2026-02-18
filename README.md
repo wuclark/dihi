@@ -28,25 +28,125 @@ A YouTube video archive management system with a REST API and browser extension.
 
 ## API Endpoints
 
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/health` | GET | Health check |
-| `/api/youtube/<id>` | GET | Check if video is archived |
-| `/api/youtube/get/<id>` | POST | Trigger video download |
-| `/api/youtube/status/<id>` | GET | Check download progress |
+| Method | Path | Rate Limit | Description |
+|--------|------|------------|-------------|
+| `GET` | `/health` | 30/min | Health check; reports archive existence and active downloads |
+| `GET` | `/api/youtube/<id>` | 60/min | Check if a video is in the archive |
+| `POST` | `/api/youtube/get/<id>` | 10/min | Trigger a video download in the background |
+| `GET` | `/api/youtube/status/<id>` | 60/min | Poll video download progress |
+| `POST` | `/api/youtube/playlist/get/<playlist_id>` | 5/min | Trigger a full playlist download in the background |
+| `GET` | `/api/youtube/playlist/status/<playlist_id>` | 60/min | Poll playlist download progress |
 
-### Example Usage
+Video IDs are exactly 11 characters (`[A-Za-z0-9_-]{11}`). Playlist IDs are 2–128 characters from the same alphabet.
+
+### `GET /health`
 
 ```bash
-# Check if video is archived
+curl http://localhost:5000/health
+```
+
+```json
+{
+  "ok": true,
+  "archive_exists": true,
+  "active_downloads": 0,
+  "max_concurrent": 5,
+  "active_playlist_downloads": 0,
+  "max_concurrent_playlists": 2
+}
+```
+
+### `GET /api/youtube/<id>` — check archive
+
+```bash
 curl http://localhost:5000/api/youtube/dQw4w9WgXcQ
+```
 
-# Trigger download
+```json
+{"result": true}
+```
+
+Returns `{"result": false}` when the video is not in the archive.
+
+### `POST /api/youtube/get/<id>` — trigger video download
+
+```bash
 curl -X POST http://localhost:5000/api/youtube/get/dQw4w9WgXcQ
+```
 
-# Check download status
+```json
+{
+  "ok": true,
+  "id": "dQw4w9WgXcQ",
+  "started": true,
+  "already_running": false
+}
+```
+
+Returns HTTP 429 when there are already 5 concurrent downloads.
+
+### `GET /api/youtube/status/<id>` — poll video download progress
+
+```bash
 curl http://localhost:5000/api/youtube/status/dQw4w9WgXcQ
 ```
+
+While downloading:
+
+```json
+{
+  "downloading": true,
+  "id": "dQw4w9WgXcQ",
+  "result": null,
+  "in_archive": false
+}
+```
+
+After completion:
+
+```json
+{
+  "downloading": false,
+  "id": "dQw4w9WgXcQ",
+  "result": "completed",
+  "in_archive": true
+}
+```
+
+`result` is `"completed"`, `"failed"`, or `null`. The result is consumed on first read and expires after 5 minutes.
+
+### `POST /api/youtube/playlist/get/<playlist_id>` — trigger playlist download
+
+```bash
+curl -X POST http://localhost:5000/api/youtube/playlist/get/PLbpi6ZahtOH6Ar_3GPy3gD_U6v-DWxvXm
+```
+
+```json
+{
+  "ok": true,
+  "id": "PLbpi6ZahtOH6Ar_3GPy3gD_U6v-DWxvXm",
+  "started": true,
+  "already_running": false
+}
+```
+
+Returns HTTP 429 when there are already 2 concurrent playlist downloads.
+
+### `GET /api/youtube/playlist/status/<playlist_id>` — poll playlist download progress
+
+```bash
+curl http://localhost:5000/api/youtube/playlist/status/PLbpi6ZahtOH6Ar_3GPy3gD_U6v-DWxvXm
+```
+
+```json
+{
+  "downloading": false,
+  "id": "PLbpi6ZahtOH6Ar_3GPy3gD_U6v-DWxvXm",
+  "result": "completed"
+}
+```
+
+`result` is `"completed"`, `"failed"`, or `null`.
 
 ## Browser Extension
 
