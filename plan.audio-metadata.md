@@ -2,10 +2,11 @@
 
 ## Goal
 
-Decouple `AudioMetadataPostProcessor` from the download pipeline so it can be:
+Decouple `AudioMetadataPostProcessor` from the download pipeline so that:
 
-1. **Skipped** during downloads via a `--no-audio-meta` flag
-2. **Run standalone** on already-downloaded files using their `.info.json` sidecars
+1. **Downloads skip audio metadata by default** — the PP is no longer part of the standard pipeline
+2. Downloads can **opt in** to audio metadata via a `--audio-meta` flag
+3. Audio metadata can be **run standalone** on already-downloaded files using their `.info.json` sidecars
 
 ---
 
@@ -24,22 +25,23 @@ The `.info.json` file written by yt-dlp contains everything `AudioMetadataPostPr
 
 ## Changes
 
-### 1. Add `--no-audio-meta` flag to `download_youtube()` and CLI
+### 1. Change default: skip audio metadata during downloads
 
 **File: `src/dihi/getvidyt.py`**
 
-- Add `no_audio_meta: bool = False` parameter to `download_youtube()`
-- Wrap the `ydl.add_post_processor(AudioMetadataPostProcessor(), when='post_process')` call in `if not no_audio_meta:`
-- Add `--no-audio-meta` argument to `main()` argparse and pass it through
+- Add `audio_meta: bool = False` parameter to `download_youtube()`
+- Wrap the `ydl.add_post_processor(AudioMetadataPostProcessor(), when='post_process')` call in `if audio_meta:`
+- Add `--audio-meta` flag to `main()` argparse and pass it through
+- **Default is OFF** — downloads no longer create clean audio copies unless explicitly requested
 
-This gives callers (including `app3.py`) the ability to skip audio metadata embedding.
+This makes downloads faster and lighter by default. The audio metadata step can be done later via the standalone `audio-meta` subcommand on existing files.
 
-### 2. Add `--no-audio-meta` flag to the API download worker
+### 2. Update the API download worker
 
 **File: `src/dihi/app3.py`**
 
-- No changes needed by default (downloads continue to include audio metadata as before)
-- Optionally, accept a query parameter or JSON body field to pass through, but this can be deferred since the primary use case is the CLI standalone tool
+- The API call `getvidyt.download_youtube(video_id)` now skips audio metadata by default — no code change needed in `app3.py` since the new default (`audio_meta=False`) applies automatically
+- If audio metadata is desired from the API in the future, a query parameter or JSON body field can be added to pass `audio_meta=True` through to `download_youtube()`
 
 ### 3. Refactor `AudioMetadataPostProcessor` to support standalone operation
 
@@ -78,7 +80,7 @@ Add a subcommand or separate mode. Two approaches:
 
 **Option A — Subcommands via argparse** (recommended):
 ```
-python getvidyt.py download <target> [--archive ...] [--no-audio-meta] ...
+python getvidyt.py download <target> [--archive ...] [--audio-meta] ...
 python getvidyt.py audio-meta <path> [--recursive]
 ```
 
@@ -139,34 +141,34 @@ This approach is filesystem-based and doesn't rely on stale absolute paths in th
 
 | Location | Change |
 |----------|--------|
-| `download_youtube()` signature | Add `no_audio_meta: bool = False` parameter |
-| `download_youtube()` body, line ~492 | Wrap `add_post_processor` in `if not no_audio_meta:` |
+| `download_youtube()` signature | Add `audio_meta: bool = False` parameter (default OFF) |
+| `download_youtube()` body, line ~492 | Wrap `add_post_processor` in `if audio_meta:` |
 | `AudioMetadataPostProcessor` class | Add `from_info_json()` classmethod |
 | `AudioMetadataPostProcessor` class | Add `process_directory()` classmethod |
 | `AudioMetadataPostProcessor` class | Add `process_single()` classmethod |
 | New class `StandaloneAudioMetaPP` | Subclass with `to_screen` override for standalone use |
 | `main()` | Refactor to use subcommands (`download` + `audio-meta`), keep bare-target compat |
-| `main()` argparse | Add `--no-audio-meta` to download subcommand |
+| `main()` argparse | Add `--audio-meta` opt-in flag to download subcommand |
 
 ### `src/dihi/app3.py`
 
 | Location | Change |
 |----------|--------|
-| (none required) | Downloads continue to include audio metadata by default |
+| (none required) | Audio metadata is now skipped by default — no changes needed |
 
 ---
 
 ## Example Usage After Implementation
 
 ```bash
-# Download WITHOUT audio metadata post-processing
-python getvidyt.py download dQw4w9WgXcQ --no-audio-meta
-
-# Download WITH audio metadata (default, same as today)
+# Download WITHOUT audio metadata (new default)
 python getvidyt.py download dQw4w9WgXcQ
 
-# Backwards-compatible (no subcommand = download)
+# Backwards-compatible (no subcommand = download, still no audio meta)
 python getvidyt.py dQw4w9WgXcQ
+
+# Download WITH audio metadata post-processing (opt-in)
+python getvidyt.py download dQw4w9WgXcQ --audio-meta
 
 # Run audio metadata on a single video's info.json
 python getvidyt.py audio-meta merged/UCxxx/dQw4w9WgXcQ/CID_UCxxx.20091025.Rick\ Astley\ -\ Never\ Gonna\ Give\ You\ Up\ \[dQw4w9WgXcQ\].out.info.json
