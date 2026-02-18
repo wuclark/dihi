@@ -29,8 +29,12 @@ limiter = Limiter(
 # Validate YouTube video IDs (11 chars: alphanumeric, underscore, dash)
 YOUTUBE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 
+# Validate YouTube playlist IDs (alphanumeric, underscore, dash, 2-128 chars)
+PLAYLIST_ID_RE = re.compile(r"^[A-Za-z0-9_-]{2,128}$")
+
 # Max concurrent downloads to prevent resource exhaustion
 MAX_CONCURRENT_DOWNLOADS = 5
+MAX_CONCURRENT_PLAYLIST_DOWNLOADS = 2
 
 # Archive lines look like: "youtube <id>"
 CHECK_FILE = Path("./archive.txt").expanduser().resolve()
@@ -44,6 +48,11 @@ _download_results: dict[str, str] = {}  # video_id -> "completed" | "failed"
 _RESULT_TTL = 300  # Keep results for 5 minutes
 _result_timestamps: dict[str, float] = {}
 
+# Playlist download tracking
+_active_playlist_downloads: Set[str] = set()
+_playlist_download_results: dict[str, str] = {}  # playlist_id -> "completed" | "failed"
+_playlist_result_timestamps: dict[str, float] = {}
+
 
 def _normalize_id(raw: str) -> Optional[str]:
     """Normalize and validate YouTube video ID."""
@@ -51,6 +60,14 @@ def _normalize_id(raw: str) -> Optional[str]:
     if not vid or not YOUTUBE_ID_RE.match(vid):
         return None
     return vid
+
+
+def _normalize_playlist_id(raw: str) -> Optional[str]:
+    """Normalize and validate YouTube playlist ID."""
+    pid = (raw or "").strip()
+    if not pid or not PLAYLIST_ID_RE.match(pid):
+        return None
+    return pid
 
 
 def _parse_archive_line(line: str) -> Optional[str]:
@@ -136,6 +153,36 @@ def _download_worker(video_id: str) -> None:
             _cleanup_old_results()
 
 
+def _cleanup_old_playlist_results() -> None:
+    """Remove playlist download results older than TTL. Must be called with _lock held."""
+    now = time.time()
+    expired = [pid for pid, ts in _playlist_result_timestamps.items() if now - ts > _RESULT_TTL]
+    for pid in expired:
+        _playlist_download_results.pop(pid, None)
+        _playlist_result_timestamps.pop(pid, None)
+
+
+def _playlist_download_worker(playlist_id: str) -> None:
+    """Download all videos from a YouTube playlist via getvidyt."""
+    try:
+        rc = getvidyt.download_youtube(playlist_id)
+        # Force cache refresh so status can report archive contents
+        global _cached_mtime
+        with _lock:
+            _cached_mtime = None
+        _ensure_cache()
+        success = rc == 0
+    except Exception as e:
+        app.logger.exception("Playlist download failed for %s: %s", playlist_id, e)
+        success = False
+    finally:
+        with _lock:
+            _active_playlist_downloads.discard(playlist_id)
+            _playlist_download_results[playlist_id] = "completed" if success else "failed"
+            _playlist_result_timestamps[playlist_id] = time.time()
+            _cleanup_old_playlist_results()
+
+
 @app.get("/api/youtube/<string:video_id>")
 @limiter.limit("60 per minute")
 def api_youtube_check(video_id: str):
@@ -215,6 +262,63 @@ def api_youtube_status(video_id: str):
     )
 
 
+@app.post("/api/youtube/playlist/get/<string:playlist_id>")
+@limiter.limit("5 per minute")
+def api_youtube_playlist_get(playlist_id: str):
+    """
+    POST /api/youtube/playlist/get/<playlist_id>
+
+    Triggers download of all videos in a YouTube playlist.
+    Uses getvidyt.download_youtube() which natively handles playlists.
+    """
+    pid = _normalize_playlist_id(playlist_id)
+    if not pid:
+        return jsonify(ok=False, error="invalid playlist id"), 400
+
+    with _lock:
+        already_running = pid in _active_playlist_downloads
+        if not already_running:
+            if len(_active_playlist_downloads) >= MAX_CONCURRENT_PLAYLIST_DOWNLOADS:
+                return jsonify(ok=False, error="too many concurrent playlist downloads"), 429
+            _active_playlist_downloads.add(pid)
+            threading.Thread(
+                target=_playlist_download_worker, args=(pid,), daemon=True
+            ).start()
+
+    return jsonify(
+        ok=True,
+        id=pid,
+        started=(not already_running),
+        already_running=already_running,
+    )
+
+
+@app.get("/api/youtube/playlist/status/<string:playlist_id>")
+@limiter.limit("60 per minute")
+def api_youtube_playlist_status(playlist_id: str):
+    """
+    GET /api/youtube/playlist/status/<playlist_id>
+
+    Poll playlist download progress.
+    """
+    pid = _normalize_playlist_id(playlist_id)
+    if not pid:
+        return jsonify(error="invalid playlist id"), 400
+
+    with _lock:
+        downloading = pid in _active_playlist_downloads
+        result = _playlist_download_results.get(pid)
+        if result and not downloading:
+            _playlist_download_results.pop(pid, None)
+            _playlist_result_timestamps.pop(pid, None)
+
+    return jsonify(
+        downloading=bool(downloading),
+        id=pid,
+        result=result,  # "completed", "failed", or None
+    )
+
+
 @app.get("/health")
 @limiter.limit("30 per minute")
 def health():
@@ -223,6 +327,8 @@ def health():
         archive_exists=CHECK_FILE.exists(),
         active_downloads=len(_active_downloads),
         max_concurrent=MAX_CONCURRENT_DOWNLOADS,
+        active_playlist_downloads=len(_active_playlist_downloads),
+        max_concurrent_playlists=MAX_CONCURRENT_PLAYLIST_DOWNLOADS,
     )
 
 
