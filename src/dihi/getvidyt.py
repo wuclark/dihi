@@ -314,6 +314,116 @@ class AudioMetadataPostProcessor(PostProcessor):
                 converted_thumb.unlink()
 
 
+class StandaloneAudioMetaPP(AudioMetadataPostProcessor):
+    """AudioMetadataPostProcessor that prints to stdout instead of yt-dlp."""
+
+    def to_screen(self, msg, *args, **kwargs):
+        print(f"[AudioMeta] {msg}")
+
+    @classmethod
+    def from_info_json(cls, info_json_path: Path) -> tuple:
+        """Load an .info.json file and resolve sibling file paths.
+
+        Returns (info_dict, resolved) where *resolved* is True if a merged
+        output file was found on disk (needed for audio-sidecar discovery).
+        """
+        import json
+
+        info_json_path = Path(info_json_path).expanduser().resolve()
+        if not info_json_path.exists():
+            raise FileNotFoundError(info_json_path)
+
+        info = json.loads(info_json_path.read_text(encoding="utf-8"))
+
+        # Derive the common stem: strip ".info.json" suffix
+        name = info_json_path.name
+        if name.endswith(".info.json"):
+            stem = name[: -len(".info.json")]
+        else:
+            stem = info_json_path.stem
+        parent = info_json_path.parent
+        stem_escaped = _glob.escape(str(parent / stem))
+
+        # Resolve the merged output file (e.g. <stem>.mkv)
+        merged_path = None
+        for ext in (".mkv", ".mp4", ".webm"):
+            candidate = parent / (stem + ext)
+            if candidate.exists():
+                merged_path = candidate
+                break
+        if merged_path is None:
+            # Try glob as fallback
+            for p in _glob.glob(stem_escaped + ".*"):
+                pp = Path(p)
+                if pp.suffix.lower() in (".mkv", ".mp4", ".webm") and ".f" not in pp.suffixes[-2:-1]:
+                    merged_path = pp
+                    break
+
+        if merged_path:
+            info["filepath"] = str(merged_path)
+
+        # Re-resolve thumbnail paths to files on disk next to the .info.json
+        for thumb in info.get("thumbnails") or []:
+            for ext in (".png", ".jpg", ".jpeg", ".webp"):
+                candidate = parent / (stem + ext)
+                if candidate.exists():
+                    thumb["filepath"] = str(candidate)
+                    break
+
+        # Re-resolve subtitle paths
+        for _lang, sub in (info.get("requested_subtitles") or {}).items():
+            for ext in ("vtt", "srt"):
+                for p in sorted(_glob.glob(stem_escaped + f".*.{ext}")):
+                    sub["filepath"] = p
+                    sub["ext"] = ext
+                    break
+
+        return info, merged_path is not None
+
+    @classmethod
+    def process_single(cls, info_json_path: Path) -> bool:
+        """Process a single .info.json file. Returns True on success."""
+        info_json_path = Path(info_json_path).expanduser().resolve()
+        try:
+            info, resolved = cls.from_info_json(info_json_path)
+        except (FileNotFoundError, Exception) as e:
+            print(f"[AudioMeta] ERROR loading {info_json_path}: {e}")
+            return False
+
+        if not resolved:
+            print(f"[AudioMeta] SKIP {info_json_path.name}: no merged output file found")
+            return False
+
+        pp = cls()
+        files_to_delete, info = pp.run(info)
+        return True
+
+    @classmethod
+    def process_directory(cls, directory: Path, recursive: bool = True) -> int:
+        """Process all .info.json files in a directory. Returns count processed."""
+        directory = Path(directory).expanduser().resolve()
+        if not directory.is_dir():
+            print(f"[AudioMeta] ERROR: {directory} is not a directory")
+            return 0
+
+        pattern = "**/*.info.json" if recursive else "*.info.json"
+        info_files = sorted(directory.glob(pattern))
+
+        if not info_files:
+            print(f"[AudioMeta] No .info.json files found in {directory}")
+            return 0
+
+        print(f"[AudioMeta] Found {len(info_files)} .info.json file(s)")
+        processed = 0
+        for i, info_json in enumerate(info_files, 1):
+            print(f"\n[AudioMeta] [{i}/{len(info_files)}] {info_json.parent.name}/{info_json.name}")
+            if cls.process_single(info_json):
+                processed += 1
+
+        print(f"\n[AudioMeta] Done: {processed}/{len(info_files)} processed")
+        return processed
+
+
 def to_youtube_url(user_input: str) -> str:
     """
     Accepts:
@@ -432,6 +542,7 @@ def download_youtube(
     no_js: bool = False,
     extra_opts: Optional[Dict[str, Any]] = None,
     quiet: bool = False,
+    audio_meta: bool = False,
 ) -> int:
     """
     Callable function for external programs.
@@ -452,6 +563,9 @@ def download_youtube(
         Extra yt-dlp options to add/override.
     quiet : bool
         If True, suppress yt-dlp output (still returns status code).
+    audio_meta : bool
+        If True, run AudioMetadataPostProcessor to create clean audio copies
+        with embedded metadata. Default is False (skip).
 
     Returns
     -------
@@ -489,25 +603,18 @@ def download_youtube(
                             yield from ('-c:s', 'copy')
                     pp._options = _patched_options
                     break
-        ydl.add_post_processor(AudioMetadataPostProcessor(), when='post_process')
+        if audio_meta:
+            ydl.add_post_processor(AudioMetadataPostProcessor(), when='post_process')
         return ydl.download([target_url])
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser(
-        description="Download YouTube video/playlist using yt-dlp Python module with a fixed profile."
-    )
-    ap.add_argument("target", help="YouTube URL or ID (video id or playlist id).")
-    ap.add_argument("--archive", default="archive.txt", help="Download archive file (default: archive.txt).")
-    ap.add_argument("--merged-dir", default="merged", help='Output base directory for "home" path (default: merged).')
-    ap.add_argument("--cookies-browser", default="firefox", help='Enable cookies-from-browser (default: "firefox"). Pass "" to disable.')
-    ap.add_argument("--no-js", action="store_true", help="Disable js_runtimes config.")
-    ap.add_argument("--quiet", action="store_true", help="Suppress yt-dlp output.")
-    args = ap.parse_args()
-
+def _run_download(args) -> int:
+    """Execute the download subcommand."""
     print(f"Target: {to_youtube_url(args.target)}")
     print(f"Output base: {Path(args.merged_dir).expanduser().resolve()}")
     print(f"Archive: {Path(args.archive).expanduser().resolve()}")
+    if args.audio_meta:
+        print("Audio metadata post-processing: enabled")
 
     return download_youtube(
         args.target,
@@ -516,7 +623,72 @@ def main() -> int:
         cookies_browser=args.cookies_browser,
         no_js=args.no_js,
         quiet=args.quiet,
+        audio_meta=args.audio_meta,
     )
+
+
+def _run_audio_meta(args) -> int:
+    """Execute the audio-meta subcommand."""
+    target = Path(args.path).expanduser().resolve()
+
+    if target.is_file() and target.name.endswith(".info.json"):
+        ok = StandaloneAudioMetaPP.process_single(target)
+        return 0 if ok else 1
+    elif target.is_dir():
+        count = StandaloneAudioMetaPP.process_directory(
+            target, recursive=not args.no_recursive,
+        )
+        return 0 if count > 0 else 1
+    else:
+        print(f"Error: {target} is not a directory or .info.json file")
+        return 1
+
+
+def _add_download_args(parser):
+    """Add download arguments to a parser."""
+    parser.add_argument("target", help="YouTube URL or ID (video id or playlist id).")
+    parser.add_argument("--archive", default="archive.txt", help="Download archive file (default: archive.txt).")
+    parser.add_argument("--merged-dir", default="merged", help='Output base directory for "home" path (default: merged).')
+    parser.add_argument("--cookies-browser", default="firefox", help='Enable cookies-from-browser (default: "firefox"). Pass "" to disable.')
+    parser.add_argument("--no-js", action="store_true", help="Disable js_runtimes config.")
+    parser.add_argument("--quiet", action="store_true", help="Suppress yt-dlp output.")
+    parser.add_argument("--audio-meta", action="store_true", help="Create clean audio copies with embedded metadata (off by default).")
+
+
+def main() -> int:
+    import sys
+
+    # Backwards compatibility: bare `python getvidyt.py <target>` with no subcommand.
+    # Detect this by checking if the first positional arg is NOT a known subcommand.
+    _SUBCOMMANDS = {"download", "audio-meta"}
+    argv = sys.argv[1:]
+    if argv and argv[0] not in _SUBCOMMANDS and not argv[0].startswith("-"):
+        # Treat as implicit "download" subcommand
+        argv = ["download"] + argv
+
+    ap = argparse.ArgumentParser(
+        description="Download YouTube video/playlist and manage audio metadata."
+    )
+    sub = ap.add_subparsers(dest="command")
+
+    # -- download subcommand --
+    dl = sub.add_parser("download", help="Download a YouTube video or playlist.")
+    _add_download_args(dl)
+
+    # -- audio-meta subcommand --
+    am = sub.add_parser("audio-meta", help="Create clean audio copies from already-downloaded files.")
+    am.add_argument("path", help="Directory to scan or a single .info.json file.")
+    am.add_argument("--no-recursive", action="store_true", help="Don't recurse into subdirectories (default: recurse).")
+
+    args = ap.parse_args(argv)
+
+    if args.command == "download":
+        return _run_download(args)
+    elif args.command == "audio-meta":
+        return _run_audio_meta(args)
+    else:
+        ap.print_help()
+        return 1
 
 
 if __name__ == "__main__":
