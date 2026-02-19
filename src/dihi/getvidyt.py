@@ -247,10 +247,14 @@ class AudioMetadataPostProcessor(PostProcessor):
         if len(desc) > 4000:
             desc = desc[:4000] + '\n[truncated]'
         for key, val in [
-            ('title', info.get('title')),
-            ('artist', info.get('uploader') or info.get('channel')),
-            ('album_artist', info.get('channel')),
-            ('album', info.get('playlist_title') or info.get('channel')),
+            #('title', info.get('title')),
+            #('artist', info.get('uploader') or info.get('channel')),
+            #('album_artist', info.get('channel')),
+            #('album', info.get('playlist_title') or info.get('channel')),
+            ('title',        info.get('track') or info.get('alt_title') or info.get('title')),
+            ('artist',       info.get('artist') or info.get('creator') or info.get('uploader') or info.get('channel')),
+            ('album_artist', info.get('artist') or info.get('channel')),
+            ('album',        info.get('album') or info.get('playlist_title') or info.get('channel')),
             ('date', info.get('upload_date')),
             ('comment', info.get('webpage_url')),
             ('description', desc),
