@@ -3,6 +3,7 @@ VENV := venv
 PYTHON := python3
 PIP := $(VENV)/bin/pip
 PYTEST := $(VENV)/bin/pytest
+DIHI := $(VENV)/bin/dihi
 
 .PHONY: setup install dev-install run clean test
 
@@ -21,9 +22,12 @@ setup: $(VENV)/bin/activate
 # Install dependencies (alias)
 install: $(VENV)/bin/activate
 
-# Install the dihi package in editable mode (makes `dihi` available on PATH)
-dev-install: $(VENV)/bin/activate
+# Install the dihi package in editable mode; re-runs when pyproject.toml changes
+$(DIHI): pyproject.toml $(VENV)/bin/activate
 	$(PIP) install -q -e .
+
+# Alias for the editable install
+dev-install: $(DIHI)
 
 # Run your app using the venv's python
 run: $(VENV)/bin/activate
@@ -37,3 +41,12 @@ test: $(VENV)/bin/activate
 # Clean up the virtual environment
 clean:
 	rm -rf $(VENV)
+
+# Download a YouTube video or playlist by ID or URL:
+#   make dQw4w9WgXcQ
+#   make PLxxxxxxxxxxxxxx
+#   make "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+# Requires: make dev-install (run once after setup)
+.DEFAULT:
+	@test -x "$(DIHI)" || { echo "Run 'make dev-install' first to install the dihi CLI."; exit 1; }
+	@$(DIHI) download "$@"
