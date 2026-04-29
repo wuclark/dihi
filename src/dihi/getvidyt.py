@@ -76,6 +76,34 @@ YOUTUBE_VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 PLAUSIBLE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{10,}$")
 
 
+def _parse_archive_line(line: str) -> Optional[str]:
+    """Return the YouTube video ID from a yt-dlp archive line, or None."""
+    s = line.strip()
+    if not s:
+        return None
+    parts = s.split()
+    if len(parts) < 2 or parts[0].lower() != "youtube":
+        return None
+    return parts[1] or None
+
+
+def load_archive(path: Union[str, Path]) -> set:
+    """Return the set of video IDs recorded in a yt-dlp archive file.
+
+    Safe to call when the file does not exist — returns an empty set.
+    """
+    p = Path(path).expanduser().resolve()
+    ids: set = set()
+    if not p.exists():
+        return ids
+    with p.open("r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            vid = _parse_archive_line(line)
+            if vid:
+                ids.add(vid)
+    return ids
+
+
 class AudioMetadataPostProcessor(PostProcessor):
     """Create metadata-enriched audio files from kept pre-merge streams.
 
@@ -778,7 +806,7 @@ def _run_download(args) -> int:
         args.target,
         merged_dir=args.merged_dir,
         archive=args.archive,
-        cookies_browser=args.cookies_browser,
+        cookies_browser=args.cookies_browser or None,
         no_js=args.no_js,
         quiet=args.quiet,
         audio_meta=args.audio_meta,
@@ -807,7 +835,7 @@ def _add_download_args(parser):
     parser.add_argument("target", help="YouTube URL or ID (video id or playlist id).")
     parser.add_argument("--archive", default="archive.txt", help="Download archive file (default: archive.txt).")
     parser.add_argument("--merged-dir", default="merged", help='Output base directory for "home" path (default: merged).')
-    parser.add_argument("--cookies-browser", default="firefox", help='Enable cookies-from-browser (default: "firefox"). Pass "" to disable.')
+    parser.add_argument("--cookies-browser", default="", help='Enable cookies-from-browser (e.g. "firefox"). Disabled by default.')
     parser.add_argument("--no-js", action="store_true", help="Disable js_runtimes config.")
     parser.add_argument("--quiet", action="store_true", help="Suppress yt-dlp output.")
     parser.add_argument("--audio-meta", action="store_true", help="Create clean audio copies with embedded metadata (off by default).")
