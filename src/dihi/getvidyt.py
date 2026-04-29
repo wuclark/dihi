@@ -34,6 +34,12 @@ def _find_deno_path() -> str:
     # Fall back to "deno" and let subprocess handle PATH resolution
     return "deno"
 
+def _datetime_now() -> str:
+    """Return current UTC time as an ISO 8601 string for sidecar timestamps."""
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+
 _SUB_TIMESTAMP_RE = re.compile(r'^\d{2}:\d{2}:\d{2}[.,]\d{3}\s*-->')
 _SUB_TAG_RE = re.compile(r'<[^>]+>')
 
@@ -428,6 +434,94 @@ class StandaloneAudioMetaPP(AudioMetadataPostProcessor):
         return processed
 
 
+class MetadataSidecarPostProcessor(PostProcessor):
+    """Write timestamped human-readable metadata sidecar files alongside downloads.
+
+    YouTube metadata fields that appear stable can change over time:
+      - Channel display names change on rebrands
+      - @handles (uploader_id) can be changed by the creator
+      - Video titles are frequently edited for SEO or corrections
+      - Upload dates occasionally shift on re-uploads
+
+    Embedding these values in folder or file names causes fragmentation:
+    new downloads land in a new path while old files remain at the old one.
+    Instead, this postprocessor writes them to small dot-files that live next
+    to the content and are updated in place, keeping the folder structure
+    permanently stable (channel_id/video_id/) while still being human-browsable.
+
+    File format — each file is an append-only log of timestamped values:
+
+        2026-04-29T12:34:56Z Never Gonna Give You Up
+        2026-05-15T08:30:00Z Never Gonna Give You Up (Official Remaster)
+
+    A new line is only appended when the value differs from the last recorded
+    entry, so repeated downloads of the same video (e.g. during a backfill run
+    without the archive) do not produce duplicate lines. When a value does
+    change, both the old and new entries are preserved with their timestamps,
+    giving a full audit trail of when the change was first observed.
+
+    Channel-level files (written to <merged_dir>/<channel_id>/):
+      .channel_name  — display name (info['channel'] or info['uploader'])
+      .uploader_id   — @handle (info['uploader_id']); changes are trackable
+      .uploader_name — raw uploader string (info['uploader'])
+
+    Video-level files (written to the video subfolder from info['filepath']):
+      .title_name    — video title (info['title'])
+      .upload_date   — upload date in YYYYMMDD format (info['upload_date'])
+    """
+
+    def __init__(self, merged_dir: Path):
+        super().__init__()
+        self._merged_dir = Path(merged_dir)
+
+    def run(self, info):
+        channel_id = info.get('channel_id')
+        filepath = info.get('filepath')
+        video_dir = Path(filepath).parent if filepath else None
+        channel_dir = self._merged_dir / channel_id if channel_id else None
+        now = _datetime_now()
+
+        if channel_dir:
+            self._append_if_changed(
+                channel_dir / '.channel_name',
+                info.get('channel') or info.get('uploader'), now)
+            self._append_if_changed(
+                channel_dir / '.uploader_id',
+                info.get('uploader_id'), now)
+            self._append_if_changed(
+                channel_dir / '.uploader_name',
+                info.get('uploader'), now)
+
+        if video_dir:
+            self._append_if_changed(
+                video_dir / '.title_name',
+                info.get('title'), now)
+            self._append_if_changed(
+                video_dir / '.upload_date',
+                info.get('upload_date'), now)
+
+        return [], info
+
+    @staticmethod
+    def _append_if_changed(path: Path, value: str, timestamp: str) -> None:
+        """Append '<timestamp> <value>' to path only if value differs from last entry."""
+        if not value:
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        last = None
+        if path.exists():
+            for line in reversed(path.read_text(encoding='utf-8').splitlines()):
+                line = line.strip()
+                if line:
+                    # First token is the timestamp; everything after is the value
+                    parts = line.split(' ', 1)
+                    last = parts[1] if len(parts) == 2 else line
+                    break
+        if value != last:
+            with path.open('a', encoding='utf-8') as f:
+                f.write(f'{timestamp} {value}\n')
+
+
 def to_youtube_url(user_input: str) -> str:
     """
     Accepts:
@@ -502,7 +596,35 @@ def build_ydl_opts(
         "writethumbnail": True,
         "writesubtitles": True,
         "writeautomaticsub": True,
-        "subtitleslangs": ["en"],
+        # Subtitle language selection strategy:
+        #
+        # "en" — requests English subtitles. yt-dlp automatically prefers manually
+        #   uploaded subtitle tracks over YouTube's auto-generated speech-to-text
+        #   when both exist for the same language code. This means creator-provided
+        #   captions (more accurate, often including speaker labels and corrections)
+        #   are used whenever available, with auto-generated as the fallback. No
+        #   extra configuration is needed to express this preference — it is
+        #   yt-dlp's built-in behaviour.
+        #
+        # "en-orig" — requests the original-language auto-generated track for
+        #   non-English videos. When a video is in Spanish, French, Japanese, etc.,
+        #   YouTube auto-transcribes the spoken audio into the source language; that
+        #   transcript is labelled "en-orig" (the original before any translation).
+        #   For English-language videos this track does not exist and is silently
+        #   skipped. Including it here means non-English channels get a native-
+        #   language transcript alongside the English one, at no cost for English
+        #   channels.
+        #
+        # Why not "all"? Requesting all languages downloads every machine-translated
+        #   variant YouTube generates (often 30–60 per video), which multiplies the
+        #   file count dramatically without adding meaningful information — they are
+        #   all machine-translated from the same "en-orig" source. The two-entry list
+        #   below captures the highest-value tracks with at most 2 files per video.
+        #
+        # To backfill subtitles for already-downloaded videos without re-downloading:
+        #   download_youtube(url, extra_opts={"skip_download": True,
+        #       "download_archive": None, "subtitleslangs": ["en", "en-orig"]})
+        "subtitleslangs": ["en", "en-orig"],
         "writeplaylistmetafiles": True,
 
         # --- Postprocessors (explicit — the Python API does NOT auto-create
@@ -517,7 +639,36 @@ def build_ydl_opts(
 
         # --- Output paths / template ---
         "paths": {"home": str(merged_dir)},
-        "outtmpl": "%(channel_id)s/%(id)s/CID_%(channel_id)s.%(upload_date|NA)s.%(title)s [%(id)s].out.%(ext)s",
+        # Output path design decisions:
+        #
+        # Folder structure: <channel_id>/<video_id>/
+        #   Both identifiers are assigned by YouTube and never change, making the
+        #   folder hierarchy permanently stable regardless of channel renames, title
+        #   edits, or video re-uploads. Using the human-readable channel name or
+        #   title as a folder would cause splits when creators rebrand or edit
+        #   metadata (new downloads land in a new folder; old files stay in the old
+        #   one with no automatic reconciliation). The @handle (uploader_id) is also
+        #   excluded for the same reason — YouTube now allows creators to change it.
+        #
+        # Filename: <upload_date>.<title> [<video_id>].out.<ext>
+        #   The date prefix sorts chronologically in any file browser. The title and
+        #   video ID are repeated in the filename (even though they appear in the
+        #   folder path) so that each file is self-describing when viewed in isolation
+        #   — e.g. when sorting search results or sharing a single file.
+        #
+        #   The ".out." infix between title and extension is load-bearing: it is the
+        #   anchor used by AudioMetadataPostProcessor's regex (\.f\d+(?=\.\w+$)) to
+        #   strip format IDs from sidecar filenames (e.g. ".out.f140.m4a" → ".out.m4a").
+        #   Do not remove it.
+        #
+        #   The former "CID_<channel_id>." prefix has been removed because the
+        #   channel ID is already encoded in the parent folder — repeating it in
+        #   every filename added length without new information.
+        #
+        # Human-readable names: see MetadataSidecarPostProcessor, which writes
+        #   .channel_name / .uploader_id / .uploader_name into the channel folder and
+        #   .title_name / .upload_date into the video folder as timestamped log files.
+        "outtmpl": "%(channel_id)s/%(id)s/%(upload_date|NA)s.%(title)s [%(id)s].out.%(ext)s",
     }
 
     cookies_file = archive_path.parent / "cookies.txt"
@@ -609,6 +760,9 @@ def download_youtube(
                     break
         if audio_meta:
             ydl.add_post_processor(AudioMetadataPostProcessor(), when='post_process')
+        ydl.add_post_processor(
+            MetadataSidecarPostProcessor(merged_dir), when='post_process'
+        )
         return ydl.download([target_url])
 
 
