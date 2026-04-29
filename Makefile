@@ -2,8 +2,9 @@
 VENV := venv
 PYTHON := python3
 PIP := $(VENV)/bin/pip
+PYTEST := $(VENV)/bin/pytest
 
-.PHONY: setup install run clean
+.PHONY: setup install run clean test
 
 # Build the venv (and install requirements) when requirements.txt changes
 $(VENV)/bin/activate: requirements.txt
@@ -23,6 +24,11 @@ install: $(VENV)/bin/activate
 # Run your app using the venv's python
 run: $(VENV)/bin/activate
 	$(VENV)/bin/python main.py
+
+# Run unit tests (pure — no network, no ffmpeg, no HTTP)
+test: $(VENV)/bin/activate
+	$(PIP) install -q -r requirements-dev.txt
+	$(PYTEST) tests/ -v --tb=short --cov=src/dihi --cov-report=term-missing
 
 # Clean up the virtual environment
 clean:
