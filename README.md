@@ -209,12 +209,71 @@ python src/dihi/app3.py
 
 ## Download Output
 
-Videos are saved to `merged/<video_id>/` with:
-- Video file (`.mkv`)
-- Metadata (`.info.json`)
-- Description (`.description`)
-- Thumbnail (`.png`)
-- Subtitles (if available)
+Videos are saved under `merged/` using a two-level folder structure:
+
+```
+merged/
+└── <channel_id>/                                   # YouTube channel ID (permanent, never changes)
+    ├── .channel_name                               # Channel display name history (timestamped log)
+    ├── .uploader_id                                # @handle history (timestamped log)
+    ├── .uploader_name                              # Uploader name history (timestamped log)
+    └── <video_id>/                                 # YouTube video ID (permanent, never changes)
+        ├── <date>.<title> [<id>].out.mkv           # Merged video (AV1 + Opus, up to 4K)
+        ├── <date>.<title> [<id>].out.f140.m4a      # Pre-merge AAC audio sidecar
+        ├── <date>.<title> [<id>].out.info.json     # Full yt-dlp metadata
+        ├── <date>.<title> [<id>].out.description   # Video description (plain text)
+        ├── <date>.<title> [<id>].out.png           # Thumbnail (converted to PNG)
+        ├── <date>.<title> [<id>].out.en.vtt        # English subtitles (manual preferred, auto-gen fallback)
+        ├── <date>.<title> [<id>].out.en-orig.vtt   # Native-language transcript (non-English videos only)
+        ├── .title_name                             # Video title history (timestamped log)
+        └── .upload_date                            # Upload date history (timestamped log)
+```
+
+### Why channel_id/video_id folders?
+
+Channel names, @handles, and video titles all change over time. Using them as folder names
+causes fragmentation: new downloads land in a new folder while old files stay in the old one,
+with no automatic reconciliation. The two-level `<channel_id>/<video_id>/` structure uses
+YouTube's own permanent identifiers, so the archive never splits regardless of renames or edits.
+
+Human-readable names are tracked in the dot-files listed above instead.
+
+### Metadata sidecar files (.channel_name, .title_name, etc.)
+
+Each dot-file is an append-only timestamped log:
+
+```
+2026-04-29T12:34:56Z Kurzgesagt – In a Nutshell
+2026-06-01T09:15:00Z Kurzgesagt — In a Nutshell
+```
+
+A new line is appended only when the value changes, so the file records the full history of
+observed values and when each change was first detected. Files that have never changed contain
+a single line.
+
+### Subtitle strategy
+
+`en` requests English subtitles. yt-dlp automatically prefers manually uploaded captions over
+auto-generated speech-to-text when both exist for the same language code — no extra configuration
+needed. `en-orig` captures the native-language auto-generated transcript for non-English videos.
+At most 2 subtitle files are written per video; English-only channels produce exactly 1.
+
+To backfill subtitles for already-downloaded videos without re-downloading the video:
+
+```python
+download_youtube(url, extra_opts={
+    "skip_download": True,
+    "download_archive": None,
+    "subtitleslangs": ["en", "en-orig"],
+})
+```
+
+### Embedded metadata (inside the .mkv and .m4a files)
+
+The merged `.mkv` contains embedded subtitle streams, cover art, and full metadata tags via
+ffmpeg postprocessors. When `audio_meta=True` is passed to `download_youtube()`, a clean
+`.out.m4a` copy is also produced with embedded cover art, chapter markers, and lyrics derived
+from the subtitle track.
 
 ## License
 
