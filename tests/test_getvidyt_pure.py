@@ -1,5 +1,5 @@
 """
-Pure unit tests for getvidyt.py — no network, no yt-dlp downloads, no ffmpeg.
+Pure unit tests for getvidyt.py and cli.py — no network, no yt-dlp downloads, no ffmpeg.
 
 TODO (integration tests to add in future):
   - download_youtube() end-to-end: requires network + yt-dlp + real archive file
@@ -8,6 +8,7 @@ TODO (integration tests to add in future):
   - StandaloneAudioMetaPP.process_directory(): requires prepared fixture tree
   - build_ydl_opts() with no_js=False: exercises _find_deno_path / Deno runtime config
   - _find_deno_path() common-path fallback: requires creating a file at ~/.deno/bin/deno
+  - dihi download / dihi audio-meta: require real yt-dlp download or ffmpeg
 """
 import json
 import re
@@ -23,10 +24,13 @@ from getvidyt import (
     StandaloneAudioMetaPP,
     _datetime_now,
     _find_deno_path,
+    _parse_archive_line,
     _sub_to_text,
     build_ydl_opts,
+    load_archive,
     to_youtube_url,
 )
+from cli import _extract_video_id, _cmd_check
 
 
 # ---------------------------------------------------------------------------
@@ -593,3 +597,120 @@ class TestStandaloneAudioMetaProcessSingle:
         info_json.write_text(json.dumps({"id": "abc12345678", "title": "T", "thumbnails": []}))
         (tmp_path / "video.out.mkv").write_bytes(b"")
         assert StandaloneAudioMetaPP.process_single(info_json) is True
+
+
+# ---------------------------------------------------------------------------
+# _parse_archive_line (now in getvidyt.py, also used by load_archive)
+# ---------------------------------------------------------------------------
+
+class TestParseArchiveLineGetvidyt:
+    def test_valid_line(self):
+        assert _parse_archive_line("youtube dQw4w9WgXcQ") == "dQw4w9WgXcQ"
+
+    def test_case_insensitive(self):
+        assert _parse_archive_line("YOUTUBE abc12345678") == "abc12345678"
+
+    def test_blank_returns_none(self):
+        assert _parse_archive_line("") is None
+
+    def test_wrong_platform_returns_none(self):
+        assert _parse_archive_line("vimeo dQw4w9WgXcQ") is None
+
+    def test_no_id_returns_none(self):
+        assert _parse_archive_line("youtube") is None
+
+
+# ---------------------------------------------------------------------------
+# load_archive
+# ---------------------------------------------------------------------------
+
+class TestLoadArchive:
+    def test_returns_ids_from_file(self, tmp_path):
+        f = tmp_path / "archive.txt"
+        f.write_text("youtube dQw4w9WgXcQ\nyoutube abc12345678\n")
+        ids = load_archive(f)
+        assert ids == {"dQw4w9WgXcQ", "abc12345678"}
+
+    def test_missing_file_returns_empty_set(self, tmp_path):
+        ids = load_archive(tmp_path / "nonexistent.txt")
+        assert ids == set()
+
+    def test_ignores_non_youtube_lines(self, tmp_path):
+        f = tmp_path / "archive.txt"
+        f.write_text("vimeo abc123\nyoutube validID123\n")
+        ids = load_archive(f)
+        assert ids == {"validID123"}
+
+    def test_empty_file_returns_empty_set(self, tmp_path):
+        f = tmp_path / "archive.txt"
+        f.write_text("")
+        assert load_archive(f) == set()
+
+    def test_deduplicates(self, tmp_path):
+        f = tmp_path / "archive.txt"
+        f.write_text("youtube dQw4w9WgXcQ\nyoutube dQw4w9WgXcQ\n")
+        assert load_archive(f) == {"dQw4w9WgXcQ"}
+
+
+# ---------------------------------------------------------------------------
+# cli._extract_video_id
+# ---------------------------------------------------------------------------
+
+class TestExtractVideoId:
+    def test_bare_video_id(self):
+        assert _extract_video_id("dQw4w9WgXcQ") == "dQw4w9WgXcQ"
+
+    def test_full_watch_url(self):
+        assert _extract_video_id("https://www.youtube.com/watch?v=dQw4w9WgXcQ") == "dQw4w9WgXcQ"
+
+    def test_url_with_extra_params(self):
+        assert _extract_video_id("https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=42") == "dQw4w9WgXcQ"
+
+    def test_playlist_id_returns_none(self):
+        # Playlist IDs are not 11 chars and have no ?v= param
+        assert _extract_video_id("PLxxxxxxxxxxxxxx") is None
+
+    def test_empty_string_returns_none(self):
+        assert _extract_video_id("") is None
+
+    def test_strips_whitespace(self):
+        assert _extract_video_id("  dQw4w9WgXcQ  ") == "dQw4w9WgXcQ"
+
+
+# ---------------------------------------------------------------------------
+# cli._cmd_check
+# ---------------------------------------------------------------------------
+
+class TestCliCheck:
+    def _make_args(self, target: str, archive: Path):
+        import argparse
+        ns = argparse.Namespace(target=target, archive=str(archive))
+        return ns
+
+    def test_found_returns_0(self, tmp_path):
+        f = tmp_path / "archive.txt"
+        f.write_text("youtube dQw4w9WgXcQ\n")
+        rc = _cmd_check(self._make_args("dQw4w9WgXcQ", f))
+        assert rc == 0
+
+    def test_not_found_returns_1(self, tmp_path):
+        f = tmp_path / "archive.txt"
+        f.write_text("youtube AAAAAAAAAAA\n")
+        rc = _cmd_check(self._make_args("dQw4w9WgXcQ", f))
+        assert rc == 1
+
+    def test_url_lookup_found(self, tmp_path):
+        f = tmp_path / "archive.txt"
+        f.write_text("youtube dQw4w9WgXcQ\n")
+        rc = _cmd_check(self._make_args("https://www.youtube.com/watch?v=dQw4w9WgXcQ", f))
+        assert rc == 0
+
+    def test_missing_archive_returns_1(self, tmp_path):
+        rc = _cmd_check(self._make_args("dQw4w9WgXcQ", tmp_path / "nonexistent.txt"))
+        assert rc == 1
+
+    def test_unrecognised_target_returns_2(self, tmp_path):
+        f = tmp_path / "archive.txt"
+        f.write_text("")
+        rc = _cmd_check(self._make_args("not-an-id", f))
+        assert rc == 2

@@ -4,7 +4,7 @@ PYTHON := python3
 PIP := $(VENV)/bin/pip
 PYTEST := $(VENV)/bin/pytest
 
-.PHONY: setup install run clean test
+.PHONY: setup install dev-install run clean test
 
 # Build the venv (and install requirements) when requirements.txt changes
 $(VENV)/bin/activate: requirements.txt
@@ -20,6 +20,10 @@ setup: $(VENV)/bin/activate
 
 # Install dependencies (alias)
 install: $(VENV)/bin/activate
+
+# Install the dihi package in editable mode (makes `dihi` available on PATH)
+dev-install: $(VENV)/bin/activate
+	$(PIP) install -q -e .
 
 # Run your app using the venv's python
 run: $(VENV)/bin/activate

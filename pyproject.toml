@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dihi"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "yt-dlp",
+    "yt-dlp-ejs",
+    "mutagen",
+    "flask",
+    "flask-cors",
+    "flask-limiter",
+    "gunicorn",
+    "curl_cffi",
+    "requests",
+    "brotli",
+    "websockets",
+]
+
+[project.scripts]
+dihi = "dihi.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
