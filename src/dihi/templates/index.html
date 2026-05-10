@@ -1,0 +1,401 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DIHI Media Library</title>
+<style>
+:root {
+  --bg: #0f0f0f;
+  --surface: #1a1a1a;
+  --surface2: #272727;
+  --border: #333;
+  --text: #f1f1f1;
+  --muted: #aaa;
+  --accent: #3ea6ff;
+  --radius: 8px;
+}
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  background: var(--bg); color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  min-height: 100vh;
+}
+
+/* ── Header ── */
+header {
+  position: sticky; top: 0; z-index: 100;
+  background: var(--surface); border-bottom: 1px solid var(--border);
+  padding: 12px 24px; display: flex; align-items: center; gap: 12px;
+  flex-wrap: wrap;
+}
+.logo { font-size: 1.3rem; font-weight: 700; color: var(--accent); flex-shrink: 0; }
+#search {
+  flex: 1; min-width: 160px; max-width: 460px;
+  background: var(--bg); border: 1px solid var(--border); color: var(--text);
+  padding: 7px 14px; border-radius: 20px; font-size: 0.9rem; outline: none;
+}
+#search:focus { border-color: var(--accent); }
+.hcontrols { display: flex; gap: 8px; align-items: center; margin-left: auto; }
+select {
+  background: var(--surface2); border: 1px solid var(--border); color: var(--text);
+  padding: 6px 10px; border-radius: 6px; font-size: 0.82rem; cursor: pointer; outline: none;
+}
+#count { font-size: 0.82rem; color: var(--muted); white-space: nowrap; }
+
+/* ── Player ── */
+#player-wrap {
+  background: var(--surface); border-bottom: 2px solid var(--accent);
+  padding: 20px 24px; display: none;
+}
+#player-wrap.visible { display: block; }
+.player-inner {
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(280px, 1fr);
+  gap: 20px; max-width: 1400px; margin: 0 auto;
+}
+.player-media { display: flex; flex-direction: column; gap: 0; }
+#vpanel, #apanel { width: 100%; }
+#vpanel {
+  aspect-ratio: 16/9; max-height: 62vh;
+  background: #000; border-radius: var(--radius); display: block; object-fit: contain;
+}
+#apanel { border-radius: var(--radius); margin-top: 10px; accent-color: var(--accent); }
+.player-info { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+#p-title { font-size: 1.1rem; font-weight: 600; line-height: 1.45; }
+.p-meta { font-size: 0.82rem; color: var(--muted); line-height: 1.8; }
+.p-actions { display: flex; gap: 8px; flex-wrap: wrap; padding-top: 4px; }
+.btn {
+  padding: 7px 15px; border-radius: 20px; border: none; cursor: pointer;
+  font-size: 0.82rem; font-weight: 500; white-space: nowrap;
+  transition: opacity .15s;
+}
+.btn:hover { opacity: .75; }
+.btn-primary { background: var(--accent); color: #000; }
+.btn-ghost { background: var(--surface2); color: var(--text); border: 1px solid var(--border); }
+.btn-close { background: transparent; color: var(--muted); border: 1px solid var(--border); margin-left: auto; }
+.vlc-hint {
+  margin-top: auto; font-size: 0.75rem; color: var(--muted);
+  background: var(--surface2); border-radius: 6px; padding: 8px 10px; line-height: 1.5;
+  word-break: break-all;
+}
+.vlc-hint code { color: var(--accent); }
+
+/* ── Grid ── */
+#library { padding: 24px; max-width: 1400px; margin: 0 auto; }
+#grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+  gap: 14px;
+}
+.card {
+  background: var(--surface); border-radius: var(--radius); overflow: hidden;
+  cursor: pointer; border: 2px solid transparent;
+  transition: transform .15s, box-shadow .15s, border-color .15s;
+}
+.card:hover { transform: translateY(-2px); box-shadow: 0 6px 24px rgba(0,0,0,.45); }
+.card.active { border-color: var(--accent); }
+.card-thumb {
+  aspect-ratio: 16/9; background: var(--surface2);
+  position: relative; overflow: hidden;
+}
+.card-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.thumb-ph { width: 100%; height: 100%; display: flex; align-items: center; justify-content: center; font-size: 2.2rem; }
+.badges { position: absolute; bottom: 5px; right: 5px; display: flex; gap: 3px; }
+.badge {
+  font-size: 0.62rem; padding: 2px 5px; border-radius: 3px;
+  background: rgba(0,0,0,.75); color: #fff; font-weight: 700;
+}
+.bv { background: rgba(62,166,255,.85); }
+.ba { background: rgba(0,200,110,.85); }
+.card-body { padding: 10px 12px 12px; }
+.card-title {
+  font-size: 0.83rem; font-weight: 500; line-height: 1.4;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+  margin-bottom: 5px;
+}
+.card-meta { font-size: 0.73rem; color: var(--muted); }
+
+/* ── States ── */
+#status-msg {
+  text-align: center; padding: 80px 20px; color: var(--muted); grid-column: 1/-1;
+}
+.spinner {
+  width: 34px; height: 34px; border: 3px solid var(--border);
+  border-top-color: var(--accent); border-radius: 50%;
+  animation: spin .65s linear infinite; margin: 0 auto 14px;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+@media (max-width: 680px) {
+  .player-inner { grid-template-columns: 1fr; }
+  .vlc-hint { display: none; }
+}
+@media (max-width: 480px) {
+  header { padding: 10px 14px; }
+  #library { padding: 14px; }
+  #grid { grid-template-columns: repeat(auto-fill, minmax(145px, 1fr)); gap: 10px; }
+}
+</style>
+</head>
+<body>
+
+<header>
+  <span class="logo">DIHI</span>
+  <input id="search" type="search" placeholder="Search videos…" autocomplete="off" aria-label="Search">
+  <div class="hcontrols">
+    <select id="sort" aria-label="Sort order">
+      <option value="date-desc">Newest first</option>
+      <option value="date-asc">Oldest first</option>
+      <option value="title-asc">Title A–Z</option>
+      <option value="title-desc">Title Z–A</option>
+      <option value="channel">By channel</option>
+    </select>
+    <span id="count"></span>
+  </div>
+</header>
+
+<div id="player-wrap" role="region" aria-label="Media player">
+  <div class="player-inner">
+    <div class="player-media">
+      <video id="vpanel" controls preload="metadata" playsinline></video>
+      <audio id="apanel" controls preload="metadata" hidden></audio>
+    </div>
+    <div class="player-info">
+      <div id="p-title"></div>
+      <div class="p-meta" id="p-meta"></div>
+      <div class="p-actions">
+        <button class="btn btn-primary" id="btn-video" onclick="setMode('video')">▶ Video</button>
+        <button class="btn btn-ghost"   id="btn-audio" onclick="setMode('audio')">♫ Audio only</button>
+        <button class="btn btn-close"   onclick="closePlayer()">✕</button>
+      </div>
+      <div class="vlc-hint" id="vlc-hint" hidden>
+        Open in VLC:<br>
+        <code id="vlc-url"></code>
+      </div>
+    </div>
+  </div>
+</div>
+
+<main id="library">
+  <div id="grid">
+    <div id="status-msg"><div class="spinner"></div>Loading library…</div>
+  </div>
+</main>
+
+<script>
+'use strict';
+
+const S = {
+  videos: [],
+  filtered: [],
+  current: null,
+  mode: 'video',
+};
+
+const $ = id => document.getElementById(id);
+
+// ── Library fetch ──────────────────────────────────────────────────────────
+
+async function fetchLibrary() {
+  try {
+    const r = await fetch('/api/media/library');
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const data = await r.json();
+    S.videos = data.videos || [];
+  } catch (e) {
+    $('grid').innerHTML = `<div id="status-msg">Failed to load library: ${esc(e.message)}</div>`;
+    return;
+  }
+  applyFilters();
+}
+
+// ── Filter + sort ──────────────────────────────────────────────────────────
+
+function applyFilters() {
+  const q = $('search').value.trim().toLowerCase();
+  const sort = $('sort').value;
+
+  let list = S.videos;
+  if (q) {
+    list = list.filter(v =>
+      v.title.toLowerCase().includes(q) ||
+      v.channel_id.toLowerCase().includes(q) ||
+      v.video_id.toLowerCase().includes(q)
+    );
+  }
+
+  list = [...list].sort((a, b) => {
+    switch (sort) {
+      case 'date-desc': return (b.date || '').localeCompare(a.date || '');
+      case 'date-asc':  return (a.date || '').localeCompare(b.date || '');
+      case 'title-asc': return a.title.localeCompare(b.title);
+      case 'title-desc':return b.title.localeCompare(a.title);
+      case 'channel':
+        return a.channel_id.localeCompare(b.channel_id) ||
+               (b.date || '').localeCompare(a.date || '');
+    }
+    return 0;
+  });
+
+  S.filtered = list;
+  renderGrid();
+}
+
+// ── Grid render ────────────────────────────────────────────────────────────
+
+function renderGrid() {
+  const grid = $('grid');
+  if (!S.filtered.length) {
+    grid.innerHTML = '<div id="status-msg">No videos found.</div>';
+    $('count').textContent = '';
+    return;
+  }
+
+  $('count').textContent = `${S.filtered.length} video${S.filtered.length !== 1 ? 's' : ''}`;
+
+  grid.innerHTML = S.filtered.map(v => {
+    const active = S.current && S.current.video_id === v.video_id ? ' active' : '';
+    const thumb = v.files.thumbnail
+      ? `<img src="${esc(v.files.thumbnail)}" alt="" loading="lazy"
+              onerror="this.replaceWith(Object.assign(document.createElement('div'),{className:'thumb-ph',textContent:'▶'}))">`
+      : `<div class="thumb-ph">▶</div>`;
+    const bv = v.files.video   ? '<span class="badge bv">MKV</span>' : '';
+    const ba = v.files.audio   ? '<span class="badge ba">M4A</span>' : '';
+
+    return `<div class="card${active}" data-id="${esc(v.video_id)}" role="button" tabindex="0"
+              aria-label="${esc(v.title)}">
+      <div class="card-thumb">${thumb}<div class="badges">${bv}${ba}</div></div>
+      <div class="card-body">
+        <div class="card-title">${esc(v.title)}</div>
+        <div class="card-meta">${fmtDate(v.date)} · ${esc(v.channel_id)}</div>
+      </div>
+    </div>`;
+  }).join('');
+
+  // Attach click + keyboard handlers
+  grid.querySelectorAll('.card').forEach(el => {
+    el.addEventListener('click', () => openVideo(el.dataset.id));
+    el.addEventListener('keydown', e => {
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openVideo(el.dataset.id); }
+    });
+  });
+}
+
+// ── Player ─────────────────────────────────────────────────────────────────
+
+function openVideo(videoId) {
+  const v = S.videos.find(x => x.video_id === videoId);
+  if (!v) return;
+  S.current = v;
+  S.mode = v.files.video ? 'video' : 'audio';
+  renderPlayer();
+  $('player-wrap').classList.add('visible');
+  $('player-wrap').scrollIntoView({ behavior: 'smooth', block: 'start' });
+  document.querySelectorAll('.card').forEach(el =>
+    el.classList.toggle('active', el.dataset.id === videoId)
+  );
+}
+
+function renderPlayer() {
+  const v = S.current;
+  if (!v) return;
+
+  $('p-title').textContent = v.title;
+  $('p-meta').innerHTML = [
+    v.date   ? `📅 ${fmtDate(v.date)}` : '',
+    `📁 ${esc(v.channel_id)}`,
+    `🔗 ${esc(v.video_id)}`,
+  ].filter(Boolean).join('<br>');
+
+  const hasVid = !!v.files.video;
+  const hasAud = !!v.files.audio;
+
+  $('btn-video').hidden = !hasVid;
+  $('btn-audio').hidden = !hasAud;
+  $('btn-video').className = `btn ${S.mode === 'video' ? 'btn-primary' : 'btn-ghost'}`;
+  $('btn-audio').className = `btn ${S.mode === 'audio' ? 'btn-primary' : 'btn-ghost'}`;
+
+  const vp = $('vpanel');
+  const ap = $('apanel');
+
+  if (S.mode === 'video' && hasVid) {
+    vp.hidden = false;
+    ap.hidden = true;
+    ap.pause(); ap.src = '';
+    // Rebuild video element to clear stale tracks
+    vp.innerHTML = '';
+    if (v.files.subtitles) {
+      const tr = document.createElement('track');
+      tr.kind = 'subtitles'; tr.src = v.files.subtitles;
+      tr.label = 'English'; tr.default = true;
+      vp.appendChild(tr);
+    }
+    vp.src = v.files.video;
+  } else if (hasAud) {
+    ap.hidden = false;
+    vp.hidden = true;
+    vp.pause(); vp.src = '';
+    ap.src = v.files.audio;
+  }
+
+  // VLC hint – show the URL for the active media so users can copy it
+  const mediaUrl = S.mode === 'video' ? v.files.video : v.files.audio;
+  if (mediaUrl) {
+    const absolute = location.origin + mediaUrl;
+    $('vlc-url').textContent = absolute;
+    $('vlc-hint').hidden = false;
+  } else {
+    $('vlc-hint').hidden = true;
+  }
+}
+
+function setMode(mode) {
+  S.mode = mode;
+  renderPlayer();
+}
+
+function closePlayer() {
+  ['vpanel', 'apanel'].forEach(id => { const el = $(id); el.pause(); el.src = ''; });
+  $('player-wrap').classList.remove('visible');
+  S.current = null;
+  document.querySelectorAll('.card.active').forEach(el => el.classList.remove('active'));
+}
+
+// ── Helpers ────────────────────────────────────────────────────────────────
+
+function esc(s) {
+  return String(s ?? '')
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+function fmtDate(d) {
+  if (!d || d.length !== 8) return d || '';
+  return `${d.slice(0,4)}-${d.slice(4,6)}-${d.slice(6,8)}`;
+}
+
+function activePlayer() {
+  return $('vpanel').hidden ? $('apanel') : $('vpanel');
+}
+
+// ── Keyboard shortcuts ─────────────────────────────────────────────────────
+document.addEventListener('keydown', e => {
+  if (['INPUT', 'SELECT', 'TEXTAREA'].includes(e.target.tagName)) return;
+  if (e.key === 'Escape') { closePlayer(); return; }
+  if (!S.current) return;
+  const p = activePlayer();
+  if (e.key === ' ')           { e.preventDefault(); p.paused ? p.play() : p.pause(); }
+  if (e.key === 'ArrowRight')  { e.preventDefault(); p.currentTime += 10; }
+  if (e.key === 'ArrowLeft')   { e.preventDefault(); p.currentTime -= 10; }
+  if (e.key === 'ArrowUp')     { e.preventDefault(); p.volume = Math.min(1, p.volume + 0.1); }
+  if (e.key === 'ArrowDown')   { e.preventDefault(); p.volume = Math.max(0, p.volume - 0.1); }
+});
+
+$('search').addEventListener('input', applyFilters);
+$('sort').addEventListener('change', applyFilters);
+
+fetchLibrary();
+</script>
+</body>
+</html>
