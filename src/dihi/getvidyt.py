@@ -28,8 +28,11 @@ def _find_deno_path() -> str:
 
     for path in common_paths:
         path = Path(path)
-        if path.exists():
-            return str(path)
+        try:
+            if path.exists():
+                return str(path)
+        except OSError:
+            continue
 
     # Fall back to "deno" and let subprocess handle PATH resolution
     return "deno"
