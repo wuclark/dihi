@@ -5,7 +5,7 @@ PIP := $(VENV)/bin/pip
 PYTEST := $(VENV)/bin/pytest
 DIHI := $(VENV)/bin/dihi
 
-.PHONY: setup install dev-install run clean test
+.PHONY: setup install dev-install run clean test data
 
 # Build the venv (and install requirements) when requirements.txt changes
 $(VENV)/bin/activate: requirements.txt
@@ -37,6 +37,13 @@ run: $(VENV)/bin/activate
 test: $(VENV)/bin/activate
 	$(PIP) install -q -r requirements-dev.txt
 	$(PYTEST) tests/ -v --tb=short --cov=src/dihi --cov-report=term-missing
+
+# Initialise host data files required by docker-compose bind mounts.
+# Docker creates missing mount targets as directories; running this first
+# ensures they are plain files so yt-dlp can read/write them correctly.
+data:
+	mkdir -p data/merged
+	touch data/archive.txt data/cookies.txt
 
 # Clean up the virtual environment
 clean:
