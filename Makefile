@@ -56,7 +56,8 @@ data:
 # Run this before `docker compose up` so the bind-mount target is a real file.
 #   make cookies
 cookies: data $(VENV)/bin/activate
-	@if [ -d "$(_CHROME_PROF)" ]; then \
+	@rm -f data/cookies.txt; \
+	if [ -d "$(_CHROME_PROF)" ]; then \
 		echo "Found Chrome ($(_WIN_USER)) — exporting cookies…"; \
 		$(YTDLP) --cookies-from-browser "chrome:$(_CHROME_PROF)" \
 		          --cookies data/cookies.txt --skip-download \
@@ -104,6 +105,7 @@ cookies-browser: data $(VENV)/bin/activate
 			--no-first-run --no-default-browser-check --no-sandbox \
 			"https://accounts.google.com/ServiceLogin?service=youtube" 2>/dev/null; \
 		echo "Browser closed — extracting cookies from Chrome profile…"; \
+		rm -f data/cookies.txt; \
 		$(YTDLP) --cookies-from-browser "chrome:$$TMPPROF" \
 			--cookies data/cookies.txt --skip-download \
 			"https://www.youtube.com/watch?v=dQw4w9WgXcQ"; \
@@ -112,6 +114,7 @@ cookies-browser: data $(VENV)/bin/activate
 		firefox --profile "$$FFPROF" --no-remote \
 			"https://accounts.google.com/ServiceLogin?service=youtube" 2>/dev/null; \
 		echo "Browser closed — extracting cookies from Firefox profile…"; \
+		rm -f data/cookies.txt; \
 		$(YTDLP) --cookies-from-browser "firefox:$$FFPROF" \
 			--cookies data/cookies.txt --skip-download \
 			"https://www.youtube.com/watch?v=dQw4w9WgXcQ"; \
