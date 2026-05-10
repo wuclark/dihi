@@ -678,25 +678,22 @@ def build_ydl_opts(
         #   one with no automatic reconciliation). The @handle (uploader_id) is also
         #   excluded for the same reason — YouTube now allows creators to change it.
         #
-        # Filename: <upload_date>.<title> [<video_id>].out.<ext>
-        #   The date prefix sorts chronologically in any file browser. The title and
-        #   video ID are repeated in the filename (even though they appear in the
-        #   folder path) so that each file is self-describing when viewed in isolation
-        #   — e.g. when sorting search results or sharing a single file.
+        # Filename: <channel_id>.<video_id>.<upload_date>.<title> [<video_id>].out.<ext>
+        #   The channel_id and video_id prefix makes every file fully self-describing
+        #   outside its directory tree — useful when files appear in search results,
+        #   are shared individually, or are viewed without their parent folders.
+        #   The date follows for chronological sorting. The title and video ID are
+        #   included for human readability.
         #
         #   The ".out." infix between title and extension is load-bearing: it is the
         #   anchor used by AudioMetadataPostProcessor's regex (\.f\d+(?=\.\w+$)) to
         #   strip format IDs from sidecar filenames (e.g. ".out.f140.m4a" → ".out.m4a").
         #   Do not remove it.
         #
-        #   The former "CID_<channel_id>." prefix has been removed because the
-        #   channel ID is already encoded in the parent folder — repeating it in
-        #   every filename added length without new information.
-        #
         # Human-readable names: see MetadataSidecarPostProcessor, which writes
         #   .channel_name / .uploader_id / .uploader_name into the channel folder and
         #   .title_name / .upload_date into the video folder as timestamped log files.
-        "outtmpl": "%(channel_id)s/%(id)s/%(upload_date|NA)s.%(title)s [%(id)s].out.%(ext)s",
+        "outtmpl": "%(channel_id)s/%(id)s/%(channel_id)s.%(id)s.%(upload_date|NA)s.%(title)s [%(id)s].out.%(ext)s",
     }
 
     cookies_file = archive_path.parent / "cookies.txt"
