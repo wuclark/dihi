@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import mimetypes
 import os
 import re
 import threading
@@ -8,10 +9,15 @@ import time
 from pathlib import Path
 from typing import Optional, Set
 
-from flask import Flask, jsonify, request
+from flask import Flask, abort, jsonify, render_template, request, send_file
 from flask_cors import CORS
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
+
+mimetypes.add_type("video/x-matroska", ".mkv")
+mimetypes.add_type("audio/mp4", ".m4a")
+mimetypes.add_type("text/vtt", ".vtt")
+mimetypes.add_type("audio/opus", ".opus")
 
 import getvidyt  # must be importable in this environment
 
@@ -38,6 +44,14 @@ MAX_CONCURRENT_PLAYLIST_DOWNLOADS = 2
 
 # Archive lines look like: "youtube <id>"
 CHECK_FILE = Path("./archive.txt").expanduser().resolve()
+MERGED_DIR = Path("./merged").expanduser().resolve()
+
+# Matches format sidecar files, e.g. Title [id].out.f140.m4a
+_SIDECAR_RE = re.compile(r"\.f\d+\.[^.]+$")
+# Parses the standard output filename to extract metadata
+_FNAME_META_RE = re.compile(
+    r"^CID_(?P<cid>[^.]+)\.(?P<date>\d{8})\.(?P<title>.+?)\s\[(?P<vid>[A-Za-z0-9_-]{11})\]\.out\."
+)
 
 _lock = threading.Lock()
 _cached_mtime: Optional[float] = None
@@ -181,6 +195,94 @@ def _playlist_download_worker(playlist_id: str) -> None:
             _playlist_download_results[playlist_id] = "completed" if success else "failed"
             _playlist_result_timestamps[playlist_id] = time.time()
             _cleanup_old_playlist_results()
+
+
+def _classify_file(fname: str, url: str, files: dict) -> None:
+    """Slot a media file URL into the correct key of a video's files dict."""
+    if _SIDECAR_RE.search(fname):
+        return  # skip .f140.m4a / .f<n>.webm sidecars
+    ext = Path(fname).suffix.lower()
+    if ext == ".mkv":
+        files["video"] = url
+    elif ext in (".mp4", ".webm") and "video" not in files:
+        files["video"] = url
+    elif ext == ".m4a" and "audio" not in files:
+        files["audio"] = url
+    elif ext == ".opus" and "audio" not in files:
+        files["audio"] = url
+    elif ext == ".png" and "thumbnail" not in files:
+        files["thumbnail"] = url
+    elif ext in (".jpg", ".jpeg") and "thumbnail" not in files:
+        files["thumbnail"] = url
+    elif ext == ".vtt" and "subtitles" not in files:
+        files["subtitles"] = url
+    elif ext == ".srt" and "subtitles" not in files:
+        files["subtitles"] = url
+    elif ext == ".json":
+        files["info_json"] = url
+    elif ext == ".description":
+        files["description"] = url
+
+
+def _scan_library() -> list[dict]:
+    """Walk merged/<channel>/<video_id>/ and return a list of video dicts."""
+    if not MERGED_DIR.exists():
+        return []
+    videos = []
+    for channel_dir in sorted(MERGED_DIR.iterdir()):
+        if not channel_dir.is_dir():
+            continue
+        channel_id = channel_dir.name
+        for video_dir in sorted(channel_dir.iterdir()):
+            if not video_dir.is_dir():
+                continue
+            video_id = video_dir.name
+            files: dict = {}
+            title: Optional[str] = None
+            date: Optional[str] = None
+            for f in sorted(video_dir.iterdir()):
+                if not f.is_file():
+                    continue
+                m = _FNAME_META_RE.match(f.name)
+                if m and title is None:
+                    title = m.group("title")
+                    date = m.group("date")
+                url = f"/media/{channel_id}/{video_id}/{f.name}"
+                _classify_file(f.name, url, files)
+            videos.append(
+                {
+                    "video_id": video_id,
+                    "channel_id": channel_id,
+                    "title": title or video_id,
+                    "date": date,
+                    "files": files,
+                }
+            )
+    return videos
+
+
+@app.get("/")
+def index():
+    return render_template("index.html")
+
+
+@app.get("/api/media/library")
+@limiter.limit("30 per minute")
+def api_media_library():
+    return jsonify(videos=_scan_library())
+
+
+@app.get("/media/<path:filepath>")
+def serve_media(filepath: str):
+    try:
+        full_path = (MERGED_DIR / filepath).resolve()
+    except Exception:
+        abort(400)
+    if not full_path.is_relative_to(MERGED_DIR):
+        abort(403)
+    if not full_path.is_file():
+        abort(404)
+    return send_file(full_path, conditional=True)
 
 
 @app.get("/api/youtube/<string:video_id>")
