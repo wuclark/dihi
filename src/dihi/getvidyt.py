@@ -709,6 +709,10 @@ def build_ydl_opts(
         deno_path = _find_deno_path()
         ydl_opts["js_runtimes"] = {"deno": {"path": deno_path}}
         ydl_opts["remote_components"] = ["ejs:github", "ejs:npm"]
+        # EJS solves challenges for the standard web player (player_ias.vflset/base.js)
+        # but not for the TV client (tv-player-ias.js), which produces the
+        # "found 0 n function possibilities" warning. Restrict to clients EJS supports.
+        ydl_opts["extractor_args"] = {"youtube": {"player_client": ["web", "ios"]}}
     if extra_opts:
         # Allow caller to override anything (format, outtmpl, paths, etc.)
         ydl_opts.update(extra_opts)
