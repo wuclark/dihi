@@ -218,21 +218,21 @@ Videos are saved under `merged/` with a permanent two-level folder structure:
 
 ```
 merged/
-└── <channel_id>/                                        # YouTube channel ID (never changes)
-    ├── .channel_name                                    # Channel display name history
-    ├── .uploader_id                                     # @handle history
-    ├── .uploader_name                                   # Uploader name history
-    └── <video_id>/                                      # YouTube video ID (never changes)
-        ├── <date>.<title> [<id>].out.mkv                # Merged video (AV1 + Opus)
-        ├── <date>.<title> [<id>].out.f140.m4a           # Pre-merge AAC audio sidecar
-        ├── <date>.<title> [<id>].out.m4a                # Clean audio copy (with --audio-meta)
-        ├── <date>.<title> [<id>].out.info.json          # Full yt-dlp metadata
-        ├── <date>.<title> [<id>].out.description        # Video description
-        ├── <date>.<title> [<id>].out.png                # Thumbnail (PNG)
-        ├── <date>.<title> [<id>].out.en.vtt             # English subtitles
-        ├── <date>.<title> [<id>].out.en-orig.vtt        # Native-language transcript (non-English only)
-        ├── .title_name                                  # Video title history
-        └── .upload_date                                 # Upload date history
+└── <channel_id>/                                                              # YouTube channel ID (never changes)
+    ├── .channel_name                                                          # Channel display name history
+    ├── .uploader_id                                                           # @handle history
+    ├── .uploader_name                                                         # Uploader name history
+    └── <video_id>/                                                            # YouTube video ID (never changes)
+        ├── <channel_id>.<video_id>.<date>.<title> [<video_id>].out.mkv       # Merged video (AV1 + Opus)
+        ├── <channel_id>.<video_id>.<date>.<title> [<video_id>].out.f140.m4a  # Pre-merge AAC audio sidecar
+        ├── <channel_id>.<video_id>.<date>.<title> [<video_id>].out.m4a       # Clean audio copy (--audio-meta)
+        ├── <channel_id>.<video_id>.<date>.<title> [<video_id>].out.info.json # Full yt-dlp metadata
+        ├── <channel_id>.<video_id>.<date>.<title> [<video_id>].out.description
+        ├── <channel_id>.<video_id>.<date>.<title> [<video_id>].out.png       # Thumbnail (PNG)
+        ├── <channel_id>.<video_id>.<date>.<title> [<video_id>].out.en.vtt    # English subtitles
+        ├── <channel_id>.<video_id>.<date>.<title> [<video_id>].out.en-orig.vtt  # Non-English only
+        ├── .title_name                                                        # Video title history
+        └── .upload_date                                                       # Upload date history
 ```
 
 ### Why channel_id/video_id folders?
