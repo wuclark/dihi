@@ -7,6 +7,8 @@ services:
       - "5000:5000"
     volumes:
       # Persistent data
+      # Note: host files must exist before `docker compose up` or Docker will
+      # create them as directories. Run `make data` to initialise them.
       - ./data/archive.txt:/app/archive.txt
       - ./data/cookies.txt:/app/cookies.txt
       - ./data/merged:/app/merged

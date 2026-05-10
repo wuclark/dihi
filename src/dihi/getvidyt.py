@@ -700,7 +700,7 @@ def build_ydl_opts(
     }
 
     cookies_file = archive_path.parent / "cookies.txt"
-    if cookies_file.exists():
+    if cookies_file.is_file():
         ydl_opts["cookiefile"] = str(cookies_file)
     if cookies_browser:
         ydl_opts["cookiesfrombrowser"] = (cookies_browser,)
