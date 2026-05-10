@@ -4,8 +4,14 @@ PYTHON := python3
 PIP := $(VENV)/bin/pip
 PYTEST := $(VENV)/bin/pytest
 DIHI := $(VENV)/bin/dihi
+YTDLP := $(VENV)/bin/yt-dlp
 
-.PHONY: setup install dev-install run clean test data
+# WSL2: detect Windows username and locate browser profiles on the host C: drive
+_WIN_USER     := $(shell cmd.exe /c "echo %USERNAME%" 2>/dev/null | tr -d '\r\n')
+_CHROME_PROF  := /mnt/c/Users/$(_WIN_USER)/AppData/Local/Google/Chrome/User Data
+_EDGE_PROF    := /mnt/c/Users/$(_WIN_USER)/AppData/Local/Microsoft/Edge/User Data
+
+.PHONY: setup install dev-install run clean test data cookies
 
 # Build the venv (and install requirements) when requirements.txt changes
 $(VENV)/bin/activate: requirements.txt
@@ -44,6 +50,29 @@ test: $(VENV)/bin/activate
 data:
 	mkdir -p data/merged
 	touch data/archive.txt data/cookies.txt
+
+# Export YouTube cookies from your Windows browser into data/cookies.txt (WSL2 only).
+# Tries Chrome → Edge → Firefox in order; stops at the first one found.
+# Run this before `docker compose up` so the bind-mount target is a real file.
+#   make cookies
+cookies: data $(VENV)/bin/activate
+	@if [ -d "$(_CHROME_PROF)" ]; then \
+		echo "Found Chrome ($(_WIN_USER)) — exporting cookies…"; \
+		$(YTDLP) --cookies-from-browser "chrome:$(_CHROME_PROF)" \
+		          --cookies data/cookies.txt --skip-download \
+		          "https://www.youtube.com/watch?v=dQw4w9WgXcQ"; \
+	elif [ -d "$(_EDGE_PROF)" ]; then \
+		echo "Found Edge ($(_WIN_USER)) — exporting cookies…"; \
+		$(YTDLP) --cookies-from-browser "edge:$(_EDGE_PROF)" \
+		          --cookies data/cookies.txt --skip-download \
+		          "https://www.youtube.com/watch?v=dQw4w9WgXcQ"; \
+	else \
+		echo "Chrome/Edge not found — trying Firefox…"; \
+		$(YTDLP) --cookies-from-browser firefox \
+		          --cookies data/cookies.txt --skip-download \
+		          "https://www.youtube.com/watch?v=dQw4w9WgXcQ"; \
+	fi
+	@echo "Done — cookies written to data/cookies.txt"
 
 # Clean up the virtual environment
 clean:
