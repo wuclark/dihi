@@ -41,6 +41,13 @@ select {
   background: var(--surface2); border: 1px solid var(--border); color: var(--text);
   padding: 6px 10px; border-radius: 6px; font-size: 0.82rem; cursor: pointer; outline: none;
 }
+.hbtn {
+  background: var(--surface2); border: 1px solid var(--border); color: var(--text);
+  padding: 6px 10px; border-radius: 6px; font-size: 0.82rem; cursor: pointer;
+  white-space: nowrap;
+}
+.hbtn:hover { border-color: var(--accent); }
+.hbtn.active { background: var(--accent); border-color: var(--accent); color: #000; }
 #count { font-size: 0.82rem; color: var(--muted); white-space: nowrap; }
 
 /* ── Player ── */
@@ -59,6 +66,7 @@ select {
 #vpanel {
   aspect-ratio: 16/9; max-height: 62vh;
   background: #000; border-radius: var(--radius); display: block; object-fit: contain;
+  cursor: pointer;
 }
 #apanel { border-radius: var(--radius); margin-top: 10px; accent-color: var(--accent); }
 .player-info { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
@@ -80,6 +88,41 @@ select {
   word-break: break-all;
 }
 .vlc-hint code { color: var(--accent); }
+.asset-details {
+  display: grid; gap: 10px; min-width: 0;
+  font-size: 0.78rem;
+}
+.asset-details details {
+  border: 1px solid var(--border); border-radius: 6px;
+  background: var(--surface2); overflow: hidden;
+}
+.asset-details summary {
+  cursor: pointer; padding: 8px 10px; color: var(--text);
+  font-weight: 600; list-style-position: inside;
+}
+.file-list, .meta-list {
+  display: grid; gap: 1px; max-height: 260px; overflow: auto;
+  border-top: 1px solid var(--border);
+}
+.file-row, .meta-row {
+  display: grid; gap: 8px; align-items: center;
+  padding: 7px 10px; background: var(--surface);
+}
+.file-row {
+  grid-template-columns: minmax(80px, .45fr) minmax(0, 1fr) auto;
+}
+.file-kind, .file-size, .meta-key { color: var(--muted); font-size: 0.72rem; }
+.file-name, .meta-val { min-width: 0; overflow-wrap: anywhere; }
+.file-name a { color: var(--accent); text-decoration: none; }
+.file-name a:hover { text-decoration: underline; }
+.meta-row { grid-template-columns: minmax(100px, .35fr) minmax(0, 1fr); }
+.metadata-json {
+  margin: 0; padding: 10px; max-height: 360px; overflow: auto;
+  border-top: 1px solid var(--border); background: #111; color: var(--text);
+  font: 0.72rem/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  white-space: pre-wrap; overflow-wrap: anywhere;
+}
+.detail-empty { padding: 9px 10px; color: var(--muted); border-top: 1px solid var(--border); }
 
 /* ── Grid ── */
 #library { padding: 24px; max-width: 1400px; margin: 0 auto; }
@@ -119,6 +162,17 @@ select {
 /* ── States ── */
 #status-msg {
   text-align: center; padding: 80px 20px; color: var(--muted); grid-column: 1/-1;
+}
+#load-more-wrap {
+  grid-column: 1/-1; display: flex; justify-content: center; padding: 18px 0 6px;
+}
+#load-more-btn {
+  background: var(--surface2); border: 1px solid var(--border); color: var(--text);
+  padding: 8px 16px; border-radius: 6px; font-size: 0.86rem; cursor: pointer;
+}
+#load-more-btn:hover { border-color: var(--accent); }
+#playback-msg {
+  margin-top: 10px; color: var(--muted); font-size: 0.82rem; min-height: 1.2em;
 }
 .spinner {
   width: 34px; height: 34px; border: 3px solid var(--border);
@@ -199,6 +253,8 @@ select {
   <span class="logo">DIHI</span>
   <input id="search" type="search" placeholder="Search videos…" autocomplete="off" aria-label="Search">
   <div class="hcontrols">
+    <button class="hbtn" id="play-all-btn" type="button" onclick="playAll()">▶ Play All</button>
+    <a class="hbtn" href="/tags">Tags</a>
     <select id="sort" aria-label="Sort order">
       <option value="date-desc">Newest first</option>
       <option value="date-asc">Oldest first</option>
@@ -225,6 +281,7 @@ select {
     <div class="player-media">
       <video id="vpanel" controls preload="metadata" playsinline></video>
       <audio id="apanel" controls preload="metadata" hidden></audio>
+      <div id="playback-msg" role="status" aria-live="polite"></div>
     </div>
     <div class="player-info">
       <div id="p-title"></div>
@@ -238,6 +295,7 @@ select {
         Open in VLC:<br>
         <code id="vlc-url"></code>
       </div>
+      <div class="asset-details" id="asset-details"></div>
     </div>
   </div>
 </div>
@@ -255,8 +313,12 @@ const S = {
   videos: [],
   filtered: [],
   current: null,
+  details: null,
   mode: 'video',
+  playAll: false,
+  renderLimit: 96,
 };
+const GRID_BATCH = 96;
 
 const $ = id => document.getElementById(id);
 
@@ -304,7 +366,12 @@ function applyFilters() {
   });
 
   S.filtered = list;
+  S.renderLimit = GRID_BATCH;
+  if (S.playAll && S.current && !list.some(v => v.video_id === S.current.video_id)) {
+    S.playAll = false;
+  }
   renderGrid();
+  updatePlayAllButton();
 }
 
 // ── Grid render ────────────────────────────────────────────────────────────
@@ -317,12 +384,16 @@ function renderGrid() {
     return;
   }
 
-  $('count').textContent = `${S.filtered.length} video${S.filtered.length !== 1 ? 's' : ''}`;
+  const shown = Math.min(S.renderLimit, S.filtered.length);
+  $('count').textContent = shown === S.filtered.length
+    ? `${S.filtered.length} video${S.filtered.length !== 1 ? 's' : ''}`
+    : `${shown} of ${S.filtered.length} videos`;
 
-  grid.innerHTML = S.filtered.map(v => {
+  const visible = S.filtered.slice(0, S.renderLimit);
+  grid.innerHTML = visible.map(v => {
     const active = S.current && S.current.video_id === v.video_id ? ' active' : '';
     const thumb = v.files.thumbnail
-      ? `<img src="${esc(v.files.thumbnail)}" alt="" loading="lazy"
+      ? `<img src="${esc(v.files.thumbnail)}" alt="" loading="lazy" decoding="async" fetchpriority="low"
               onerror="this.replaceWith(Object.assign(document.createElement('div'),{className:'thumb-ph',textContent:'▶'}))">`
       : `<div class="thumb-ph">▶</div>`;
     const bv = v.files.video   ? '<span class="badge bv">MKV</span>' : '';
@@ -336,7 +407,9 @@ function renderGrid() {
         <div class="card-meta">${fmtDate(v.date)} · ${esc(v.channel_id)}</div>
       </div>
     </div>`;
-  }).join('');
+  }).join('') + (S.renderLimit < S.filtered.length
+    ? `<div id="load-more-wrap"><button id="load-more-btn" type="button">Load more</button></div>`
+    : '');
 
   // Attach click + keyboard handlers
   grid.querySelectorAll('.card').forEach(el => {
@@ -345,6 +418,12 @@ function renderGrid() {
       if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openVideo(el.dataset.id); }
     });
   });
+  $('load-more-btn')?.addEventListener('click', loadMoreVideos);
+}
+
+function loadMoreVideos() {
+  S.renderLimit += GRID_BATCH;
+  renderGrid();
 }
 
 // ── Player ─────────────────────────────────────────────────────────────────
@@ -353,13 +432,67 @@ function openVideo(videoId) {
   const v = S.videos.find(x => x.video_id === videoId);
   if (!v) return;
   S.current = v;
+  S.details = null;
   S.mode = v.files.video ? 'video' : 'audio';
+  $('playback-msg').textContent = '';
   renderPlayer();
+  loadDetails(v);
   $('player-wrap').classList.add('visible');
   $('player-wrap').scrollIntoView({ behavior: 'smooth', block: 'start' });
   document.querySelectorAll('.card').forEach(el =>
     el.classList.toggle('active', el.dataset.id === videoId)
   );
+}
+
+function playableList() {
+  return S.filtered.filter(v => v.files.video || v.files.audio);
+}
+
+function playAll() {
+  const list = playableList();
+  if (!list.length) return;
+  S.playAll = true;
+  updatePlayAllButton();
+  const start = S.current && list.some(v => v.video_id === S.current.video_id)
+    ? S.current
+    : list[0];
+  openVideo(start.video_id);
+  playActiveMedia();
+}
+
+function stopPlayAll() {
+  S.playAll = false;
+  updatePlayAllButton();
+}
+
+function updatePlayAllButton() {
+  const btn = $('play-all-btn');
+  if (!btn) return;
+  btn.classList.toggle('active', S.playAll);
+  btn.textContent = S.playAll ? 'Playing All' : '▶ Play All';
+  btn.disabled = !playableList().length;
+}
+
+function playActiveMedia() {
+  const p = activePlayer();
+  if (!p || p.hidden || !p.src) return;
+  $('playback-msg').textContent = '';
+  p.play().catch(e => {
+    $('playback-msg').textContent = e?.message || 'Playback could not start.';
+  });
+}
+
+function playNext() {
+  if (!S.playAll || !S.current) return;
+  const list = playableList();
+  const idx = list.findIndex(v => v.video_id === S.current.video_id);
+  const next = idx >= 0 ? list[idx + 1] : null;
+  if (!next) {
+    stopPlayAll();
+    return;
+  }
+  openVideo(next.video_id);
+  playActiveMedia();
 }
 
 function renderPlayer() {
@@ -387,7 +520,7 @@ function renderPlayer() {
   if (S.mode === 'video' && hasVid) {
     vp.hidden = false;
     ap.hidden = true;
-    ap.pause(); ap.src = '';
+    resetMedia(ap);
     // Rebuild video element to clear stale tracks
     vp.innerHTML = '';
     if (v.files.subtitles) {
@@ -396,12 +529,14 @@ function renderPlayer() {
       tr.label = 'English'; tr.default = true;
       vp.appendChild(tr);
     }
-    vp.src = v.files.video;
+    vp.poster = v.files.thumbnail || '';
+    if (vp.src !== location.origin + v.files.video) vp.src = v.files.video;
   } else if (hasAud) {
     ap.hidden = false;
     vp.hidden = true;
-    vp.pause(); vp.src = '';
-    ap.src = v.files.audio;
+    resetMedia(vp);
+    vp.poster = '';
+    if (ap.src !== location.origin + v.files.audio) ap.src = v.files.audio;
   }
 
   // VLC hint – show the URL for the active media so users can copy it
@@ -413,18 +548,103 @@ function renderPlayer() {
   } else {
     $('vlc-hint').hidden = true;
   }
+
+  renderAssetDetails();
 }
 
 function setMode(mode) {
   S.mode = mode;
+  $('playback-msg').textContent = '';
   renderPlayer();
 }
 
 function closePlayer() {
-  ['vpanel', 'apanel'].forEach(id => { const el = $(id); el.pause(); el.src = ''; });
+  ['vpanel', 'apanel'].forEach(id => resetMedia($(id)));
   $('player-wrap').classList.remove('visible');
   S.current = null;
+  S.details = null;
+  S.playAll = false;
+  updatePlayAllButton();
+  $('asset-details').innerHTML = '';
+  $('playback-msg').textContent = '';
   document.querySelectorAll('.card.active').forEach(el => el.classList.remove('active'));
+}
+
+async function loadDetails(video) {
+  $('asset-details').innerHTML = '<div class="detail-empty">Loading details...</div>';
+  try {
+    const r = await fetch(`/api/media/details/${encodeURIComponent(video.channel_id)}/${encodeURIComponent(video.video_id)}`);
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const details = await r.json();
+    if (!S.current || S.current.video_id !== video.video_id) return;
+    S.details = details;
+    renderAssetDetails();
+  } catch (e) {
+    if (S.current && S.current.video_id === video.video_id) {
+      $('asset-details').innerHTML = `<div class="detail-empty">Failed to load details: ${esc(e.message)}</div>`;
+    }
+  }
+}
+
+function renderAssetDetails() {
+  if (!S.current) return;
+  const details = S.details;
+  const files = details?.files || [];
+  const metadata = details?.metadata || null;
+  const fileRows = files.length
+    ? files.map(f => `<div class="file-row">
+        <span class="file-kind">${esc(f.kind || 'file')}</span>
+        <span class="file-name"><a href="${esc(f.url)}" target="_blank" rel="noopener">${esc(f.name)}</a></span>
+        <span class="file-size">${fmtBytes(f.size)}</span>
+      </div>`).join('')
+    : '<div class="detail-empty">No files found.</div>';
+
+  const historyRows = metadata ? renderMetadataRows(metadata) : '<div class="detail-empty">Metadata loading...</div>';
+  const infoJson = metadata?.info_json
+    ? esc(JSON.stringify(metadata.info_json, null, 2))
+    : esc(metadata?.info_json_error || 'No .info.json metadata found.');
+
+  $('asset-details').innerHTML = `
+    <details open>
+      <summary>Files (${files.length})</summary>
+      <div class="file-list">${fileRows}</div>
+    </details>
+    <details open>
+      <summary>Metadata</summary>
+      <div class="meta-list">${historyRows}</div>
+    </details>
+    <details>
+      <summary>info.json</summary>
+      <pre class="metadata-json">${infoJson}</pre>
+    </details>`;
+}
+
+function renderMetadataRows(metadata) {
+  const rows = [];
+  const addHistory = (label, values) => {
+    if (!values?.length) return;
+    for (const row of values) rows.push([label, `${row.timestamp} ${row.value}`]);
+  };
+  addHistory('channel_name', metadata.channel?.channel_name);
+  addHistory('uploader_id', metadata.channel?.uploader_id);
+  addHistory('uploader_name', metadata.channel?.uploader_name);
+  addHistory('title_name', metadata.video?.title_name);
+  addHistory('upload_date', metadata.video?.upload_date);
+
+  const info = metadata.info_json || {};
+  for (const key of ['id', 'title', 'channel', 'channel_id', 'uploader', 'uploader_id',
+                     'upload_date', 'timestamp', 'duration', 'view_count', 'like_count',
+                     'categories', 'tags', 'webpage_url']) {
+    if (info[key] !== undefined && info[key] !== null && info[key] !== '') {
+      rows.push([key, typeof info[key] === 'object' ? JSON.stringify(info[key]) : String(info[key])]);
+    }
+  }
+
+  if (!rows.length) return '<div class="detail-empty">No metadata found.</div>';
+  return rows.map(([k, v]) => `<div class="meta-row">
+    <span class="meta-key">${esc(k)}</span>
+    <span class="meta-val">${esc(v)}</span>
+  </div>`).join('');
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -440,8 +660,27 @@ function fmtDate(d) {
   return `${d.slice(0,4)}-${d.slice(4,6)}-${d.slice(6,8)}`;
 }
 
+function fmtBytes(n) {
+  const size = Number(n);
+  if (!Number.isFinite(size)) return '';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let value = size;
+  let i = 0;
+  while (value >= 1024 && i < units.length - 1) {
+    value /= 1024;
+    i += 1;
+  }
+  return `${value.toFixed(i ? 1 : 0)} ${units[i]}`;
+}
+
 function activePlayer() {
   return $('vpanel').hidden ? $('apanel') : $('vpanel');
+}
+
+function resetMedia(el) {
+  el.pause();
+  el.removeAttribute('src');
+  el.load();
 }
 
 // ── Keyboard shortcuts ─────────────────────────────────────────────────────
@@ -450,7 +689,7 @@ document.addEventListener('keydown', e => {
   if (e.key === 'Escape') { closePlayer(); return; }
   if (!S.current) return;
   const p = activePlayer();
-  if (e.key === ' ')           { e.preventDefault(); p.paused ? p.play() : p.pause(); }
+  if (e.key === ' ')           { e.preventDefault(); p.paused ? playActiveMedia() : p.pause(); }
   if (e.key === 'ArrowRight')  { e.preventDefault(); p.currentTime += 10; }
   if (e.key === 'ArrowLeft')   { e.preventDefault(); p.currentTime -= 10; }
   if (e.key === 'ArrowUp')     { e.preventDefault(); p.volume = Math.min(1, p.volume + 0.1); }
@@ -588,7 +827,7 @@ function startPollVideo(entry) {
       const r = await fetch(`/api/youtube/status/${encodeURIComponent(entry.id)}`);
       if (!r.ok) return;
       const data = await r.json();
-      if (!data.downloading) {
+      if (data.in_archive || data.result) {
         clearInterval(entry.timerId);
         entry.state = (data.result === 'completed' || data.in_archive) ? 'done' : 'failed';
         upsertDlItem(entry);
@@ -606,7 +845,7 @@ function startPollPlaylist(entry) {
       const r = await fetch(`/api/youtube/playlist/status/${encodeURIComponent(entry.id)}`);
       if (!r.ok) return;
       const data = await r.json();
-      if (!data.downloading) {
+      if (data.result) {
         clearInterval(entry.timerId);
         entry.state = data.result === 'completed' ? 'done' : 'failed';
         upsertDlItem(entry);
@@ -617,6 +856,22 @@ function startPollPlaylist(entry) {
 }
 
 $('dl-input').addEventListener('keydown', e => { if (e.key === 'Enter') submitDownload(); });
+
+$('vpanel').addEventListener('click', e => {
+  const vp = e.currentTarget;
+  if (vp.hidden || !vp.src) return;
+  if (vp.paused) playActiveMedia();
+  else vp.pause();
+});
+
+$('vpanel').addEventListener('ended', playNext);
+$('apanel').addEventListener('ended', playNext);
+$('vpanel').addEventListener('error', () => {
+  $('playback-msg').textContent = 'This video format may not be playable in the browser. Use the VLC URL below or try audio only.';
+});
+$('apanel').addEventListener('error', () => {
+  $('playback-msg').textContent = 'This audio file could not be played in the browser.';
+});
 
 $('search').addEventListener('input', applyFilters);
 $('sort').addEventListener('change', applyFilters);

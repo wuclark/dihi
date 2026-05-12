@@ -15,8 +15,10 @@ ENV PATH="${DENO_INSTALL}/bin:${PATH}"
 # Set working directory
 WORKDIR /app
 
-# Copy requirements first for better caching
+# Copy package metadata and source so the local editable install can resolve
+COPY pyproject.toml .
 COPY requirements.txt .
+COPY src ./src
 
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
@@ -39,4 +41,4 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:${PORT}/health || exit 1
 
 # Run the application with Gunicorn
-CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "2", "--threads", "4", "app3:app"]
+CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "1", "--threads", "8", "app3:app"]

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import mimetypes
+import json
 import os
 import re
 import threading
@@ -50,7 +51,8 @@ MERGED_DIR = Path("./merged").expanduser().resolve()
 _SIDECAR_RE = re.compile(r"\.f\d+\.[^.]+$")
 # Parses the standard output filename to extract metadata
 _FNAME_META_RE = re.compile(
-    r"^CID_(?P<cid>[^.]+)\.(?P<date>\d{8})\.(?P<title>.+?)\s\[(?P<vid>[A-Za-z0-9_-]{11})\]\.out\."
+    r"^(?:(?P<channel_id>[^.]+)\.(?P<prefix_vid>[A-Za-z0-9_-]{11})\.)?"
+    r"(?P<date>\d{8})\.(?P<title>.+?)\s\[(?P<vid>[A-Za-z0-9_-]{11})\]\.out\."
 )
 
 _lock = threading.Lock()
@@ -139,12 +141,12 @@ def _cleanup_old_results() -> None:
 def _download_worker(video_id: str) -> None:
     """
     Actually runs:
-      getvidyt.download_youtube(video_id)
+      getvidyt.download_youtube(video_id, audio_meta=True)
     Tracks completion status for proper UI feedback.
     """
     success = False
     try:
-        getvidyt.download_youtube(video_id)
+        getvidyt.download_youtube(video_id, audio_meta=True)
         # Give filesystem time to sync archive.txt
         time.sleep(0.5)
         # Force cache refresh and check if video is now in archive
@@ -179,7 +181,7 @@ def _cleanup_old_playlist_results() -> None:
 def _playlist_download_worker(playlist_id: str) -> None:
     """Download all videos from a YouTube playlist via getvidyt."""
     try:
-        rc = getvidyt.download_youtube(playlist_id)
+        rc = getvidyt.download_youtube(playlist_id, audio_meta=True)
         # Force cache refresh so status can report archive contents
         global _cached_mtime
         with _lock:
@@ -212,7 +214,7 @@ def _classify_file(fname: str, url: str, files: dict) -> None:
         files["audio"] = url
     elif ext == ".png" and "thumbnail" not in files:
         files["thumbnail"] = url
-    elif ext in (".jpg", ".jpeg") and "thumbnail" not in files:
+    elif ext in (".jpg", ".jpeg", ".webp") and "thumbnail" not in files:
         files["thumbnail"] = url
     elif ext == ".vtt" and "subtitles" not in files:
         files["subtitles"] = url
@@ -222,6 +224,75 @@ def _classify_file(fname: str, url: str, files: dict) -> None:
         files["info_json"] = url
     elif ext == ".description":
         files["description"] = url
+
+
+def _file_kind(path: Path) -> str:
+    name = path.name
+    if _SIDECAR_RE.search(name):
+        return "sidecar"
+    ext = path.suffix.lower()
+    if ext in {".mkv", ".mp4", ".webm"}:
+        return "video"
+    if ext in {".m4a", ".opus", ".mp3"}:
+        return "audio"
+    if ext in {".png", ".jpg", ".jpeg", ".webp"}:
+        return "thumbnail"
+    if ext in {".vtt", ".srt"}:
+        return "subtitle"
+    if name.endswith(".formats.json"):
+        return "formats"
+    if ext == ".json":
+        return "metadata"
+    if ext == ".description":
+        return "description"
+    if name.startswith("."):
+        return "history"
+    return "file"
+
+
+def _media_file_entry(path: Path, channel_id: str, video_id: str) -> dict:
+    stat = path.stat()
+    return {
+        "name": path.name,
+        "url": f"/media/{channel_id}/{video_id}/{path.name}",
+        "kind": _file_kind(path),
+        "size": stat.st_size,
+        "mtime": stat.st_mtime,
+    }
+
+
+def _media_file_url(channel_id: str, video_id: str, filename: str) -> str:
+    return f"/media/{channel_id}/{video_id}/{filename}"
+
+
+def _read_history_file(path: Path) -> list[dict]:
+    if not path.is_file():
+        return []
+    rows = []
+    for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        ts, _, value = line.partition(" ")
+        rows.append({"timestamp": ts, "value": value})
+    return rows
+
+
+def _safe_metadata_value(value):
+    try:
+        json.dumps(value)
+        return value
+    except TypeError:
+        return str(value)
+
+
+def _load_info_json(video_dir: Path) -> tuple[Optional[dict], Optional[str]]:
+    for path in sorted(video_dir.glob("*.info.json")):
+        try:
+            return json.loads(path.read_text(encoding="utf-8", errors="ignore")), None
+        except Exception as e:
+            return None, str(e)
+    return None, None
 
 
 def _scan_library() -> list[dict]:
@@ -247,7 +318,7 @@ def _scan_library() -> list[dict]:
                 if m and title is None:
                     title = m.group("title")
                     date = m.group("date")
-                url = f"/media/{channel_id}/{video_id}/{f.name}"
+                url = _media_file_url(channel_id, video_id, f.name)
                 _classify_file(f.name, url, files)
             videos.append(
                 {
@@ -261,15 +332,86 @@ def _scan_library() -> list[dict]:
     return videos
 
 
+def _scan_tags() -> dict:
+    videos = _scan_library()
+    tags: dict[str, list[dict]] = {}
+    for video in videos:
+        video_dir = MERGED_DIR / video["channel_id"] / video["video_id"]
+        info, _error = _load_info_json(video_dir)
+        for tag in info.get("tags") or [] if info else []:
+            tag = str(tag).strip()
+            if not tag:
+                continue
+            tags.setdefault(tag, []).append(video)
+
+    return {
+        "tags": [
+            {"tag": tag, "count": len(items)}
+            for tag, items in sorted(tags.items(), key=lambda item: (-len(item[1]), item[0].lower()))
+        ],
+        "videos_by_tag": tags,
+    }
+
+
 @app.get("/")
 def index():
     return render_template("index.html")
+
+
+@app.get("/tags")
+def tags_page():
+    return render_template("tags.html")
 
 
 @app.get("/api/media/library")
 @limiter.limit("30 per minute")
 def api_media_library():
     return jsonify(videos=_scan_library())
+
+
+@app.get("/api/media/tags")
+@limiter.limit("30 per minute")
+def api_media_tags():
+    return jsonify(_scan_tags())
+
+
+@app.get("/api/media/details/<string:channel_id>/<string:video_id>")
+@limiter.limit("60 per minute")
+def api_media_details(channel_id: str, video_id: str):
+    if not PLAYLIST_ID_RE.match(channel_id) or not YOUTUBE_ID_RE.match(video_id):
+        return jsonify(error="invalid id"), 400
+
+    video_dir = (MERGED_DIR / channel_id / video_id).resolve()
+    if not video_dir.is_relative_to(MERGED_DIR):
+        abort(403)
+    if not video_dir.is_dir():
+        abort(404)
+
+    files = [
+        _media_file_entry(path, channel_id, video_id)
+        for path in sorted(video_dir.iterdir())
+        if path.is_file()
+    ]
+    info_json, info_error = _load_info_json(video_dir)
+    if info_json:
+        info_json = {k: _safe_metadata_value(v) for k, v in info_json.items()}
+
+    channel_dir = MERGED_DIR / channel_id
+    metadata = {
+        "channel": {
+            "channel_name": _read_history_file(channel_dir / ".channel_name"),
+            "uploader_id": _read_history_file(channel_dir / ".uploader_id"),
+            "uploader_name": _read_history_file(channel_dir / ".uploader_name"),
+        },
+        "video": {
+            "title_name": _read_history_file(video_dir / ".title_name"),
+            "upload_date": _read_history_file(video_dir / ".upload_date"),
+        },
+        "info_json": info_json,
+        "info_json_error": info_error,
+    }
+
+    return jsonify(channel_id=channel_id, video_id=video_id, files=files, metadata=metadata)
 
 
 @app.get("/media/<path:filepath>")
@@ -282,7 +424,10 @@ def serve_media(filepath: str):
         abort(403)
     if not full_path.is_file():
         abort(404)
-    return send_file(full_path, conditional=True)
+    response = send_file(full_path, conditional=True)
+    response.headers.setdefault("Accept-Ranges", "bytes")
+    response.headers.setdefault("Cache-Control", "public, max-age=86400")
+    return response
 
 
 @app.get("/api/youtube/<string:video_id>")
@@ -311,7 +456,7 @@ def api_youtube_get(video_id: str):
 
     Triggers:
       import getvidyt
-      getvidyt.download_youtube("<id>")
+      getvidyt.download_youtube("<id>", audio_meta=True)
 
     Does NOT modify archive.txt.
     """

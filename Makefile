@@ -11,7 +11,7 @@ _WIN_USER     := $(shell cmd.exe /c "echo %USERNAME%" 2>/dev/null | tr -d '\r\n'
 _CHROME_PROF  := /mnt/c/Users/$(_WIN_USER)/AppData/Local/Google/Chrome/User Data
 _EDGE_PROF    := /mnt/c/Users/$(_WIN_USER)/AppData/Local/Microsoft/Edge/User Data
 
-.PHONY: setup install dev-install run clean test data cookies cookies-browser install-chrome
+.PHONY: setup install dev-install run clean test data cookies cookies-browser install-chrome git-add git-commit-push
 
 # Build the venv (and install requirements) when requirements.txt changes
 $(VENV)/bin/activate: requirements.txt
@@ -43,6 +43,24 @@ run: $(VENV)/bin/activate
 test: $(VENV)/bin/activate
 	$(PIP) install -q -r requirements-dev.txt
 	$(PYTEST) tests/ -v --tb=short --cov=src/dihi --cov-report=term-missing
+
+# Stage project files while leaving local runtime data out of commits.
+git-add:
+	git add -u
+	@git restore --staged -- data 2>/dev/null || true
+	@git restore --staged -- archive.txt 2>/dev/null || true
+	@git restore --staged -- cookies.txt 2>/dev/null || true
+	@git restore --staged -- audio 2>/dev/null || true
+	@git ls-files --others --exclude-standard | grep -Ev '^(data/|archive\.txt$$|cookies\.txt$$|audio/)' | xargs -r git add --
+	git status --short
+
+# Stage all changes, commit them, and push the current branch.
+# Usage:
+#   make git-commit-push MSG="Describe the change"
+git-commit-push: git-add
+	@test -n "$(MSG)" || { echo 'ERROR: provide a commit message: make git-commit-push MSG="Describe the change"'; exit 1; }
+	git commit -m "$(MSG)"
+	git push
 
 # Initialise host data files required by docker-compose bind mounts.
 # Docker creates missing mount targets as directories; running this first

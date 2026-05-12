@@ -227,6 +227,7 @@ merged/
         ├── <channel_id>.<video_id>.<date>.<title> [<video_id>].out.f140.m4a  # Pre-merge AAC audio sidecar
         ├── <channel_id>.<video_id>.<date>.<title> [<video_id>].out.m4a       # Clean audio copy (--audio-meta)
         ├── <channel_id>.<video_id>.<date>.<title> [<video_id>].out.info.json # Full yt-dlp metadata
+        ├── <channel_id>.<video_id>.<date>.<title> [<video_id>].out.formats.json # Available formats manifest
         ├── <channel_id>.<video_id>.<date>.<title> [<video_id>].out.description
         ├── <channel_id>.<video_id>.<date>.<title> [<video_id>].out.png       # Thumbnail (PNG)
         ├── <channel_id>.<video_id>.<date>.<title> [<video_id>].out.en.vtt    # English subtitles
@@ -238,6 +239,37 @@ merged/
 ### Why channel_id/video_id folders?
 
 Channel names, @handles, and video titles all change over time. Using them as folder names causes fragmentation — new downloads land in a new path while old files stay in the old one. The `<channel_id>/<video_id>/` structure uses YouTube's own permanent identifiers so the archive never splits regardless of renames.
+
+### Format selection and YouTube clients
+
+The server intentionally requests separate video and audio streams so yt-dlp keeps raw sidecars and merges the final video to MKV:
+
+```text
+399+251/bestvideo[height<=1080][vcodec^=av01]+251/bestvideo[height<=1080]+251/bestvideo[height<=1080]+bestaudio,140/bestaudio
+```
+
+Do not add a `/best` progressive fallback if you need `.out.f<id>.*` sidecars and `.out.mkv`. A progressive fallback can select format `18`, which saves only `.out.mp4` and leaves no raw audio sidecar for `--audio-meta`.
+
+The server also includes the `android_vr` YouTube client:
+
+```python
+{"youtube": {"player_client": ["android_vr", "web", "ios"]}}
+```
+
+That matters because some DASH formats, including `399` and `251` for `dQw4w9WgXcQ`, may be visible from the Android VR client while missing from the web/ios client set. TV clients are intentionally excluded because they trigger unsupported EJS challenge paths.
+
+For a one-off CLI equivalent:
+
+```bash
+yt-dlp \
+  -f "399+251/bestvideo[height<=1080][vcodec^=av01]+251/bestvideo[height<=1080]+251/bestvideo[height<=1080]+bestaudio,140/bestaudio" \
+  --extractor-args "youtube:player_client=android_vr,web,ios" \
+  --merge-output-format mkv \
+  --keep-video \
+  dQw4w9WgXcQ
+```
+
+When re-testing a video that already downloaded as `.out.mp4`, remove its `youtube <video_id>` line from `data/archive.txt` and delete the existing `data/merged/<channel_id>/<video_id>/` directory before downloading again. `download_archive` and `nooverwrites` are designed to preserve prior downloads.
 
 Human-readable names are tracked in the dot-files alongside the content instead.
 

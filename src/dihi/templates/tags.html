@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DIHI Tags</title>
+<style>
+:root {
+  --bg: #0f0f0f;
+  --surface: #1a1a1a;
+  --surface2: #272727;
+  --border: #333;
+  --text: #f1f1f1;
+  --muted: #aaa;
+  --accent: #3ea6ff;
+  --green: #2ea043;
+  --radius: 8px;
+}
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  background: var(--bg); color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  min-height: 100vh;
+}
+header {
+  position: sticky; top: 0; z-index: 100;
+  background: var(--surface); border-bottom: 1px solid var(--border);
+  padding: 12px 24px; display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+}
+.logo { font-size: 1.3rem; font-weight: 700; color: var(--accent); text-decoration: none; }
+#tag-search {
+  flex: 1; min-width: 180px; max-width: 520px;
+  background: var(--bg); border: 1px solid var(--border); color: var(--text);
+  padding: 7px 14px; border-radius: 20px; font-size: 0.9rem; outline: none;
+}
+#tag-search:focus { border-color: var(--accent); }
+.hbtn {
+  background: var(--surface2); border: 1px solid var(--border); color: var(--text);
+  padding: 6px 10px; border-radius: 6px; font-size: 0.82rem; cursor: pointer;
+  text-decoration: none; white-space: nowrap;
+}
+.hbtn:hover { border-color: var(--accent); }
+#count { margin-left: auto; color: var(--muted); font-size: 0.82rem; }
+main { max-width: 1400px; margin: 0 auto; padding: 22px 24px 32px; }
+.layout {
+  display: grid; grid-template-columns: minmax(240px, 360px) minmax(0, 1fr);
+  gap: 18px; align-items: start;
+}
+.tag-panel {
+  position: sticky; top: 70px; display: flex; flex-wrap: wrap; gap: 8px;
+  max-height: calc(100vh - 96px); overflow: auto; align-content: flex-start;
+}
+.tag {
+  border: 1px solid var(--border); background: var(--surface2); color: var(--text);
+  border-radius: 999px; padding: 5px 9px; cursor: pointer; font-size: 0.78rem;
+  max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.tag:hover { border-color: var(--accent); }
+.tag.active { background: var(--accent); border-color: var(--accent); color: #000; }
+.tag-count { opacity: .72; margin-left: 4px; }
+#grid {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 14px;
+}
+.card {
+  background: var(--surface); border-radius: var(--radius); overflow: hidden;
+  border: 2px solid transparent; color: inherit; text-decoration: none;
+}
+.card:hover { border-color: var(--accent); }
+.card-thumb { aspect-ratio: 16/9; background: var(--surface2); position: relative; overflow: hidden; }
+.card-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.thumb-ph { width: 100%; height: 100%; display: flex; align-items: center; justify-content: center; font-size: 2.1rem; }
+.badges { position: absolute; bottom: 5px; right: 5px; display: flex; gap: 3px; }
+.badge {
+  font-size: 0.62rem; padding: 2px 5px; border-radius: 3px;
+  background: rgba(0,0,0,.75); color: #fff; font-weight: 700;
+}
+.bv { background: rgba(62,166,255,.85); }
+.ba { background: rgba(0,200,110,.85); }
+.card-body { padding: 10px 12px 12px; }
+.card-title {
+  font-size: 0.83rem; font-weight: 500; line-height: 1.4;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+  margin-bottom: 5px;
+}
+.card-meta { font-size: 0.73rem; color: var(--muted); }
+.empty {
+  grid-column: 1 / -1; color: var(--muted); text-align: center; padding: 70px 20px;
+}
+@media (max-width: 780px) {
+  header { padding: 10px 14px; }
+  main { padding: 14px; }
+  .layout { grid-template-columns: 1fr; }
+  .tag-panel { position: static; max-height: 220px; }
+  #grid { grid-template-columns: repeat(auto-fill, minmax(145px, 1fr)); gap: 10px; }
+}
+</style>
+</head>
+<body>
+<header>
+  <a class="logo" href="/">DIHI</a>
+  <input id="tag-search" type="search" placeholder="Search tags or videos..." autocomplete="off">
+  <button class="hbtn" type="button" onclick="clearTags()">Clear</button>
+  <a class="hbtn" href="/">Library</a>
+  <span id="count"></span>
+</header>
+
+<main>
+  <div class="layout">
+    <section class="tag-panel" id="tag-panel" aria-label="Tags"></section>
+    <section id="grid" aria-live="polite"></section>
+  </div>
+</main>
+
+<script>
+'use strict';
+
+const S = {
+  tags: [],
+  videosByTag: {},
+  selected: new Set(),
+  query: '',
+};
+
+const $ = id => document.getElementById(id);
+
+async function loadTags() {
+  try {
+    const r = await fetch('/api/media/tags');
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const data = await r.json();
+    S.tags = data.tags || [];
+    S.videosByTag = data.videos_by_tag || {};
+  } catch (e) {
+    $('grid').innerHTML = `<div class="empty">Failed to load tags: ${esc(e.message)}</div>`;
+    return;
+  }
+  render();
+}
+
+function render() {
+  renderTags();
+  renderVideos();
+}
+
+function renderTags() {
+  const q = S.query.toLowerCase();
+  const tags = S.tags.filter(t => !q || t.tag.toLowerCase().includes(q));
+  $('tag-panel').innerHTML = tags.map(t => {
+    const active = S.selected.has(t.tag) ? ' active' : '';
+    return `<button class="tag${active}" type="button" title="${esc(t.tag)}" data-tag="${esc(t.tag)}">
+      ${esc(t.tag)} <span class="tag-count">${t.count}</span>
+    </button>`;
+  }).join('') || '<div class="empty">No tags found.</div>';
+
+  $('tag-panel').querySelectorAll('.tag').forEach(el => {
+    el.addEventListener('click', () => toggleTag(el.dataset.tag));
+  });
+}
+
+function renderVideos() {
+  const videos = filteredVideos();
+  $('count').textContent = `${videos.length} video${videos.length === 1 ? '' : 's'}`;
+  if (!videos.length) {
+    $('grid').innerHTML = '<div class="empty">No matching videos.</div>';
+    return;
+  }
+
+  $('grid').innerHTML = videos.map(v => {
+    const thumb = v.files?.thumbnail
+      ? `<img src="${esc(v.files.thumbnail)}" alt="" loading="lazy">`
+      : '<div class="thumb-ph">▶</div>';
+    const bv = v.files?.video ? '<span class="badge bv">MKV</span>' : '';
+    const ba = v.files?.audio ? '<span class="badge ba">M4A</span>' : '';
+    return `<a class="card" href="/?video=${encodeURIComponent(v.video_id)}">
+      <div class="card-thumb">${thumb}<div class="badges">${bv}${ba}</div></div>
+      <div class="card-body">
+        <div class="card-title">${esc(v.title)}</div>
+        <div class="card-meta">${fmtDate(v.date)} · ${esc(v.channel_id)}</div>
+      </div>
+    </a>`;
+  }).join('');
+}
+
+function filteredVideos() {
+  const selected = [...S.selected];
+  let videos;
+  if (selected.length) {
+    const seen = new Map();
+    for (const tag of selected) {
+      for (const video of S.videosByTag[tag] || []) {
+        seen.set(video.video_id, video);
+      }
+    }
+    videos = [...seen.values()];
+  } else {
+    const seen = new Map();
+    for (const tag of S.tags) {
+      for (const video of S.videosByTag[tag.tag] || []) {
+        seen.set(video.video_id, video);
+      }
+    }
+    videos = [...seen.values()];
+  }
+
+  const q = S.query.toLowerCase();
+  if (q) {
+    videos = videos.filter(v =>
+      v.title.toLowerCase().includes(q) ||
+      v.channel_id.toLowerCase().includes(q) ||
+      v.video_id.toLowerCase().includes(q)
+    );
+  }
+
+  return videos.sort((a, b) => (b.date || '').localeCompare(a.date || '') || a.title.localeCompare(b.title));
+}
+
+function toggleTag(tag) {
+  if (S.selected.has(tag)) S.selected.delete(tag);
+  else S.selected.add(tag);
+  render();
+}
+
+function clearTags() {
+  S.selected.clear();
+  $('tag-search').value = '';
+  S.query = '';
+  render();
+}
+
+function esc(s) {
+  return String(s ?? '')
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+function fmtDate(d) {
+  if (!d || d.length !== 8) return d || '';
+  return `${d.slice(0,4)}-${d.slice(4,6)}-${d.slice(6,8)}`;
+}
+
+$('tag-search').addEventListener('input', e => {
+  S.query = e.target.value.trim();
+  render();
+});
+
+loadTags();
+</script>
+</body>
+</html>

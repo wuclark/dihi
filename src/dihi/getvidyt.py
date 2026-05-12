@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import glob as _glob
+import json
 import math
 import re
 import shutil
@@ -23,7 +24,6 @@ def _find_deno_path() -> str:
     common_paths = [
         "/root/.deno/bin/deno",  # Docker/root install
         Path.home() / ".deno" / "bin" / "deno",  # User install
-        "./venv/bin/deno/bin/deno",  # Local venv install
     ]
 
     for path in common_paths:
@@ -72,7 +72,28 @@ def _sub_to_text(sub_path: Path) -> Optional[str]:
             lines.append(clean)
             prev = clean
 
-    return '\n'.join(lines) if lines else None
+    if not lines:
+        return None
+
+    kept = []
+    total = 0
+    truncated = False
+    for line in lines:
+        line_bytes = len(line.encode('utf-8'))
+        sep_bytes = 1 if kept else 0
+        if total + sep_bytes + line_bytes > 64 * 1024:
+            truncated = True
+            break
+        kept.append(line)
+        total += sep_bytes + line_bytes
+
+    if not kept:
+        return None
+
+    text = '\n'.join(kept)
+    if truncated:
+        text += '\n[truncated]'
+    return text
 
 
 YOUTUBE_VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
@@ -90,13 +111,13 @@ def _parse_archive_line(line: str) -> Optional[str]:
     return parts[1] or None
 
 
-def load_archive(path: Union[str, Path]) -> set:
+def load_archive(path: Union[str, Path]) -> set[str]:
     """Return the set of video IDs recorded in a yt-dlp archive file.
 
     Safe to call when the file does not exist — returns an empty set.
     """
     p = Path(path).expanduser().resolve()
-    ids: set = set()
+    ids: set[str] = set()
     if not p.exists():
         return ids
     with p.open("r", encoding="utf-8", errors="ignore") as f:
@@ -499,6 +520,9 @@ class MetadataSidecarPostProcessor(PostProcessor):
     Video-level files (written to the video subfolder from info['filepath']):
       .title_name    — video title (info['title'])
       .upload_date   — upload date in YYYYMMDD format (info['upload_date'])
+
+    Format manifest:
+      <stem>.formats.json — compact list of all formats yt-dlp saw for the video
     """
 
     def __init__(self, merged_dir: Path):
@@ -530,6 +554,7 @@ class MetadataSidecarPostProcessor(PostProcessor):
             self._append_if_changed(
                 video_dir / '.upload_date',
                 info.get('upload_date'), now)
+            self._write_formats_manifest(info, Path(filepath))
 
         return [], info
 
@@ -551,6 +576,50 @@ class MetadataSidecarPostProcessor(PostProcessor):
         if value != last:
             with path.open('a', encoding='utf-8') as f:
                 f.write(f'{timestamp} {value}\n')
+
+    @staticmethod
+    def _write_formats_manifest(info: dict, final_path: Path) -> None:
+        formats = info.get('formats') or []
+        if not formats:
+            return
+
+        manifest = {
+            "id": info.get("id"),
+            "webpage_url": info.get("webpage_url"),
+            "format_id": info.get("format_id"),
+            "requested_format_ids": [
+                str(fmt.get("format_id"))
+                for fmt in info.get("requested_formats") or []
+                if fmt.get("format_id") is not None
+            ],
+            "formats": [
+                {
+                    "format_id": fmt.get("format_id"),
+                    "ext": fmt.get("ext"),
+                    "resolution": fmt.get("resolution"),
+                    "width": fmt.get("width"),
+                    "height": fmt.get("height"),
+                    "fps": fmt.get("fps"),
+                    "vcodec": fmt.get("vcodec"),
+                    "acodec": fmt.get("acodec"),
+                    "abr": fmt.get("abr"),
+                    "vbr": fmt.get("vbr"),
+                    "tbr": fmt.get("tbr"),
+                    "asr": fmt.get("asr"),
+                    "filesize": fmt.get("filesize"),
+                    "filesize_approx": fmt.get("filesize_approx"),
+                    "protocol": fmt.get("protocol"),
+                    "format_note": fmt.get("format_note"),
+                }
+                for fmt in formats
+            ],
+        }
+
+        path = final_path.with_suffix(".formats.json")
+        path.write_text(
+            json.dumps(manifest, indent=2, ensure_ascii=False, sort_keys=True),
+            encoding="utf-8",
+        )
 
 
 def to_youtube_url(user_input: str) -> str:
@@ -616,8 +685,7 @@ def build_ydl_opts(
         "user_agent": "Mozilla/5.0 (X11; Linux x86_64; rv:147.0) Gecko/20100101 Firefox/147.0",
 
         # --- Format / merge ---
-        # "format": "399+140/299+140/137+140/298+140/136+140/135+140/134+140/133+140/160+140/best",
-        "format": "bestvideo[height<=1080][vcodec^=av01]+251/bestvideo[height<=1080]+251/bestvideo[height<=1080]+bestaudio/best,140/bestaudio",
+        "format": "399+251/bestvideo[height<=1080][vcodec^=av01]+251/bestvideo[height<=1080]+251/bestvideo[height<=1080]+bestaudio,140/bestaudio",
         "merge_output_format": "mkv",
         "keepvideo": True,
 
@@ -709,10 +777,12 @@ def build_ydl_opts(
         deno_path = _find_deno_path()
         ydl_opts["js_runtimes"] = {"deno": {"path": deno_path}}
         ydl_opts["remote_components"] = ["ejs:github", "ejs:npm"]
-        # EJS solves challenges for the standard web player (player_ias.vflset/base.js)
-        # but not for the TV client (tv-player-ias.js), which produces the
-        # "found 0 n function possibilities" warning. Restrict to clients EJS supports.
-        ydl_opts["extractor_args"] = {"youtube": {"player_client": ["web", "ios"]}}
+        # Keep TV clients out because they trigger unsupported EJS challenge paths,
+        # but include android_vr because it exposes the full DASH format set that
+        # the CLI sees for videos like dQw4w9WgXcQ.
+        ydl_opts["extractor_args"] = {
+            "youtube": {"player_client": ["android_vr", "web", "ios"]}
+        }
     if extra_opts:
         # Allow caller to override anything (format, outtmpl, paths, etc.)
         ydl_opts.update(extra_opts)
@@ -760,9 +830,10 @@ def download_youtube(
         yt-dlp download() return code (0 success, nonzero errors).
     """
     target_url = to_youtube_url(target)
+    merged_dir_path = Path(merged_dir).expanduser().resolve()
 
     ydl_opts = build_ydl_opts(
-        merged_dir=merged_dir,
+        merged_dir=merged_dir_path,
         archive=archive,
         cookies_browser=cookies_browser,
         no_js=no_js,
@@ -790,11 +861,11 @@ def download_youtube(
                             yield from ('-c:s', 'copy')
                     pp._options = _patched_options
                     break
+        ydl.add_post_processor(
+            MetadataSidecarPostProcessor(merged_dir_path), when='post_process'
+        )
         if audio_meta:
             ydl.add_post_processor(AudioMetadataPostProcessor(), when='post_process')
-        ydl.add_post_processor(
-            MetadataSidecarPostProcessor(merged_dir), when='post_process'
-        )
         return ydl.download([target_url])
 
 
