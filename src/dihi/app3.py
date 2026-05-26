@@ -60,14 +60,21 @@ _cached_mtime: Optional[float] = None
 _cached_ids: Set[str] = set()
 
 _active_downloads: Set[str] = set()  # prevent spamming duplicate downloads
+_download_started_at: dict[str, float] = {}
 _download_results: dict[str, str] = {}  # video_id -> "completed" | "failed"
 _RESULT_TTL = 300  # Keep results for 5 minutes
 _result_timestamps: dict[str, float] = {}
+_download_history: dict[str, str] = {}
+_download_history_timestamps: dict[str, float] = {}
 
 # Playlist download tracking
 _active_playlist_downloads: Set[str] = set()
+_playlist_started_at: dict[str, float] = {}
 _playlist_download_results: dict[str, str] = {}  # playlist_id -> "completed" | "failed"
 _playlist_result_timestamps: dict[str, float] = {}
+_playlist_history: dict[str, str] = {}
+_playlist_history_timestamps: dict[str, float] = {}
+_last_queue_log_message: Optional[str] = None
 
 
 def _normalize_id(raw: str) -> Optional[str]:
@@ -138,6 +145,142 @@ def _cleanup_old_results() -> None:
         _result_timestamps.pop(vid, None)
 
 
+def _cleanup_old_download_history() -> None:
+    """Remove download page history older than TTL. Must be called with _lock held."""
+    now = time.time()
+    expired = [
+        vid for vid, ts in _download_history_timestamps.items() if now - ts > _RESULT_TTL
+    ]
+    for vid in expired:
+        _download_history.pop(vid, None)
+        _download_history_timestamps.pop(vid, None)
+
+
+def _format_download_entries(
+    active_ids: Set[str],
+    started_at: dict[str, float],
+    results: dict[str, str],
+    result_timestamps: dict[str, float],
+    kind: str,
+    now: float,
+) -> list[dict]:
+    entries = []
+    for item_id in sorted(active_ids):
+        started = started_at.get(item_id)
+        entries.append(
+            {
+                "id": item_id,
+                "kind": kind,
+                "status": "downloading",
+                "active": True,
+                "started_at": started,
+                "elapsed_seconds": round(now - started, 1) if started else None,
+                "finished_at": None,
+                "age_seconds": None,
+            }
+        )
+    for item_id, result in sorted(results.items()):
+        if item_id in active_ids:
+            continue
+        finished = result_timestamps.get(item_id)
+        entries.append(
+            {
+                "id": item_id,
+                "kind": kind,
+                "status": result,
+                "active": False,
+                "started_at": started_at.get(item_id),
+                "elapsed_seconds": None,
+                "finished_at": finished,
+                "age_seconds": round(now - finished, 1) if finished else None,
+            }
+        )
+    return entries
+
+
+def _queue_summary_from_active(active_videos: int, active_playlists: int) -> dict:
+    remaining_total = active_videos + active_playlists
+    queue_empty = remaining_total == 0
+    return {
+        "empty": queue_empty,
+        "message": "Queue Empty" if queue_empty else f"{active_videos} video(s) remaining in queue",
+        "remaining_videos": active_videos,
+        "remaining_playlists": active_playlists,
+        "remaining_total": remaining_total,
+    }
+
+
+def _log_queue_state_locked() -> None:
+    """Log queue state changes. Must be called with _lock held."""
+    global _last_queue_log_message
+    queue = _queue_summary_from_active(
+        len(_active_downloads),
+        len(_active_playlist_downloads),
+    )
+    detail = (
+        queue["message"]
+        if queue["empty"]
+        else (
+            f"{queue['message']} "
+            f"({queue['remaining_total']} total active item(s), "
+            f"{queue['remaining_playlists']} playlist(s))"
+        )
+    )
+    if detail == _last_queue_log_message:
+        return
+    _last_queue_log_message = detail
+    app.logger.info("Download queue: %s", detail)
+
+
+def _download_status_snapshot() -> dict:
+    now = time.time()
+    with _lock:
+        _cleanup_old_results()
+        _cleanup_old_playlist_results()
+        _cleanup_old_download_history()
+        _cleanup_old_playlist_history()
+        videos = _format_download_entries(
+            _active_downloads,
+            _download_started_at,
+            _download_history,
+            _download_history_timestamps,
+            "video",
+            now,
+        )
+        playlists = _format_download_entries(
+            _active_playlist_downloads,
+            _playlist_started_at,
+            _playlist_history,
+            _playlist_history_timestamps,
+            "playlist",
+            now,
+        )
+
+    active = [entry for entry in [*videos, *playlists] if entry["active"]]
+    recent = [entry for entry in [*videos, *playlists] if not entry["active"]]
+    active_videos = [entry for entry in videos if entry["active"]]
+    active_playlists = [entry for entry in playlists if entry["active"]]
+    remaining_videos = len(active_videos)
+    queue = _queue_summary_from_active(remaining_videos, len(active_playlists))
+    return {
+        "ok": True,
+        "active": active,
+        "recent": recent,
+        "videos": videos,
+        "playlists": playlists,
+        "queue": queue,
+        "counts": {
+            "active": len(active),
+            "recent": len(recent),
+            "active_videos": remaining_videos,
+            "active_playlists": len(active_playlists),
+            "max_videos": MAX_CONCURRENT_DOWNLOADS,
+            "max_playlists": MAX_CONCURRENT_PLAYLIST_DOWNLOADS,
+        },
+        "result_ttl_seconds": _RESULT_TTL,
+    }
+
+
 def _download_worker(video_id: str) -> None:
     """
     Actually runs:
@@ -163,10 +306,16 @@ def _download_worker(video_id: str) -> None:
         with _lock:
             _active_downloads.discard(video_id)
             # Store result for status endpoint
-            _download_results[video_id] = "completed" if success else "failed"
-            _result_timestamps[video_id] = time.time()
+            result = "completed" if success else "failed"
+            finished_at = time.time()
+            _download_results[video_id] = result
+            _result_timestamps[video_id] = finished_at
+            _download_history[video_id] = result
+            _download_history_timestamps[video_id] = finished_at
             # Cleanup old results
             _cleanup_old_results()
+            _cleanup_old_download_history()
+            _log_queue_state_locked()
 
 
 def _cleanup_old_playlist_results() -> None:
@@ -176,6 +325,17 @@ def _cleanup_old_playlist_results() -> None:
     for pid in expired:
         _playlist_download_results.pop(pid, None)
         _playlist_result_timestamps.pop(pid, None)
+
+
+def _cleanup_old_playlist_history() -> None:
+    """Remove playlist download page history older than TTL. Must be called with _lock held."""
+    now = time.time()
+    expired = [
+        pid for pid, ts in _playlist_history_timestamps.items() if now - ts > _RESULT_TTL
+    ]
+    for pid in expired:
+        _playlist_history.pop(pid, None)
+        _playlist_history_timestamps.pop(pid, None)
 
 
 def _playlist_download_worker(playlist_id: str) -> None:
@@ -194,9 +354,15 @@ def _playlist_download_worker(playlist_id: str) -> None:
     finally:
         with _lock:
             _active_playlist_downloads.discard(playlist_id)
-            _playlist_download_results[playlist_id] = "completed" if success else "failed"
-            _playlist_result_timestamps[playlist_id] = time.time()
+            result = "completed" if success else "failed"
+            finished_at = time.time()
+            _playlist_download_results[playlist_id] = result
+            _playlist_result_timestamps[playlist_id] = finished_at
+            _playlist_history[playlist_id] = result
+            _playlist_history_timestamps[playlist_id] = finished_at
             _cleanup_old_playlist_results()
+            _cleanup_old_playlist_history()
+            _log_queue_state_locked()
 
 
 def _classify_file(fname: str, url: str, files: dict) -> None:
@@ -332,6 +498,20 @@ def _scan_library() -> list[dict]:
     return videos
 
 
+def _resolve_media_by_video_id(video_id: str) -> Optional[dict]:
+    for video in _scan_library():
+        if video.get("video_id") != video_id:
+            continue
+        files = video.get("files") or {}
+        player_url = files.get("video") or files.get("audio")
+        return {
+            **video,
+            "player_url": player_url,
+            "player_kind": "video" if files.get("video") else "audio" if files.get("audio") else None,
+        }
+    return None
+
+
 def _scan_tags() -> dict:
     videos = _scan_library()
     tags: dict[str, list[dict]] = {}
@@ -363,6 +543,11 @@ def tags_page():
     return render_template("tags.html")
 
 
+@app.get("/downloads")
+def downloads_page():
+    return render_template("downloads.html")
+
+
 @app.get("/api/media/library")
 @limiter.limit("30 per minute")
 def api_media_library():
@@ -373,6 +558,26 @@ def api_media_library():
 @limiter.limit("30 per minute")
 def api_media_tags():
     return jsonify(_scan_tags())
+
+
+@app.get("/api/media/resolve/<string:video_id>")
+@limiter.limit("60 per minute")
+def api_media_resolve(video_id: str):
+    vid = _normalize_id(video_id)
+    if not vid:
+        return jsonify(error="invalid video id"), 400
+
+    video = _resolve_media_by_video_id(vid)
+    if not video:
+        return jsonify(result=False, video_id=vid), 404
+
+    return jsonify(result=True, video=video)
+
+
+@app.get("/api/downloads/status")
+@limiter.limit("60 per minute")
+def api_downloads_status():
+    return jsonify(_download_status_snapshot())
 
 
 @app.get("/api/media/details/<string:channel_id>/<string:video_id>")
@@ -471,6 +676,8 @@ def api_youtube_get(video_id: str):
             if len(_active_downloads) >= MAX_CONCURRENT_DOWNLOADS:
                 return jsonify(ok=False, error="too many concurrent downloads"), 429
             _active_downloads.add(vid)
+            _download_started_at[vid] = time.time()
+            _log_queue_state_locked()
             threading.Thread(target=_download_worker, args=(vid,), daemon=True).start()
 
     return jsonify(
@@ -528,6 +735,8 @@ def api_youtube_playlist_get(playlist_id: str):
             if len(_active_playlist_downloads) >= MAX_CONCURRENT_PLAYLIST_DOWNLOADS:
                 return jsonify(ok=False, error="too many concurrent playlist downloads"), 429
             _active_playlist_downloads.add(pid)
+            _playlist_started_at[pid] = time.time()
+            _log_queue_state_locked()
             threading.Thread(
                 target=_playlist_download_worker, args=(pid,), daemon=True
             ).start()

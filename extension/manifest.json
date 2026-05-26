@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "YouTube ID Server Checker",
-  "version": "1.5.0",
-  "description": "Auto-checks YouTube video ID via /api/youtube/<id> => {result:true}. If red, clicking the icon POSTs /api/youtube/get/<id> and shows yellow while downloading. Notifies when download finishes.",
+  "version": "1.6.0",
+  "description": "Tracks YouTube video visits, can auto-download missing videos after a configurable visit count, and opens archived videos from the server.",
   "action": {
     "default_title": "YouTube ID Check",
     "default_popup": "popup.html"
@@ -17,6 +17,8 @@
   ],
   "host_permissions": [
     "https://dihi.i.apiskpis.com/*",
+    "http://*/*",
+    "https://*/*",
     "*://*.youtube.com/*",
     "*://youtu.be/*"
   ],

@@ -10,7 +10,9 @@
     .card { border: 1px solid #ddd; border-radius: 12px; padding: 16px; }
     .row { margin: 12px 0; }
     label { display: block; font-size: 12px; opacity: 0.7; margin-bottom: 6px; }
-    input { width: 100%; padding: 10px; border: 1px solid #ccc; border-radius: 10px; font-size: 14px; }
+    input { width: 100%; padding: 10px; border: 1px solid #ccc; border-radius: 10px; font-size: 14px; box-sizing: border-box; }
+    input[type="checkbox"] { width: auto; margin-right: 8px; }
+    .check-label { display: flex; align-items: center; gap: 4px; font-size: 14px; opacity: 1; }
     .actions { display: flex; gap: 10px; margin-top: 14px; }
     button { cursor: pointer; padding: 10px 12px; border: 1px solid #ccc; border-radius: 10px; background: #fff; }
     .note { font-size: 12px; opacity: 0.7; margin-top: 10px; }
@@ -36,6 +38,25 @@
       <input id="debounceMs" type="number" min="0" step="50" />
     </div>
 
+    <div class="row">
+      <label class="check-label" for="autoDownloadEnabled">
+        <input id="autoDownloadEnabled" type="checkbox" />
+        Auto-download missing videos after repeated visits
+      </label>
+    </div>
+
+    <div class="row">
+      <label for="autoDownloadVisitThreshold">Auto-download visit threshold</label>
+      <input id="autoDownloadVisitThreshold" type="number" min="1" step="1" />
+    </div>
+
+    <div class="row">
+      <label class="check-label" for="playArchivedFromServer">
+        <input id="playArchivedFromServer" type="checkbox" />
+        Open archived videos from the server instead of YouTube
+      </label>
+    </div>
+
     <div class="actions">
       <button id="saveBtn">Save</button>
       <button id="resetBtn">Reset to defaults</button>
@@ -43,7 +64,7 @@
     </div>
 
     <div class="note">
-      The extension checks <code>GET /api/youtube/&lt;id&gt;</code> and triggers <code>POST /api/youtube/get/&lt;id&gt;</code> when a video is missing. When the server reports <code>downloading:false</code>, a notification is shown.
+      The extension tracks YouTube video visits locally, checks <code>GET /api/youtube/&lt;id&gt;</code>, redirects archived videos through <code>GET /api/media/resolve/&lt;id&gt;</code>, and triggers <code>POST /api/youtube/get/&lt;id&gt;</code> when a missing video reaches the configured visit threshold.
     </div>
   </div>
 

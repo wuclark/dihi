@@ -66,8 +66,8 @@ git-commit-push: git-add
 # Docker creates missing mount targets as directories; running this first
 # ensures they are plain files so yt-dlp can read/write them correctly.
 data:
-	mkdir -p data/merged
-	touch data/archive.txt data/cookies.txt
+	mkdir -p data/merged data/bestfallback
+	touch data/archive.txt data/cookies.txt data/bestfallback/archive.txt
 
 # Export YouTube cookies from your Windows browser into data/cookies.txt (WSL2 only).
 # Tries Chrome → Edge → Firefox in order; stops at the first one found.

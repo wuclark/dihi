@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DIHI Downloads</title>
+<style>
+:root {
+  --bg: #0f0f0f;
+  --surface: #1a1a1a;
+  --surface2: #272727;
+  --border: #333;
+  --text: #f1f1f1;
+  --muted: #aaa;
+  --accent: #3ea6ff;
+  --green: #2ea043;
+  --red: #f85149;
+  --yellow: #d29922;
+  --radius: 8px;
+}
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  background: var(--bg); color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  min-height: 100vh;
+}
+header {
+  position: sticky; top: 0; z-index: 100;
+  background: var(--surface); border-bottom: 1px solid var(--border);
+  padding: 12px 24px; display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+}
+.logo { font-size: 1.3rem; font-weight: 700; color: var(--accent); text-decoration: none; }
+.hbtn {
+  background: var(--surface2); border: 1px solid var(--border); color: var(--text);
+  padding: 6px 10px; border-radius: 6px; font-size: 0.82rem; cursor: pointer;
+  text-decoration: none; white-space: nowrap;
+}
+.hbtn:hover { border-color: var(--accent); }
+#summary { margin-left: auto; color: var(--muted); font-size: 0.82rem; }
+main { max-width: 1100px; margin: 0 auto; padding: 22px 24px 34px; display: grid; gap: 18px; }
+.section-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+h1 { font-size: 1.15rem; font-weight: 650; }
+h2 { font-size: 0.95rem; font-weight: 650; }
+.muted { color: var(--muted); font-size: 0.82rem; }
+.queue-output {
+  border: 1px solid var(--border); border-radius: var(--radius);
+  background: var(--surface); padding: 14px 16px;
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+}
+.queue-title { font-size: 0.78rem; color: var(--muted); margin-bottom: 4px; }
+.queue-value { font-size: 1.05rem; font-weight: 700; }
+.queue-value.empty { color: var(--green); }
+.queue-value.busy { color: var(--yellow); }
+.table {
+  border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden;
+  background: var(--surface);
+}
+.row {
+  display: grid; grid-template-columns: 92px minmax(140px, 1fr) 122px 120px 150px;
+  gap: 12px; align-items: center; padding: 10px 12px; border-top: 1px solid var(--border);
+}
+.row:first-child { border-top: 0; }
+.head {
+  background: var(--surface2); color: var(--muted); font-size: 0.72rem;
+  text-transform: uppercase; letter-spacing: .04em; font-weight: 700;
+}
+.id { font: 0.82rem/1.35 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; overflow-wrap: anywhere; }
+.status {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: fit-content; min-width: 86px; border-radius: 999px; padding: 3px 8px;
+  font-size: 0.75rem; font-weight: 700; border: 1px solid var(--border);
+}
+.downloading { color: #000; background: var(--yellow); border-color: var(--yellow); }
+.completed { color: #fff; background: var(--green); border-color: var(--green); }
+.failed { color: #fff; background: var(--red); border-color: var(--red); }
+.links { display: flex; gap: 8px; flex-wrap: wrap; }
+.links a { color: var(--accent); text-decoration: none; font-size: 0.78rem; }
+.links a:hover { text-decoration: underline; }
+.empty {
+  border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface);
+  color: var(--muted); padding: 26px 18px; text-align: center;
+}
+@media (max-width: 760px) {
+  header { padding: 10px 14px; }
+  main { padding: 14px; }
+  #summary { margin-left: 0; width: 100%; }
+  .row { grid-template-columns: 1fr; gap: 6px; }
+  .head { display: none; }
+  .row { align-items: start; }
+}
+</style>
+</head>
+<body>
+<header>
+  <a class="logo" href="/">DIHI</a>
+  <a class="hbtn" href="/">Library</a>
+  <a class="hbtn" href="/tags">Tags</a>
+  <button class="hbtn" type="button" onclick="loadStatus()">Refresh</button>
+  <span id="summary">Loading...</span>
+</header>
+
+<main>
+  <div class="section-head">
+    <h1>Downloads</h1>
+    <span class="muted" id="updated"></span>
+  </div>
+
+  <section class="queue-output" aria-live="polite">
+    <div>
+      <div class="queue-title">Queue</div>
+      <div class="queue-value" id="queue-output">Loading...</div>
+    </div>
+    <span class="muted" id="queue-detail"></span>
+  </section>
+
+  <section>
+    <div class="section-head">
+      <h2>Active</h2>
+      <span class="muted" id="active-count"></span>
+    </div>
+    <div id="active"></div>
+  </section>
+
+  <section>
+    <div class="section-head">
+      <h2>Recent</h2>
+      <span class="muted" id="recent-count"></span>
+    </div>
+    <div id="recent"></div>
+  </section>
+</main>
+
+<script>
+'use strict';
+
+const $ = id => document.getElementById(id);
+let timerId = null;
+
+async function loadStatus() {
+  try {
+    const r = await fetch('/api/downloads/status', { cache: 'no-store' });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const data = await r.json();
+    render(data);
+  } catch (e) {
+    $('summary').textContent = `Failed to load downloads: ${e.message}`;
+  }
+}
+
+function render(data) {
+  const counts = data.counts || {};
+  const queue = data.queue || {};
+  $('summary').textContent = `${counts.active || 0} active, ${counts.recent || 0} recent`;
+  $('updated').textContent = `Updated ${new Date().toLocaleTimeString()}`;
+  $('queue-output').textContent = queue.empty ? 'Queue Empty' : `${queue.remaining_videos || 0} video${queue.remaining_videos === 1 ? '' : 's'} remaining in queue`;
+  $('queue-output').className = `queue-value ${queue.empty ? 'empty' : 'busy'}`;
+  $('queue-detail').textContent = queue.empty
+    ? ''
+    : `${queue.remaining_total || 0} total active item${queue.remaining_total === 1 ? '' : 's'}, ${queue.remaining_playlists || 0} playlist${queue.remaining_playlists === 1 ? '' : 's'}`;
+  $('active-count').textContent = `${counts.active_videos || 0}/${counts.max_videos || 0} videos, ${counts.active_playlists || 0}/${counts.max_playlists || 0} playlists`;
+  $('recent-count').textContent = `${counts.recent || 0} kept for ${data.result_ttl_seconds || 0}s`;
+  renderTable('active', data.active || [], 'No downloads are currently running.');
+  renderTable('recent', data.recent || [], 'No recent download results.');
+}
+
+function renderTable(targetId, rows, emptyText) {
+  if (!rows.length) {
+    $(targetId).innerHTML = `<div class="empty">${esc(emptyText)}</div>`;
+    return;
+  }
+  $(targetId).innerHTML = `<div class="table">
+    <div class="row head">
+      <div>Type</div><div>ID</div><div>Status</div><div>Time</div><div>Links</div>
+    </div>
+    ${rows.map(renderRow).join('')}
+  </div>`;
+}
+
+function renderRow(item) {
+  const active = !!item.active;
+  const seconds = active ? item.elapsed_seconds : item.age_seconds;
+  const timeLabel = active ? `${fmtDuration(seconds)} elapsed` : `${fmtDuration(seconds)} ago`;
+  const status = esc(item.status || 'unknown');
+  return `<div class="row">
+    <div>${esc(item.kind || '')}</div>
+    <div class="id">${esc(item.id || '')}</div>
+    <div><span class="status ${status}">${status}</span></div>
+    <div class="muted">${timeLabel}</div>
+    <div class="links">${linksFor(item)}</div>
+  </div>`;
+}
+
+function linksFor(item) {
+  const id = encodeURIComponent(item.id || '');
+  if (item.kind === 'playlist') {
+    return `<a href="https://www.youtube.com/playlist?list=${id}" target="_blank" rel="noreferrer">YouTube</a>`;
+  }
+  return [
+    `<a href="https://www.youtube.com/watch?v=${id}" target="_blank" rel="noreferrer">YouTube</a>`,
+    `<a href="/?play=${id}">Library</a>`
+  ].join('');
+}
+
+function fmtDuration(value) {
+  const seconds = Math.max(0, Math.floor(Number(value) || 0));
+  const minutes = Math.floor(seconds / 60);
+  const remaining = seconds % 60;
+  if (minutes < 1) return `${remaining}s`;
+  const hours = Math.floor(minutes / 60);
+  const mins = minutes % 60;
+  if (hours < 1) return `${minutes}m ${remaining}s`;
+  return `${hours}h ${mins}m`;
+}
+
+function esc(s) {
+  return String(s ?? '').replace(/[&<>"']/g, c => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }[c]));
+}
+
+loadStatus();
+timerId = setInterval(loadStatus, 3000);
+window.addEventListener('beforeunload', () => clearInterval(timerId));
+</script>
+</body>
+</html>

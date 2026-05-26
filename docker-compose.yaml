@@ -12,6 +12,7 @@ services:
       - ./data/archive.txt:/app/archive.txt
       - ./data/cookies.txt:/app/cookies.txt
       - ./data/merged:/app/merged
+      - ./data/bestfallback:/app/data/bestfallback
     environment:
       - PORT=5000
     healthcheck:

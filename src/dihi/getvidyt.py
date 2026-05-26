@@ -99,6 +99,21 @@ def _sub_to_text(sub_path: Path) -> Optional[str]:
 YOUTUBE_VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 PLAUSIBLE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{10,}$")
 
+STRICT_FORMAT = (
+    "399+251/"
+    "bestvideo[height<=1080][vcodec^=av01]+251/"
+    "bestvideo[height<=1080]+251/"
+    "bestvideo[height<=1080]+bestaudio,"
+    "140/bestaudio"
+)
+
+BEST_FALLBACK_FORMAT = (
+    "bestvideo+bestaudio/"
+    "bv*+ba/"
+    "best,"
+    "140/bestaudio[ext=m4a]/bestaudio"
+)
+
 
 def _parse_archive_line(line: str) -> Optional[str]:
     """Return the YouTube video ID from a yt-dlp archive line, or None."""
@@ -126,6 +141,27 @@ def load_archive(path: Union[str, Path]) -> set[str]:
             if vid:
                 ids.add(vid)
     return ids
+
+
+def _find_cookiefile(archive_path: Path) -> Optional[Path]:
+    """Find the Netscape cookie file used for authenticated YouTube requests."""
+    candidates = [
+        archive_path.parent / "cookies.txt",
+        Path("data/cookies.txt").expanduser(),
+        Path("cookies.txt").expanduser(),
+    ]
+    seen = set()
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            continue
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if resolved.is_file():
+            return resolved
+    return None
 
 
 class AudioMetadataPostProcessor(PostProcessor):
@@ -685,7 +721,7 @@ def build_ydl_opts(
         "user_agent": "Mozilla/5.0 (X11; Linux x86_64; rv:147.0) Gecko/20100101 Firefox/147.0",
 
         # --- Format / merge ---
-        "format": "399+251/bestvideo[height<=1080][vcodec^=av01]+251/bestvideo[height<=1080]+251/bestvideo[height<=1080]+bestaudio,140/bestaudio",
+        "format": STRICT_FORMAT,
         "merge_output_format": "mkv",
         "keepvideo": True,
 
@@ -767,8 +803,9 @@ def build_ydl_opts(
         "outtmpl": "%(channel_id)s/%(id)s/%(channel_id)s.%(id)s.%(upload_date|NA)s.%(title)s [%(id)s].out.%(ext)s",
     }
 
-    cookies_file = archive_path.parent / "cookies.txt"
-    if cookies_file.is_file():
+    cookies_file = _find_cookiefile(archive_path)
+    has_cookies = bool(cookies_file or cookies_browser)
+    if cookies_file:
         ydl_opts["cookiefile"] = str(cookies_file)
     if cookies_browser:
         ydl_opts["cookiesfrombrowser"] = (cookies_browser,)
@@ -777,11 +814,13 @@ def build_ydl_opts(
         deno_path = _find_deno_path()
         ydl_opts["js_runtimes"] = {"deno": {"path": deno_path}}
         ydl_opts["remote_components"] = ["ejs:github", "ejs:npm"]
-        # Keep TV clients out because they trigger unsupported EJS challenge paths,
-        # but include android_vr because it exposes the full DASH format set that
-        # the CLI sees for videos like dQw4w9WgXcQ.
+        # Keep TV clients out because they trigger unsupported EJS challenge paths.
+        # When cookies are used, yt-dlp skips android_vr/ios because those clients
+        # do not support cookies. Add web_safari so age-gated videos can still
+        # expose higher HLS formats instead of falling back to web's 360p format 18.
+        player_clients = ["web", "web_safari"] if has_cookies else ["android_vr", "web", "ios"]
         ydl_opts["extractor_args"] = {
-            "youtube": {"player_client": ["android_vr", "web", "ios"]}
+            "youtube": {"player_client": player_clients}
         }
     if extra_opts:
         # Allow caller to override anything (format, outtmpl, paths, etc.)
@@ -790,7 +829,7 @@ def build_ydl_opts(
     return ydl_opts
 
 
-def download_youtube(
+def _download_youtube_once(
     target: str,
     *,
     merged_dir: Union[str, Path] = "merged",
@@ -801,35 +840,6 @@ def download_youtube(
     quiet: bool = False,
     audio_meta: bool = False,
 ) -> int:
-    """
-    Callable function for external programs.
-
-    Parameters
-    ----------
-    target : str
-        YouTube URL, video ID, or playlist ID.
-    merged_dir : str|Path
-        Base output directory (mapped to yt-dlp "home" path).
-    archive : str|Path
-        download-archive file.
-    cookies_browser : str|None
-        e.g. "firefox" (enables cookies-from-browser). Leave None to disable.
-    no_js : bool
-        If True, don't configure js_runtimes.
-    extra_opts : dict|None
-        Extra yt-dlp options to add/override.
-    quiet : bool
-        If True, suppress yt-dlp output (still returns status code).
-    audio_meta : bool
-        If True, run AudioMetadataPostProcessor to create clean audio copies
-        with embedded metadata. Default is False (skip).
-
-    Returns
-    -------
-    int
-        yt-dlp download() return code (0 success, nonzero errors).
-    """
-    target_url = to_youtube_url(target)
     merged_dir_path = Path(merged_dir).expanduser().resolve()
 
     ydl_opts = build_ydl_opts(
@@ -866,7 +876,92 @@ def download_youtube(
         )
         if audio_meta:
             ydl.add_post_processor(AudioMetadataPostProcessor(), when='post_process')
-        return ydl.download([target_url])
+        return ydl.download([target])
+
+
+def download_youtube(
+    target: str,
+    *,
+    merged_dir: Union[str, Path] = "merged",
+    archive: Union[str, Path] = "archive.txt",
+    cookies_browser: Optional[str] = None,
+    no_js: bool = False,
+    extra_opts: Optional[Dict[str, Any]] = None,
+    quiet: bool = False,
+    audio_meta: bool = False,
+    best_fallback: bool = True,
+) -> int:
+    """
+    Callable function for external programs.
+
+    Parameters
+    ----------
+    target : str
+        YouTube URL, video ID, or playlist ID.
+    merged_dir : str|Path
+        Base output directory (mapped to yt-dlp "home" path).
+    archive : str|Path
+        download-archive file.
+    cookies_browser : str|None
+        e.g. "firefox" (enables cookies-from-browser). Leave None to disable.
+    no_js : bool
+        If True, don't configure js_runtimes.
+    extra_opts : dict|None
+        Extra yt-dlp options to add/override.
+    quiet : bool
+        If True, suppress yt-dlp output (still returns status code).
+    audio_meta : bool
+        If True, run AudioMetadataPostProcessor to create clean audio copies
+        with embedded metadata. Default is False (skip).
+    best_fallback : bool
+        If True, retry failed strict-format downloads into data/bestfallback
+        with a broader format string and separate archive.
+
+    Returns
+    -------
+    int
+        yt-dlp download() return code (0 success, nonzero errors).
+    """
+    target_url = to_youtube_url(target)
+
+    result = _download_youtube_once(
+        target_url,
+        merged_dir=merged_dir,
+        archive=archive,
+        cookies_browser=cookies_browser,
+        no_js=no_js,
+        extra_opts=extra_opts,
+        quiet=quiet,
+        audio_meta=audio_meta,
+    )
+    if result == 0 or not best_fallback:
+        return result
+
+    fallback_dir = Path("data/bestfallback")
+    fallback_archive = fallback_dir / "archive.txt"
+    fallback_extra_opts = {
+        **(extra_opts or {}),
+        "format": BEST_FALLBACK_FORMAT,
+        "format_sort": ["res", "fps", "br"],
+        "format_sort_force": True,
+    }
+
+    if not quiet:
+        print(
+            "Strict format download failed; retrying with best fallback "
+            f"into {fallback_dir.resolve()}"
+        )
+
+    return _download_youtube_once(
+        target_url,
+        merged_dir=fallback_dir,
+        archive=fallback_archive,
+        cookies_browser=cookies_browser,
+        no_js=no_js,
+        extra_opts=fallback_extra_opts,
+        quiet=quiet,
+        audio_meta=audio_meta,
+    )
 
 
 def _run_download(args) -> int:

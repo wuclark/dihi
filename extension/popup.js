@@ -10,6 +10,7 @@ async function getStatus() {
 
 function render(s) {
   document.getElementById("videoId").textContent = s.videoId || "—";
+  document.getElementById("visitCount").textContent = s.visitCount ?? "—";
 
   if (!s.url || (!s.videoId && s.url)) {
     setStatus("Not a YouTube video", "");

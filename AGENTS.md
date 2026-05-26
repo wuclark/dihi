@@ -63,9 +63,12 @@ Core UI/media routes:
 
 - `GET /` renders the media library UI
 - `GET /tags` renders the tag browser UI
+- `GET /downloads` renders the active/recent download status UI
 - `GET /api/media/library` lists library cards
 - `GET /api/media/details/<channel_id>/<video_id>` returns per-video files and metadata
+- `GET /api/media/resolve/<video_id>` returns the archived media record and preferred playable URL for one YouTube ID
 - `GET /api/media/tags` returns tag counts and tag-grouped videos
+- `GET /api/downloads/status` returns active video/playlist downloads, recent completed/failed results, and queue summary fields including `Queue Empty` when idle
 - `GET /media/<path>` serves downloaded files with conditional/range-capable responses
 
 Archive/download API routes:
@@ -77,7 +80,7 @@ Archive/download API routes:
 - `POST /api/youtube/playlist/get/<playlist_id>`
 - `GET /api/youtube/playlist/status/<playlist_id>`
 
-The extension depends on the `/api/youtube/*` endpoints. Keep their response shapes stable unless updating the extension in the same change.
+The extension depends on the `/api/youtube/*` endpoints and `/api/media/resolve/<video_id>`. Keep their response shapes stable unless updating the extension in the same change.
 
 ## Data And Output Layout
 
@@ -139,7 +142,9 @@ Meaning:
 
 ## UI Notes
 
-The web UI is part of `app3.py`, not a separate server yet. It lists the archive, batches thumbnail rendering, supports video/audio playback, exposes VLC URLs, and loads per-video details lazily.
+The web UI is part of `app3.py`, not a separate server yet. It lists the archive, batches thumbnail rendering, supports video/audio playback, exposes VLC URLs, loads per-video details lazily, and includes `/downloads` for active/recent download status with a remaining queue output. Queue state changes are also written to the server log, including `Queue Empty` when all active downloads finish.
+
+The browser extension tracks per-video YouTube visit counts in `chrome.storage.local`. When enabled, it auto-downloads missing videos after the configured visit threshold and notifies when the automatic request starts. It calls `/api/media/resolve/<video_id>` before posting a download request and skips the request if local media already exists. Counts reset only once the video is found in the archive, so still-missing videos at or above the threshold are requested again on later visits. When archived playback redirection is enabled, archived YouTube watch pages are redirected to the server UI at `/?play=<video_id>&autoplay=1` after `/api/media/resolve/<video_id>` confirms a local media file exists.
 
 Browser playback of `.mkv` is inconsistent across browsers and codecs. Keep the VLC URL path available when changing playback behavior.
 

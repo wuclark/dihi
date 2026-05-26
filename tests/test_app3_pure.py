@@ -26,6 +26,9 @@ from app3 import (
     _ensure_cache,
     _cleanup_old_results,
     _cleanup_old_playlist_results,
+    _resolve_media_by_video_id,
+    _download_status_snapshot,
+    _log_queue_state_locked,
     _RESULT_TTL,
 )
 
@@ -36,11 +39,18 @@ def reset_app3_state(monkeypatch):
     monkeypatch.setattr(app3, "_cached_mtime", None)
     monkeypatch.setattr(app3, "_cached_ids", set())
     monkeypatch.setattr(app3, "_active_downloads", set())
+    monkeypatch.setattr(app3, "_download_started_at", {})
     monkeypatch.setattr(app3, "_download_results", {})
     monkeypatch.setattr(app3, "_result_timestamps", {})
+    monkeypatch.setattr(app3, "_download_history", {})
+    monkeypatch.setattr(app3, "_download_history_timestamps", {})
     monkeypatch.setattr(app3, "_active_playlist_downloads", set())
+    monkeypatch.setattr(app3, "_playlist_started_at", {})
     monkeypatch.setattr(app3, "_playlist_download_results", {})
     monkeypatch.setattr(app3, "_playlist_result_timestamps", {})
+    monkeypatch.setattr(app3, "_playlist_history", {})
+    monkeypatch.setattr(app3, "_playlist_history_timestamps", {})
+    monkeypatch.setattr(app3, "_last_queue_log_message", None)
 
 
 # ---------------------------------------------------------------------------
@@ -208,6 +218,116 @@ class TestEnsureCache:
         monkeypatch.setattr(app3, "_cached_ids", {"stale"})
         _ensure_cache()
         assert app3._cached_ids == {"dQw4w9WgXcQ"}
+
+
+# ---------------------------------------------------------------------------
+# _resolve_media_by_video_id
+# ---------------------------------------------------------------------------
+
+class TestResolveMediaByVideoId:
+    def test_resolves_video_file(self, monkeypatch, tmp_path):
+        video_dir = tmp_path / "UCchannel01" / "dQw4w9WgXcQ"
+        video_dir.mkdir(parents=True)
+        media = video_dir / "UCchannel01.dQw4w9WgXcQ.20240101.Title [dQw4w9WgXcQ].out.mkv"
+        media.write_text("video")
+        monkeypatch.setattr(app3, "MERGED_DIR", tmp_path.resolve())
+
+        result = _resolve_media_by_video_id("dQw4w9WgXcQ")
+
+        assert result["video_id"] == "dQw4w9WgXcQ"
+        assert result["channel_id"] == "UCchannel01"
+        assert result["player_kind"] == "video"
+        assert result["player_url"].endswith(".out.mkv")
+
+    def test_resolves_audio_when_video_missing(self, monkeypatch, tmp_path):
+        video_dir = tmp_path / "UCchannel01" / "abc12345678"
+        video_dir.mkdir(parents=True)
+        audio = video_dir / "UCchannel01.abc12345678.20240101.Title [abc12345678].out.m4a"
+        audio.write_text("audio")
+        monkeypatch.setattr(app3, "MERGED_DIR", tmp_path.resolve())
+
+        result = _resolve_media_by_video_id("abc12345678")
+
+        assert result["player_kind"] == "audio"
+        assert result["player_url"].endswith(".out.m4a")
+
+    def test_missing_video_returns_none(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(app3, "MERGED_DIR", tmp_path.resolve())
+
+        assert _resolve_media_by_video_id("dQw4w9WgXcQ") is None
+
+
+# ---------------------------------------------------------------------------
+# _download_status_snapshot
+# ---------------------------------------------------------------------------
+
+class TestDownloadStatusSnapshot:
+    def test_reports_active_and_recent_video_downloads(self):
+        now = time.time()
+        app3._active_downloads.add("dQw4w9WgXcQ")
+        app3._download_started_at["dQw4w9WgXcQ"] = now - 15
+        app3._download_history["abc12345678"] = "completed"
+        app3._download_history_timestamps["abc12345678"] = now - 5
+
+        snapshot = _download_status_snapshot()
+
+        assert snapshot["ok"] is True
+        assert snapshot["counts"]["active_videos"] == 1
+        assert snapshot["counts"]["active"] == 1
+        assert snapshot["queue"]["empty"] is False
+        assert snapshot["queue"]["remaining_videos"] == 1
+        assert snapshot["queue"]["message"] == "1 video(s) remaining in queue"
+        assert snapshot["active"][0]["id"] == "dQw4w9WgXcQ"
+        assert snapshot["active"][0]["status"] == "downloading"
+        assert snapshot["recent"][0]["id"] == "abc12345678"
+        assert snapshot["recent"][0]["status"] == "completed"
+
+    def test_reports_active_and_recent_playlist_downloads(self):
+        now = time.time()
+        app3._active_playlist_downloads.add("PLabc123")
+        app3._playlist_started_at["PLabc123"] = now - 30
+        app3._playlist_history["PLdone"] = "failed"
+        app3._playlist_history_timestamps["PLdone"] = now - 6
+
+        snapshot = _download_status_snapshot()
+
+        assert snapshot["counts"]["active_playlists"] == 1
+        assert snapshot["active"][0]["kind"] == "playlist"
+        assert snapshot["active"][0]["id"] == "PLabc123"
+        assert snapshot["recent"][0]["kind"] == "playlist"
+        assert snapshot["recent"][0]["status"] == "failed"
+
+    def test_expires_old_recent_results(self):
+        now = time.time()
+        app3._download_history["oldresult1"] = "completed"
+        app3._download_history_timestamps["oldresult1"] = now - (_RESULT_TTL + 1)
+
+        snapshot = _download_status_snapshot()
+
+        assert snapshot["queue"]["empty"] is True
+        assert snapshot["queue"]["message"] == "Queue Empty"
+        assert snapshot["recent"] == []
+        assert "oldresult1" not in app3._download_history
+
+    def test_logs_queue_state_changes(self, monkeypatch):
+        messages = []
+
+        def fake_info(message, detail):
+            messages.append(message % detail)
+
+        monkeypatch.setattr(app3.app.logger, "info", fake_info)
+
+        with app3._lock:
+            app3._active_downloads.add("dQw4w9WgXcQ")
+            _log_queue_state_locked()
+            _log_queue_state_locked()
+            app3._active_downloads.clear()
+            _log_queue_state_locked()
+
+        assert messages == [
+            "Download queue: 1 video(s) remaining in queue (1 total active item(s), 0 playlist(s))",
+            "Download queue: Queue Empty",
+        ]
 
 
 # ---------------------------------------------------------------------------

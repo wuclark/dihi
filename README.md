@@ -79,6 +79,11 @@ curl http://localhost:5000/health
 | `GET` | `/api/youtube/status/<id>` | 60/min | Poll video download progress |
 | `POST` | `/api/youtube/playlist/get/<playlist_id>` | 5/min | Trigger a full playlist download |
 | `GET` | `/api/youtube/playlist/status/<playlist_id>` | 60/min | Poll playlist download progress |
+| `GET` | `/api/media/library` | 30/min | List archived media cards for the web UI |
+| `GET` | `/api/media/resolve/<id>` | 60/min | Resolve one archived YouTube ID to its media record and preferred playback URL |
+| `GET` | `/api/media/details/<channel_id>/<id>` | 60/min | Return files and metadata for one archived video |
+| `GET` | `/api/media/tags` | 30/min | Return tag counts and tag-grouped videos |
+| `GET` | `/api/downloads/status` | 60/min | Return active video/playlist downloads and recent completed/failed results |
 
 Video IDs are exactly 11 characters (`[A-Za-z0-9_-]{11}`). Playlist IDs are 2–128 characters from the same alphabet.
 
@@ -156,6 +161,54 @@ curl http://localhost:5000/api/youtube/playlist/status/PLbpi6ZahtOH6Ar_3GPy3gD_U
 {"downloading": false, "id": "PLbpi6ZahtOH6Ar_3GPy3gD_U6v-DWxvXm", "result": "completed"}
 ```
 
+### `GET /api/media/resolve/<id>` — resolve archived media
+
+```bash
+curl http://localhost:5000/api/media/resolve/dQw4w9WgXcQ
+```
+```json
+{
+  "result": true,
+  "video": {
+    "video_id": "dQw4w9WgXcQ",
+    "channel_id": "UC...",
+    "title": "Example",
+    "files": {"video": "/media/UC.../dQw4w9WgXcQ/example.out.mkv"},
+    "player_url": "/media/UC.../dQw4w9WgXcQ/example.out.mkv",
+    "player_kind": "video"
+  }
+}
+```
+
+Returns HTTP 404 with `{"result": false, "video_id": "<id>"}` when the ID is not present in `merged/`.
+
+### `GET /api/downloads/status` — download status
+
+```bash
+curl http://localhost:5000/api/downloads/status
+```
+```json
+{
+  "ok": true,
+  "active": [
+    {"id": "dQw4w9WgXcQ", "kind": "video", "status": "downloading", "active": true}
+  ],
+  "recent": [
+    {"id": "PLexample", "kind": "playlist", "status": "completed", "active": false}
+  ],
+  "queue": {
+    "empty": false,
+    "message": "1 video(s) remaining in queue",
+    "remaining_videos": 1,
+    "remaining_playlists": 0,
+    "remaining_total": 1
+  },
+  "counts": {"active": 1, "recent": 1}
+}
+```
+
+The `/downloads` page polls this endpoint and shows active video/playlist downloads, recent completed or failed results, and a queue output. When there are no active downloads it shows `Queue Empty`. Queue state changes are also logged by the server.
+
 ---
 
 ## Browser Extension
@@ -178,6 +231,15 @@ Displays a badge on every YouTube video page showing its archive status.
 2. Enable **Developer mode**
 3. Click **Load unpacked** → select the `extension/` folder
 4. Open the extension options page to set the API URL (default: `https://dihi.i.apiskpis.com`)
+
+Options also control automatic behavior:
+
+- Auto-download missing videos after a configurable per-video visit count.
+- Open archived YouTube videos in the server UI instead of YouTube.
+
+Visit counts are stored locally in the browser and reset when a video is found in the archive. When auto-download starts after a threshold match, the extension shows a notification. Before posting a download request, it resolves local media again and skips the request if the video is already downloaded. If the video is still missing on a later visit and its count is still at or above the threshold, the extension requests the download again.
+
+The server UI accepts `/?play=<video_id>&autoplay=1` to open an archived video directly.
 
 ---
 
@@ -250,6 +312,22 @@ The server intentionally requests separate video and audio streams so yt-dlp kee
 
 Do not add a `/best` progressive fallback if you need `.out.f<id>.*` sidecars and `.out.mkv`. A progressive fallback can select format `18`, which saves only `.out.mp4` and leaves no raw audio sidecar for `--audio-meta`.
 
+If the strict format download fails, the downloader retries once into `data/bestfallback/` using a broader fallback chain:
+
+```text
+bestvideo+bestaudio/bv*+ba/best,140/bestaudio[ext=m4a]/bestaudio
+```
+
+The fallback retry is not capped at 1080p, uses best available audio instead of pinning Opus `251`, and forces yt-dlp's fallback sort toward highest resolution first (`res`, then `fps`, then bitrate). It uses its own archive file at `data/bestfallback/archive.txt`. That keeps the main archive clean: a fallback `.out.mp4` or other less-ideal result will not prevent a later strict-format download from succeeding into `merged/`.
+
+Age-restricted videos require authenticated YouTube cookies. The downloader looks for cookies in this order:
+
+1. `cookies.txt` next to the active archive file
+2. `data/cookies.txt`
+3. `./cookies.txt`
+
+Use `make cookies` or `make cookies-browser` to refresh `data/cookies.txt`. If running through Docker, restart the service after refreshing cookies so the container sees the updated file.
+
 The server also includes the `android_vr` YouTube client:
 
 ```python
@@ -257,6 +335,8 @@ The server also includes the `android_vr` YouTube client:
 ```
 
 That matters because some DASH formats, including `399` and `251` for `dQw4w9WgXcQ`, may be visible from the Android VR client while missing from the web/ios client set. TV clients are intentionally excluded because they trigger unsupported EJS challenge paths.
+
+When cookies are active, yt-dlp skips `android_vr` and `ios` because those clients do not support cookies. In that case the server uses `["web", "web_safari"]`; `web_safari` exposes higher HLS formats for age-gated videos where the plain `web` client may only expose format `18` at 360p.
 
 For a one-off CLI equivalent:
 
@@ -315,6 +395,7 @@ The merged `.mkv` contains embedded subtitle streams, cover art, and full metada
 | `./data/archive.txt` | `/app/archive.txt` | Download archive |
 | `./data/cookies.txt` | `/app/cookies.txt` | YouTube cookies (optional) |
 | `./data/merged` | `/app/merged` | Downloaded files |
+| `./data/bestfallback` | `/app/data/bestfallback` | Fallback downloads and fallback archive |
 
 ### Environment Variables
 

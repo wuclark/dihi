@@ -220,6 +220,11 @@ select {
   display: flex; flex-direction: column; gap: 5px;
 }
 #dl-queue:empty { display: none; }
+#dl-queue-status {
+  max-width: 1400px; margin: 8px auto 0; color: var(--muted);
+  font-size: 0.78rem;
+}
+#dl-queue-status.empty { color: #2ea043; }
 .dl-item {
   display: flex; align-items: center; gap: 8px;
   font-size: 0.82rem; padding: 5px 10px; border-radius: 6px;
@@ -254,6 +259,7 @@ select {
   <input id="search" type="search" placeholder="Search videos…" autocomplete="off" aria-label="Search">
   <div class="hcontrols">
     <button class="hbtn" id="play-all-btn" type="button" onclick="playAll()">▶ Play All</button>
+    <a class="hbtn" href="/downloads">Downloads</a>
     <a class="hbtn" href="/tags">Tags</a>
     <select id="sort" aria-label="Sort order">
       <option value="date-desc">Newest first</option>
@@ -273,6 +279,7 @@ select {
            autocomplete="off" spellcheck="false" aria-label="YouTube URL or ID">
     <button id="dl-btn" onclick="submitDownload()">+ Add</button>
   </div>
+  <div id="dl-queue-status" class="empty" aria-live="polite">Queue Empty</div>
   <ul id="dl-queue" aria-live="polite" aria-label="Download queue"></ul>
 </div>
 
@@ -319,6 +326,7 @@ const S = {
   renderLimit: 96,
 };
 const GRID_BATCH = 96;
+const VIDEO_ID_RE = /^[A-Za-z0-9_-]{11}$/;
 
 const $ = id => document.getElementById(id);
 
@@ -335,6 +343,7 @@ async function fetchLibrary() {
     return;
   }
   applyFilters();
+  openInitialVideoFromUrl();
 }
 
 // ── Filter + sort ──────────────────────────────────────────────────────────
@@ -442,6 +451,15 @@ function openVideo(videoId) {
   document.querySelectorAll('.card').forEach(el =>
     el.classList.toggle('active', el.dataset.id === videoId)
   );
+}
+
+function openInitialVideoFromUrl() {
+  const params = new URLSearchParams(location.search);
+  const videoId = params.get('play') || params.get('v');
+  if (!videoId || !VIDEO_ID_RE.test(videoId)) return;
+  if (!S.videos.some(v => v.video_id === videoId)) return;
+  openVideo(videoId);
+  if (params.get('autoplay') === '1') playActiveMedia();
 }
 
 function playableList() {
@@ -698,7 +716,6 @@ document.addEventListener('keydown', e => {
 
 // ── Download bar ───────────────────────────────────────────────────────────
 
-const VIDEO_ID_RE = /^[A-Za-z0-9_-]{11}$/;
 // Active entries: id → {type, id, label, state, timerId}
 const DL = new Map();
 
@@ -762,6 +779,7 @@ function upsertDlItem(entry) {
   const newEl = renderDlItem(entry);
   if (existing) existing.replaceWith(newEl);
   else $('dl-queue').prepend(newEl);
+  updateDlQueueStatus();
 }
 
 function dismissDl(id) {
@@ -769,6 +787,22 @@ function dismissDl(id) {
   if (entry?.timerId) clearInterval(entry.timerId);
   DL.delete(id);
   document.getElementById(`dl-${id}`)?.remove();
+  updateDlQueueStatus();
+}
+
+function updateDlQueueStatus() {
+  const active = [...DL.values()].filter(entry =>
+    ['pending', 'queued', 'running'].includes(entry.state)
+  );
+  const videos = active.filter(entry => entry.type === 'video').length;
+  const el = $('dl-queue-status');
+  if (!active.length) {
+    el.textContent = 'Queue Empty';
+    el.className = 'empty';
+    return;
+  }
+  el.textContent = `${videos} video${videos === 1 ? '' : 's'} remaining in queue`;
+  el.className = '';
 }
 
 async function submitDownload() {

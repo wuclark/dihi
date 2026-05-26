@@ -3,17 +3,15 @@ const DEFAULTS = {
   timeoutMs: 6000,
   debounceMs: 600,
   autoDownloadEnabled: false,
-  autoDownloadAfterSeconds: 60
+  autoDownloadVisitThreshold: 3,
+  playArchivedFromServer: true
 };
 
-// tabId -> { videoId, isTrue, lastCheckedAt }
+// tabId -> { videoId, isTrue, lastCheckedAt, visitCount }
 const tabState = new Map();
 
 // tabId -> { videoId, serverOrigin }
 const downloadPollByTab = new Map();
-
-// tabId -> { videoId, alarmName }
-const autoDownloadByTab = new Map();
 
 function buildUrl(serverOrigin, path) {
   return `${serverOrigin.replace(/\/$/, "")}${path}`;
@@ -78,17 +76,19 @@ async function getConfig() {
     "timeoutMs",
     "debounceMs",
     "autoDownloadEnabled",
-    "autoDownloadAfterSeconds"
+    "autoDownloadVisitThreshold",
+    "playArchivedFromServer"
   ]);
   return {
     serverOrigin: (cfg.serverOrigin || DEFAULTS.serverOrigin).replace(/\/$/, ""),
     timeoutMs: Number(cfg.timeoutMs || DEFAULTS.timeoutMs),
     debounceMs: Number(cfg.debounceMs || DEFAULTS.debounceMs),
     autoDownloadEnabled: Boolean(cfg.autoDownloadEnabled ?? DEFAULTS.autoDownloadEnabled),
-    autoDownloadAfterSeconds: Math.max(
-      5,
-      Number(cfg.autoDownloadAfterSeconds || DEFAULTS.autoDownloadAfterSeconds)
-    )
+    autoDownloadVisitThreshold: Math.max(
+      1,
+      Number(cfg.autoDownloadVisitThreshold || DEFAULTS.autoDownloadVisitThreshold)
+    ),
+    playArchivedFromServer: Boolean(cfg.playArchivedFromServer ?? DEFAULTS.playArchivedFromServer)
   };
 }
 
@@ -98,7 +98,8 @@ chrome.runtime.onInstalled.addListener(() => {
     "timeoutMs",
     "debounceMs",
     "autoDownloadEnabled",
-    "autoDownloadAfterSeconds"
+    "autoDownloadVisitThreshold",
+    "playArchivedFromServer"
   ], (cfg) => {
     const updates = {};
     if (!cfg.serverOrigin) updates.serverOrigin = DEFAULTS.serverOrigin;
@@ -107,8 +108,11 @@ chrome.runtime.onInstalled.addListener(() => {
     if (cfg.autoDownloadEnabled === undefined) {
       updates.autoDownloadEnabled = DEFAULTS.autoDownloadEnabled;
     }
-    if (!cfg.autoDownloadAfterSeconds) {
-      updates.autoDownloadAfterSeconds = DEFAULTS.autoDownloadAfterSeconds;
+    if (!cfg.autoDownloadVisitThreshold) {
+      updates.autoDownloadVisitThreshold = DEFAULTS.autoDownloadVisitThreshold;
+    }
+    if (cfg.playArchivedFromServer === undefined) {
+      updates.playArchivedFromServer = DEFAULTS.playArchivedFromServer;
     }
     if (Object.keys(updates).length) chrome.storage.sync.set(updates);
   });
@@ -137,34 +141,76 @@ async function notifyDownloadFinished(videoId, ok = true) {
   }
 }
 
-function autoAlarmName(tabId, videoId) {
-  return `auto_${tabId}_${videoId}`;
+async function notifyDownloadStarted(videoId, visitCount, threshold, alreadyRunning = false) {
+  try {
+    await chrome.notifications.create({
+      type: "basic",
+      iconUrl: "icons/icon128.png",
+      title: alreadyRunning ? "YouTube download already running" : "YouTube download started",
+      message: `Video ID ${videoId} reached ${visitCount} visit${visitCount === 1 ? "" : "s"}; threshold is ${threshold}.`
+    });
+  } catch {
+    // ignore notification failures
+  }
 }
 
-function clearAutoDownloadTimer(tabId) {
-  const timer = autoDownloadByTab.get(tabId);
-  if (timer?.alarmName) chrome.alarms.clear(timer.alarmName);
-  autoDownloadByTab.delete(tabId);
+async function incrementVisitCount(videoId) {
+  const data = await chrome.storage.local.get(["visitCounts"]);
+  const visitCounts = data.visitCounts || {};
+  const count = Number(visitCounts[videoId] || 0) + 1;
+  visitCounts[videoId] = count;
+  await chrome.storage.local.set({ visitCounts });
+  return count;
 }
 
-async function scheduleAutoDownload(tabId, videoId, isArchived) {
-  const cfg = await getConfig();
-  clearAutoDownloadTimer(tabId);
+async function resetVisitCount(videoId) {
+  const data = await chrome.storage.local.get(["visitCounts"]);
+  const visitCounts = data.visitCounts || {};
+  if (visitCounts[videoId] === undefined) return;
+  delete visitCounts[videoId];
+  await chrome.storage.local.set({ visitCounts });
+}
 
-  if (!cfg.autoDownloadEnabled || isArchived !== false) return;
+async function getVisitCount(videoId) {
+  const data = await chrome.storage.local.get(["visitCounts"]);
+  return Number((data.visitCounts || {})[videoId] || 0);
+}
 
-  const alarmName = autoAlarmName(tabId, videoId);
-  autoDownloadByTab.set(tabId, { videoId, alarmName });
-  chrome.alarms.create(alarmName, {
-    delayInMinutes: cfg.autoDownloadAfterSeconds / 60
-  });
+async function resolveArchivedMedia(serverOrigin, videoId, timeoutMs) {
+  const url = buildUrl(serverOrigin, `/api/media/resolve/${encodeURIComponent(videoId)}`);
+  const res = await fetchWithTimeout(url, { method: "GET" }, timeoutMs);
+  if (!res.ok) return null;
+  const data = await safeJson(res);
+  const playerUrl = data?.video?.player_url;
+  if (!data?.result || !playerUrl) return null;
+  return buildUrl(serverOrigin, playerUrl);
+}
+
+async function maybePlayFromServer(tabId, videoId, cfg) {
+  if (!cfg.playArchivedFromServer) return false;
+
+  try {
+    const mediaUrl = await resolveArchivedMedia(cfg.serverOrigin, videoId, cfg.timeoutMs);
+    if (!mediaUrl) return false;
+
+    const tab = await chrome.tabs.get(tabId);
+    if (!tab?.url || extractYouTubeId(tab.url) !== videoId) return false;
+
+    const playerPage = buildUrl(
+      cfg.serverOrigin,
+      `/?play=${encodeURIComponent(videoId)}&autoplay=1`
+    );
+    await chrome.tabs.update(tabId, { url: playerPage });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 async function checkTab(tabId, tabUrl) {
   if (!tabUrl || !isYouTubeUrl(tabUrl)) {
     await setBadge(tabId, "", "#808080");
     tabState.delete(tabId);
-    clearAutoDownloadTimer(tabId);
     return { status: "not_youtube" };
   }
 
@@ -172,11 +218,11 @@ async function checkTab(tabId, tabUrl) {
   if (!videoId) {
     await setBadge(tabId, "—", "#808080");
     tabState.delete(tabId);
-    clearAutoDownloadTimer(tabId);
     return { status: "no_video_id" };
   }
 
-  const { serverOrigin, timeoutMs, debounceMs } = await getConfig();
+  const cfg = await getConfig();
+  const { serverOrigin, timeoutMs, debounceMs } = cfg;
 
   const now = Date.now();
   const prev = tabState.get(tabId);
@@ -184,13 +230,14 @@ async function checkTab(tabId, tabUrl) {
     return { status: "debounced", videoId, isTrue: prev.isTrue };
   }
 
-  if (!prev || prev.videoId !== videoId) {
-    clearAutoDownloadTimer(tabId);
-  }
-
   const checkUrl = buildUrl(serverOrigin, `/api/youtube/${encodeURIComponent(videoId)}`);
 
-  tabState.set(tabId, { videoId, isTrue: null, lastCheckedAt: now });
+  const isNewVisitForTab = !prev || prev.videoId !== videoId;
+  const visitCount = isNewVisitForTab
+    ? await incrementVisitCount(videoId)
+    : await getVisitCount(videoId);
+
+  tabState.set(tabId, { videoId, isTrue: null, lastCheckedAt: now, visitCount });
 
   await setBadge(tabId, "...", "#1a73e8");
 
@@ -200,26 +247,42 @@ async function checkTab(tabId, tabUrl) {
 
     const isTrue = data?.result === true;
 
-    tabState.set(tabId, { videoId, isTrue, lastCheckedAt: now });
+    tabState.set(tabId, { videoId, isTrue, lastCheckedAt: now, visitCount });
 
     if (isTrue) {
       await setBadge(tabId, "OK", "#00A000");
+      await resetVisitCount(videoId);
+      await maybePlayFromServer(tabId, videoId, cfg);
     } else {
       await setBadge(tabId, "NO", "#D00000");
     }
 
-    await scheduleAutoDownload(tabId, videoId, isTrue);
+    if (
+      cfg.autoDownloadEnabled &&
+      isNewVisitForTab &&
+      isTrue === false &&
+      visitCount >= cfg.autoDownloadVisitThreshold
+    ) {
+      await startDownloadFlow(tabId, tabUrl, {
+        skipRecheck: true,
+        notifyStarted: true,
+        visitCount,
+        threshold: cfg.autoDownloadVisitThreshold
+      });
+    }
 
-    return { status: "checked", videoId, isTrue };
+    return { status: "checked", videoId, isTrue, visitCount };
   } catch {
-    tabState.set(tabId, { videoId, isTrue: null, lastCheckedAt: now });
+    tabState.set(tabId, { videoId, isTrue: null, lastCheckedAt: now, visitCount });
     await setBadge(tabId, "ERR", "#D00000");
-    return { status: "error", videoId };
+    return { status: "error", videoId, visitCount };
   }
 }
 
-async function startDownloadFlow(tabId, tabUrl) {
-  await checkTab(tabId, tabUrl);
+async function startDownloadFlow(tabId, tabUrl, opts = {}) {
+  if (!opts.skipRecheck) {
+    await checkTab(tabId, tabUrl);
+  }
 
   const state = tabState.get(tabId);
   if (!state?.videoId) return { ok: false, reason: "no_video_id" };
@@ -230,6 +293,15 @@ async function startDownloadFlow(tabId, tabUrl) {
   const postUrl = buildUrl(serverOrigin, `/api/youtube/get/${encodeURIComponent(state.videoId)}`);
 
   try {
+    const mediaUrl = await resolveArchivedMedia(serverOrigin, state.videoId, timeoutMs);
+    if (mediaUrl) {
+      await setBadge(tabId, "OK", "#00A000");
+      await resetVisitCount(state.videoId);
+      const cfg = await getConfig();
+      await maybePlayFromServer(tabId, state.videoId, cfg);
+      return { ok: false, reason: "already_downloaded", videoId: state.videoId };
+    }
+
     const res = await fetchWithTimeout(
       postUrl,
       {
@@ -240,18 +312,33 @@ async function startDownloadFlow(tabId, tabUrl) {
       timeoutMs
     );
 
+    const data = await safeJson(res);
+
     if (!res.ok) {
       await setBadge(tabId, "ERR", "#D00000");
       return { ok: false, reason: "post_failed", status: res.status };
     }
 
     await setBadge(tabId, "DL", "#FFD000");
-    clearAutoDownloadTimer(tabId);
+
+    if (opts.notifyStarted) {
+      await notifyDownloadStarted(
+        state.videoId,
+        Number(opts.visitCount || state.visitCount || 0),
+        Number(opts.threshold || 1),
+        Boolean(data?.already_running)
+      );
+    }
 
     downloadPollByTab.set(tabId, { videoId: state.videoId, serverOrigin });
     chrome.alarms.create(`poll_${tabId}`, { periodInMinutes: 0.05 });
 
-    return { ok: true, videoId: state.videoId };
+    return {
+      ok: true,
+      videoId: state.videoId,
+      started: data?.started,
+      alreadyRunning: data?.already_running
+    };
   } catch {
     await setBadge(tabId, "ERR", "#D00000");
     return { ok: false, reason: "exception" };
@@ -282,7 +369,6 @@ chrome.tabs.onActivated.addListener(async ({ tabId }) => {
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
-  clearAutoDownloadTimer(tabId);
   tabState.delete(tabId);
   downloadPollByTab.delete(tabId);
   chrome.alarms.clear(`poll_${tabId}`);
@@ -296,27 +382,6 @@ chrome.action.onClicked.addListener(async (tab) => {
 });
 
 chrome.alarms.onAlarm.addListener(async (alarm) => {
-  if (alarm?.name?.startsWith("auto_")) {
-    const match = /^auto_(\d+)_(.+)$/.exec(alarm.name);
-    if (!match) return;
-
-    const tabId = Number(match[1]);
-    const videoId = match[2];
-    const timer = autoDownloadByTab.get(tabId);
-    if (!timer || timer.videoId !== videoId) return;
-
-    autoDownloadByTab.delete(tabId);
-
-    try {
-      const tab = await chrome.tabs.get(tabId);
-      if (!tab?.url || extractYouTubeId(tab.url) !== videoId) return;
-      await startDownloadFlow(tabId, tab.url);
-    } catch {
-      // Tab closed or inaccessible.
-    }
-    return;
-  }
-
   if (!alarm?.name?.startsWith("poll_")) return;
 
   const tabId = Number(alarm.name.replace("poll_", ""));
@@ -377,7 +442,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         url: tab.url || "",
         videoId: state?.videoId || null,
         isTrue: state?.isTrue ?? null,
-        isDownloading: polling
+        isDownloading: polling,
+        visitCount: state?.visitCount ?? null
       });
     }
 
