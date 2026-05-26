@@ -209,6 +209,7 @@ __marimo__/
 
 
 merged/
+data/
 
 # Sensitive cookie files
 cookies.txt
