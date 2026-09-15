@@ -254,20 +254,26 @@ The server UI accepts `/?play=<video_id>&autoplay=1` to open an archived video d
 ### Setup
 
 ```bash
+make help         # list targets without installing anything
 make setup        # create venv + install dependencies
 make dev-install  # install the `dihi` CLI entry point (pip install -e .)
 make test         # run the unit test suite
 
 # Run the API server directly (not via Docker)
-python src/dihi/app3.py
+make run
 ```
+
+Make uses the venv executables directly. To use `dihi` in your own shell, run `source venv/bin/activate` first or call `venv/bin/dihi`.
 
 ### Make targets
 
 | Target | Description |
 |--------|-------------|
+| `make help` or `make` | List Make targets without installing dependencies |
 | `make setup` | Create venv and install `requirements.txt` |
 | `make dev-install` | Install `dihi` CLI entry point via `pip install -e .` |
+| `make startup` | Show the command to activate the venv in your shell |
+| `make run` | Start the Flask server from `src/dihi/app3.py` |
 | `make test` | Run the unit test suite with coverage |
 | `make clean` | Remove the venv |
 | `make <id>` | Download a video or playlist (any unrecognised target) |

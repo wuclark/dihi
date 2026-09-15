@@ -5,22 +5,41 @@ PIP := $(VENV)/bin/pip
 PYTEST := $(VENV)/bin/pytest
 DIHI := $(VENV)/bin/dihi
 YTDLP := $(VENV)/bin/yt-dlp
+.DEFAULT_GOAL := help
 
 # WSL2: detect Windows username and locate browser profiles on the host C: drive
 _WIN_USER     := $(shell cmd.exe /c "echo %USERNAME%" 2>/dev/null | tr -d '\r\n')
 _CHROME_PROF  := /mnt/c/Users/$(_WIN_USER)/AppData/Local/Google/Chrome/User Data
 _EDGE_PROF    := /mnt/c/Users/$(_WIN_USER)/AppData/Local/Microsoft/Edge/User Data
 
-.PHONY: setup install dev-install run clean test data cookies cookies-browser install-chrome git-add git-commit-push
+.PHONY: help startup setup install dev-install run clean test data cookies cookies-browser install-chrome git-add git-commit-push
+
+help:
+	@echo 'Available targets:'
+	@echo '  help             Show this help'
+	@echo '  setup            Create venv and install dependencies'
+	@echo '  install          Alias for setup'
+	@echo '  dev-install      Install the dihi CLI in editable mode'
+	@echo '  startup          Show the venv activation command'
+	@echo '  run              Run the app with the venv Python'
+	@echo '  test             Run unit tests with coverage'
+	@echo '  data             Create Docker bind-mount data files'
+	@echo '  cookies          Export YouTube cookies from a WSL2 browser'
+	@echo '  cookies-browser  Export cookies from a fresh Linux browser session'
+	@echo '  install-chrome   Install Chrome on Debian/Ubuntu'
+	@echo '  git-add          Stage project files, excluding runtime data'
+	@echo '  git-commit-push  Commit and push staged changes (requires MSG=...)'
+	@echo '  clean            Remove the venv'
+	@echo '  <video ID or URL> Download a video or playlist'
 
 # Build the venv (and install requirements) when requirements.txt changes
 $(VENV)/bin/activate: requirements.txt
 	$(PYTHON) -m venv $(VENV)
 	$(PIP) install --upgrade pip
 	$(PIP) install -r requirements.txt
-	source $(VENV)/bin/activate
 
-startup: source $(VENV)/bin/activate
+startup:
+	@echo 'To activate the venv in your shell, run: source $(VENV)/bin/activate'
 
 # Create/refresh venv + deps
 setup: $(VENV)/bin/activate
@@ -37,7 +56,7 @@ dev-install: $(DIHI)
 
 # Run your app using the venv's python
 run: $(VENV)/bin/activate
-	$(VENV)/bin/python main.py
+	$(VENV)/bin/python src/dihi/app3.py
 
 # Run unit tests (pure — no network, no ffmpeg, no HTTP)
 test: $(VENV)/bin/activate

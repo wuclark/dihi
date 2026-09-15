@@ -44,8 +44,10 @@ gunicorn --bind 0.0.0.0:5000 --workers 1 --threads 8 app3:app
 ## Common Commands
 
 ```bash
+make help
 make setup
 make dev-install
+make run
 venv/bin/pytest
 python src/dihi/app3.py
 docker compose up -d --build
@@ -53,7 +55,7 @@ make git-add
 make git-commit-push MSG="Describe the change"
 ```
 
-Current `make run` invokes `main.py`, which does not exist. Use `python src/dihi/app3.py` unless the Makefile is fixed.
+`make help` works before setup and is the default Make target. `make setup` and `make dev-install` use the venv executables directly; to activate the venv in your shell, run `source venv/bin/activate` yourself (or use `make startup` to display that command). `make run` starts the active server in `src/dihi/app3.py`.
 
 `make git-add` intentionally excludes local runtime data paths: `data/**`, root `archive.txt`, root `cookies.txt`, and `audio/**`.
 
