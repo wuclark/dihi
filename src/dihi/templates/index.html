@@ -250,6 +250,11 @@ select {
   border-top-color: var(--accent); border-radius: 50%;
   animation: spin .65s linear infinite; flex-shrink: 0;
 }
+.dl-progress { flex-basis: 100%; margin: 2px 0 0 20px; min-width: 0; }
+.dl-progress-bar { height: 5px; background: var(--border); border-radius: 4px; overflow: hidden; }
+.dl-progress-fill { height: 100%; background: var(--accent); transition: width .3s ease; }
+.dl-progress-text { color: var(--muted); font-size: .7rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.dl-log { margin-top: 3px; max-height: 80px; overflow: auto; white-space: pre-wrap; color: var(--muted); font: .68rem/1.3 ui-monospace, monospace; }
 </style>
 </head>
 <body>
@@ -763,12 +768,15 @@ function renderDlItem(entry) {
   const iconHtml = spinning
     ? '<span class="dl-spin"></span>'
     : `<span class="di-icon">${DL_ICONS[entry.state] ?? '?'}</span>`;
+  const percent = Number(entry.percent);
+  const progress = entry.state === 'running' && (entry.phase || Number.isFinite(percent))
+    ? `<div class="dl-progress"><div class="dl-progress-bar"><div class="dl-progress-fill" style="width:${Number.isFinite(percent) ? Math.max(0, Math.min(100, percent)) : 8}%"></div></div><div class="dl-progress-text">${esc(entry.phase || 'Working…')}</div>${entry.logs?.length ? `<details open><summary>yt-dlp output</summary><pre class="dl-log">${esc(entry.logs.join('\\n'))}</pre></details>` : ''}</div>` : '';
   li.innerHTML = `
     ${iconHtml}
     <span class="di-label">${esc(entry.label)}</span>
     <span class="di-type">${esc(entry.type)}</span>
     <span class="di-state">${DL_LABELS[entry.state] ?? entry.state}</span>
-    <button class="di-dismiss" title="Dismiss" data-id="${esc(entry.id)}">✕</button>`;
+    <button class="di-dismiss" title="Dismiss" data-id="${esc(entry.id)}">✕</button>${progress}`;
   li.querySelector('.di-dismiss').addEventListener('click', () => dismissDl(entry.id));
   return li;
 }
@@ -861,6 +869,7 @@ function startPollVideo(entry) {
       const r = await fetch(`/api/youtube/status/${encodeURIComponent(entry.id)}`);
       if (!r.ok) return;
       const data = await r.json();
+      Object.assign(entry, data);
       if (data.in_archive || data.result) {
         clearInterval(entry.timerId);
         entry.state = (data.result === 'completed' || data.in_archive) ? 'done' : 'failed';
@@ -879,6 +888,7 @@ function startPollPlaylist(entry) {
       const r = await fetch(`/api/youtube/playlist/status/${encodeURIComponent(entry.id)}`);
       if (!r.ok) return;
       const data = await r.json();
+      Object.assign(entry, data);
       if (data.result) {
         clearInterval(entry.timerId);
         entry.state = data.result === 'completed' ? 'done' : 'failed';

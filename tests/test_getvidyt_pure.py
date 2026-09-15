@@ -517,6 +517,15 @@ class TestBuildYdlOpts:
         )
         assert opts.get("cookiefile") == str(tmp_path / "cookies.txt")
 
+    def test_empty_cookie_placeholder_is_ignored(self, tmp_path):
+        (tmp_path / "cookies.txt").touch()
+        opts = build_ydl_opts(
+            merged_dir=tmp_path / "merged",
+            archive=tmp_path / "archive.txt",
+            no_js=True,
+        )
+        assert "cookiefile" not in opts
+
     def test_cookies_file_absent_no_cookiefile_key(self, tmp_path):
         opts = build_ydl_opts(
             merged_dir=tmp_path / "merged",

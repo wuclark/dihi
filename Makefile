@@ -12,7 +12,7 @@ _WIN_USER     := $(shell cmd.exe /c "echo %USERNAME%" 2>/dev/null | tr -d '\r\n'
 _CHROME_PROF  := /mnt/c/Users/$(_WIN_USER)/AppData/Local/Google/Chrome/User Data
 _EDGE_PROF    := /mnt/c/Users/$(_WIN_USER)/AppData/Local/Microsoft/Edge/User Data
 
-.PHONY: help startup setup install dev-install pot-provider run clean test data cookies cookies-browser install-chrome git-add git-commit-push
+.PHONY: help startup setup install dev-install pot-provider docker-up docker-down docker-logs run clean test data cookies cookies-browser install-chrome git-add git-commit-push
 
 help:
 	@echo 'Available targets:'
@@ -21,6 +21,9 @@ help:
 	@echo '  install          Alias for setup'
 	@echo '  dev-install      Install the dihi CLI in editable mode'
 	@echo '  pot-provider     Start the Docker PO Token service for host downloads'
+	@echo '  docker-up        Build and start the dihi server and PO Token provider'
+	@echo '  docker-down      Stop the Docker Compose services'
+	@echo '  docker-logs      Follow Docker Compose service logs'
 	@echo '  startup          Show the venv activation command'
 	@echo '  run              Run the app with the venv Python'
 	@echo '  test             Run unit tests with coverage'
@@ -62,6 +65,16 @@ dev-install: $(DIHI)
 pot-provider:
 	@command -v docker >/dev/null || { echo 'Docker is required for the PO Token provider.'; exit 1; }
 	@docker compose up -d bgutil-provider
+
+# Build and start the complete Docker deployment, including the PO Token provider.
+docker-up: data
+	docker compose up -d --build
+
+docker-down:
+	docker compose down
+
+docker-logs:
+	docker compose logs -f
 
 # Run your app using the venv's python
 run: $(VENV)/.setup-complete

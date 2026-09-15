@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import io
 import mimetypes
 import json
 import os
 import re
 import threading
 import time
+import zipfile
 from pathlib import Path
 from typing import Optional, Set
 
@@ -46,6 +48,14 @@ MAX_CONCURRENT_PLAYLIST_DOWNLOADS = 2
 # Archive lines look like: "youtube <id>"
 CHECK_FILE = Path("./archive.txt").expanduser().resolve()
 MERGED_DIR = Path("./merged").expanduser().resolve()
+_APP_DIR = Path(__file__).resolve().parent
+_SOURCE_EXTENSION_DIR = _APP_DIR / "extension"
+for _parent in _APP_DIR.parents:
+    candidate = _parent / "extension"
+    if candidate.is_dir():
+        _SOURCE_EXTENSION_DIR = candidate
+        break
+EXTENSION_DIR = Path(os.environ.get("DIHI_EXTENSION_DIR", _SOURCE_EXTENSION_DIR))
 
 # Matches format sidecar files, e.g. Title [id].out.f140.m4a
 _SIDECAR_RE = re.compile(r"\.f\d+\.[^.]+$")
@@ -66,6 +76,7 @@ _RESULT_TTL = 300  # Keep results for 5 minutes
 _result_timestamps: dict[str, float] = {}
 _download_history: dict[str, str] = {}
 _download_history_timestamps: dict[str, float] = {}
+_download_details: dict[str, dict] = {}
 
 # Playlist download tracking
 _active_playlist_downloads: Set[str] = set()
@@ -177,6 +188,7 @@ def _format_download_entries(
                 "elapsed_seconds": round(now - started, 1) if started else None,
                 "finished_at": None,
                 "age_seconds": None,
+                **_download_details.get(item_id, {}),
             }
         )
     for item_id, result in sorted(results.items()):
@@ -193,9 +205,33 @@ def _format_download_entries(
                 "elapsed_seconds": None,
                 "finished_at": finished,
                 "age_seconds": round(now - finished, 1) if finished else None,
+                **_download_details.get(item_id, {}),
             }
         )
     return entries
+
+
+def _progress_hook(video_id: str):
+    """Create a yt-dlp hook that keeps concise progress text for the UI."""
+    def hook(event: dict) -> None:
+        status = event.get("status", "")
+        filename = Path(event.get("filename", "")).name if event.get("filename") else ""
+        total = event.get("total_bytes") or event.get("total_bytes_estimate")
+        downloaded = event.get("downloaded_bytes") or 0
+        percent = round(downloaded * 100 / total, 1) if total else None
+        phase = "finished" if status == "finished" else status or "working"
+        if filename:
+            phase = f"{phase}: {filename}"
+        if percent is not None:
+            phase += f" ({percent:g}%)"
+        with _lock:
+            detail = _download_details.setdefault(video_id, {"logs": []})
+            detail.update({"phase": phase, "filename": filename, "percent": percent})
+            logs = detail.setdefault("logs", [])
+            if not logs or logs[-1] != phase:
+                logs.append(phase)
+                del logs[:-40]
+    return hook
 
 
 def _queue_summary_from_active(active_videos: int, active_playlists: int) -> dict:
@@ -289,7 +325,11 @@ def _download_worker(video_id: str) -> None:
     """
     success = False
     try:
-        getvidyt.download_youtube(video_id, audio_meta=True)
+        getvidyt.download_youtube(
+            video_id,
+            audio_meta=True,
+            extra_opts={"progress_hooks": [_progress_hook(video_id)]},
+        )
         # Give filesystem time to sync archive.txt
         time.sleep(0.5)
         # Force cache refresh and check if video is now in archive
@@ -312,6 +352,9 @@ def _download_worker(video_id: str) -> None:
             _result_timestamps[video_id] = finished_at
             _download_history[video_id] = result
             _download_history_timestamps[video_id] = finished_at
+            _download_details.setdefault(video_id, {}).update(
+                {"phase": result, "percent": 100 if success else None}
+            )
             # Cleanup old results
             _cleanup_old_results()
             _cleanup_old_download_history()
@@ -341,7 +384,11 @@ def _cleanup_old_playlist_history() -> None:
 def _playlist_download_worker(playlist_id: str) -> None:
     """Download all videos from a YouTube playlist via getvidyt."""
     try:
-        rc = getvidyt.download_youtube(playlist_id, audio_meta=True)
+        rc = getvidyt.download_youtube(
+            playlist_id,
+            audio_meta=True,
+            extra_opts={"progress_hooks": [_progress_hook(playlist_id)]},
+        )
         # Force cache refresh so status can report archive contents
         global _cached_mtime
         with _lock:
@@ -538,6 +585,28 @@ def index():
     return render_template("index.html")
 
 
+@app.get("/extension.zip")
+def download_extension():
+    """Download the browser extension as a ZIP for local installation."""
+    if not EXTENSION_DIR.is_dir():
+        abort(404)
+
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as bundle:
+        for path in sorted(EXTENSION_DIR.rglob("*")):
+            if not path.is_file() or "__pycache__" in path.parts:
+                continue
+            bundle.write(path, path.relative_to(EXTENSION_DIR).as_posix())
+    archive.seek(0)
+    return send_file(
+        archive,
+        mimetype="application/zip",
+        as_attachment=True,
+        download_name="dihi-extension.zip",
+        max_age=0,
+    )
+
+
 @app.get("/tags")
 def tags_page():
     return render_template("tags.html")
@@ -677,6 +746,7 @@ def api_youtube_get(video_id: str):
                 return jsonify(ok=False, error="too many concurrent downloads"), 429
             _active_downloads.add(vid)
             _download_started_at[vid] = time.time()
+            _download_details[vid] = {"phase": "queued", "percent": 0, "filename": "", "logs": []}
             _log_queue_state_locked()
             threading.Thread(target=_download_worker, args=(vid,), daemon=True).start()
 
@@ -698,6 +768,7 @@ def api_youtube_status(video_id: str):
     with _lock:
         downloading = vid in _active_downloads
         result = _download_results.get(vid)
+        detail = dict(_download_details.get(vid, {}))
         # Clear result after reading (one-time consumption)
         if result and not downloading:
             _download_results.pop(vid, None)
@@ -713,6 +784,7 @@ def api_youtube_status(video_id: str):
         id=vid,
         result=result,  # "completed", "failed", or None
         in_archive=in_archive,
+        **detail,
     )
 
 
@@ -736,6 +808,7 @@ def api_youtube_playlist_get(playlist_id: str):
                 return jsonify(ok=False, error="too many concurrent playlist downloads"), 429
             _active_playlist_downloads.add(pid)
             _playlist_started_at[pid] = time.time()
+            _download_details[pid] = {"phase": "queued", "percent": 0, "filename": "", "logs": []}
             _log_queue_state_locked()
             threading.Thread(
                 target=_playlist_download_worker, args=(pid,), daemon=True
@@ -764,6 +837,7 @@ def api_youtube_playlist_status(playlist_id: str):
     with _lock:
         downloading = pid in _active_playlist_downloads
         result = _playlist_download_results.get(pid)
+        detail = dict(_download_details.get(pid, {}))
         if result and not downloading:
             _playlist_download_results.pop(pid, None)
             _playlist_result_timestamps.pop(pid, None)
@@ -772,6 +846,7 @@ def api_youtube_playlist_status(playlist_id: str):
         downloading=bool(downloading),
         id=pid,
         result=result,  # "completed", "failed", or None
+        **detail,
     )
 
 

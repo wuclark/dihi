@@ -13,6 +13,8 @@ TODO (HTTP / integration tests to add in future):
   - _playlist_download_worker thread integration: same pattern
 """
 import time
+import io
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -44,6 +46,7 @@ def reset_app3_state(monkeypatch):
     monkeypatch.setattr(app3, "_result_timestamps", {})
     monkeypatch.setattr(app3, "_download_history", {})
     monkeypatch.setattr(app3, "_download_history_timestamps", {})
+    monkeypatch.setattr(app3, "_download_details", {})
     monkeypatch.setattr(app3, "_active_playlist_downloads", set())
     monkeypatch.setattr(app3, "_playlist_started_at", {})
     monkeypatch.setattr(app3, "_playlist_download_results", {})
@@ -83,6 +86,15 @@ class TestNormalizeId:
     def test_none_coerced_to_empty_returns_none(self):
         # raw or "" handles None gracefully
         assert _normalize_id(None) is None
+
+
+def test_extension_zip_download_contains_manifest():
+    response = app3.app.test_client().get("/extension.zip")
+
+    assert response.status_code == 200
+    assert response.mimetype == "application/zip"
+    with zipfile.ZipFile(io.BytesIO(response.data)) as bundle:
+        assert "manifest.json" in bundle.namelist()
 
 
 # ---------------------------------------------------------------------------

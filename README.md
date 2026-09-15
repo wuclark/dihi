@@ -79,6 +79,7 @@ Compose starts the PO Token provider with the app and publishes its service port
 | Method | Path | Rate Limit | Description |
 |--------|------|------------|-------------|
 | `GET` | `/health` | 30/min | Health check; reports archive existence and active downloads |
+| `GET` | `/extension.zip` | — | Download the current browser extension bundle |
 | `GET` | `/api/youtube/<id>` | 60/min | Check if a video is in the archive |
 | `POST` | `/api/youtube/get/<id>` | 10/min | Trigger a video download in the background |
 | `GET` | `/api/youtube/status/<id>` | 60/min | Poll video download progress |
@@ -88,7 +89,7 @@ Compose starts the PO Token provider with the app and publishes its service port
 | `GET` | `/api/media/resolve/<id>` | 60/min | Resolve one archived YouTube ID to its media record and preferred playback URL |
 | `GET` | `/api/media/details/<channel_id>/<id>` | 60/min | Return files and metadata for one archived video |
 | `GET` | `/api/media/tags` | 30/min | Return tag counts and tag-grouped videos |
-| `GET` | `/api/downloads/status` | 60/min | Return active video/playlist downloads and recent completed/failed results |
+| `GET` | `/api/downloads/status` | 60/min | Return active video/playlist downloads, recent results, and yt-dlp progress details |
 
 Video IDs are exactly 11 characters (`[A-Za-z0-9_-]{11}`). Playlist IDs are 2–128 characters from the same alphabet.
 
@@ -235,7 +236,15 @@ Displays a badge on every YouTube video page showing its archive status.
 1. Open Chrome/Edge → `chrome://extensions`
 2. Enable **Developer mode**
 3. Click **Load unpacked** → select the `extension/` folder
-4. Open the extension options page to set the API URL (default: `https://dihi.i.apiskpis.com`)
+4. Open the extension options page to set the API URL (default: `https://dihi.i.apiskpis.com`; use `http://localhost:5000` for a local server)
+
+Browsers do not install extensions directly from a localhost web page. Use
+**Load unpacked** for local development; the installed extension can then call
+the dihi server at `http://localhost:5000`.
+
+When the local server is running, download the current extension bundle from
+[`http://localhost:5000/extension.zip`](http://localhost:5000/extension.zip),
+extract it, and select the extracted folder with **Load unpacked**.
 
 Options also control automatic behavior:
 
@@ -267,6 +276,19 @@ make test         # run the unit test suite
 # Run the API server directly (not via Docker)
 make run
 ```
+
+To run the complete Docker stack (dihi plus the PO Token provider):
+
+```bash
+make docker-up
+```
+
+Stop it with `make docker-down`; follow logs with `make docker-logs`.
+
+Docker dependency installation is cached separately from application source;
+routine code and template edits therefore rebuild quickly. Changes to
+`requirements.txt` or `pyproject.toml` invalidate that dependency layer; a
+BuildKit pip cache avoids redownloading packages when that layer is retried.
 
 Make uses the venv executables directly. To use `dihi` in your own shell, run `source venv/bin/activate` first or call `venv/bin/dihi`.
 

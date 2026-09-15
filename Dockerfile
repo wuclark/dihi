@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 FROM python:3.12-slim
 
 # Install system dependencies
@@ -18,13 +19,20 @@ WORKDIR /app
 # Copy package metadata and source so the local editable install can resolve
 COPY pyproject.toml .
 COPY requirements.txt .
+
+# Install third-party dependencies in a cacheable layer. The source tree is
+# copied below so normal code/template edits do not reinstall every package.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    sed '/^-e \.$/d' requirements.txt > /tmp/requirements-runtime.txt \
+    && pip install -r /tmp/requirements-runtime.txt
+
+# Copy application code and install this project without re-resolving deps.
 COPY src ./src
-
-# Install Python dependencies
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Copy application code
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --no-deps -e .
 COPY src/dihi/ ./
+# Include the browser extension for the /extension.zip download endpoint.
+COPY extension ./extension
 
 # Create directories for data persistence
 RUN mkdir -p /app/merged /app/data

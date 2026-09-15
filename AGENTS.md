@@ -41,6 +41,16 @@ Docker runs `app3:app` with Gunicorn:
 gunicorn --bind 0.0.0.0:5000 --workers 1 --threads 8 app3:app
 ```
 
+The Docker image includes `extension/` so `/extension.zip` works from the
+container as well as from a source checkout.
+
+The Dockerfile installs third-party requirements before copying application
+source, so edits to Python, templates, or the extension reuse the dependency
+layer. The pip wheel cache is persisted through BuildKit as well, so a failed
+dependency build does not need to download every package again. Change
+`requirements.txt` or `pyproject.toml` to intentionally rebuild that slower
+layer.
+
 ## Common Commands
 
 ```bash
@@ -48,6 +58,9 @@ make help
 make setup
 make dev-install
 make pot-provider
+make docker-up
+make docker-down
+make docker-logs
 make run
 venv/bin/pytest
 python src/dihi/app3.py
@@ -58,20 +71,21 @@ make git-commit-push MSG="Describe the change"
 
 `make help` works before setup and is the default Make target. `make setup` installs the pinned yt-dlp and PO Token plugin in the venv and writes `venv/.setup-complete` only after all installs succeed; a failed pip run remains retryable. `make dev-install` installs the CLI entry point. Both use venv executables directly. To activate the venv in your shell, run `source venv/bin/activate` yourself (or use `make startup` to display that command). `make <video ID or URL>` starts the Docker PO Token service before downloading unless `DIHI_PO_TOKEN_PROVIDER_URL` points to another provider. `make pot-provider` starts it explicitly for direct CLI calls or server-triggered downloads. `make run` starts the active server in `src/dihi/app3.py`.
 
-`make git-add` intentionally excludes local runtime data paths: `data/**`, root `archive.txt`, root `cookies.txt`, and `audio/**`.
+`make docker-up` initializes bind-mount data files, then builds and starts the dihi server and PO Token provider. `make docker-down` stops the Compose services; `make docker-logs` follows their logs. `make git-add` intentionally excludes local runtime data paths: `data/**`, root `archive.txt`, root `cookies.txt`, and `audio/**`.
 
 ## Server Routes
 
 Core UI/media routes:
 
 - `GET /` renders the media library UI
+- `GET /extension.zip` downloads the browser extension bundle for local installation
 - `GET /tags` renders the tag browser UI
 - `GET /downloads` renders the active/recent download status UI
 - `GET /api/media/library` lists library cards
 - `GET /api/media/details/<channel_id>/<video_id>` returns per-video files and metadata
 - `GET /api/media/resolve/<video_id>` returns the archived media record and preferred playable URL for one YouTube ID
 - `GET /api/media/tags` returns tag counts and tag-grouped videos
-- `GET /api/downloads/status` returns active video/playlist downloads, recent completed/failed results, and queue summary fields including `Queue Empty` when idle
+- `GET /api/downloads/status` returns active video/playlist downloads, recent completed/failed results, queue summary fields including `Queue Empty` when idle, and yt-dlp progress details (`phase`, `percent`, `filename`, and recent `logs`)
 - `GET /media/<path>` serves downloaded files with conditional/range-capable responses
 
 Archive/download API routes:

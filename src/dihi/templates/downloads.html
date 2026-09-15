@@ -76,6 +76,11 @@ h2 { font-size: 0.95rem; font-weight: 650; }
 .links { display: flex; gap: 8px; flex-wrap: wrap; }
 .links a { color: var(--accent); text-decoration: none; font-size: 0.78rem; }
 .links a:hover { text-decoration: underline; }
+.progress-detail { grid-column: 1 / -1; min-width: 0; }
+.progress-bar { height: 7px; background: var(--surface2); border-radius: 5px; overflow: hidden; margin: 5px 0; }
+.progress-fill { height: 100%; background: var(--accent); transition: width .3s ease; }
+.progress-file { color: var(--muted); font-size: .75rem; overflow-wrap: anywhere; }
+.progress-log { margin-top: 5px; max-height: 120px; overflow: auto; color: var(--muted); font: .72rem/1.4 ui-monospace, monospace; white-space: pre-wrap; }
 .empty {
   border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface);
   color: var(--muted); padding: 26px 18px; text-align: center;
@@ -181,12 +186,19 @@ function renderRow(item) {
   const seconds = active ? item.elapsed_seconds : item.age_seconds;
   const timeLabel = active ? `${fmtDuration(seconds)} elapsed` : `${fmtDuration(seconds)} ago`;
   const status = esc(item.status || 'unknown');
+  const percent = Number(item.percent);
+  const progress = item.active && (item.phase || Number.isFinite(percent))
+    ? `<div class="progress-detail">
+         <div class="progress-bar"><div class="progress-fill" style="width:${Number.isFinite(percent) ? Math.max(0, Math.min(100, percent)) : 8}%"></div></div>
+         <div class="progress-file">${esc(item.phase || item.filename || 'Working…')}</div>
+         ${item.logs?.length ? `<details open><summary class="muted">yt-dlp output (${item.logs.length} lines)</summary><pre class="progress-log">${esc(item.logs.join('\\n'))}</pre></details>` : ''}
+       </div>` : '';
   return `<div class="row">
     <div>${esc(item.kind || '')}</div>
     <div class="id">${esc(item.id || '')}</div>
     <div><span class="status ${status}">${status}</span></div>
     <div class="muted">${timeLabel}</div>
-    <div class="links">${linksFor(item)}</div>
+    <div class="links">${linksFor(item)}</div>${progress}
   </div>`;
 }
 

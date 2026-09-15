@@ -29,9 +29,6 @@ merged/
 archive.txt
 cookies.txt
 
-# Extension (not needed in container)
-extension/
-
 # Documentation
 *.md
 LICENSE

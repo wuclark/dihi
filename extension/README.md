@@ -27,6 +27,17 @@ When the server reports `downloading:false`, the extension shows a **notificatio
 3. Click **Load unpacked**
 4. Select this folder (`extension/`)
 
+The browser does not allow an extension to be installed just by opening a
+`http://localhost` page. For local development, **Load unpacked** is the
+supported install method. After loading it, open the extension's Options page
+and set **Server Origin** to `http://localhost:5000` when the dihi server is
+running on the same computer. The manifest already permits localhost HTTP
+origins.
+
+The running dihi server also provides the current extension as
+`http://localhost:5000/extension.zip`. Download and extract that ZIP, then
+choose the extracted folder with **Load unpacked**.
+
 ## Options
 
 Open the extension’s **Options** page to set:

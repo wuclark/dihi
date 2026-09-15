@@ -160,7 +160,10 @@ def _find_cookiefile(archive_path: Path) -> Optional[Path]:
         if resolved in seen:
             continue
         seen.add(resolved)
-        if resolved.is_file():
+        # `make data` creates an empty placeholder so Docker bind mounts have
+        # a file target. Treat that placeholder as absent; passing it to
+        # yt-dlp causes a fatal "does not look like a Netscape format" error.
+        if resolved.is_file() and resolved.stat().st_size > 0:
             return resolved
     return None
 
