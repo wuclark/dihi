@@ -7,8 +7,9 @@ name = "dihi"
 version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = [
-    "yt-dlp",
+    "yt-dlp>=2026.8.19",
     "yt-dlp-ejs",
+    "bgutil-ytdlp-pot-provider>=2.0.0",
     "mutagen",
     "flask",
     "flask-cors",

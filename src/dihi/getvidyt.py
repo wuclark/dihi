@@ -3,6 +3,7 @@ import argparse
 import glob as _glob
 import json
 import math
+import os
 import re
 import shutil
 import subprocess as _subprocess
@@ -767,9 +768,11 @@ def build_ydl_opts(
         "postprocessors": [
             {"key": "FFmpegThumbnailsConvertor", "format": "png", "when": "before_dl"},
             {"key": "FFmpegEmbedSubtitle"},
-            {"key": "EmbedThumbnail", "already_have_thumbnail": False},
+            # FFmpegMetadata remuxes m4a files and drops the covr atom if the
+            # thumbnail was embedded first. Add artwork after that remux.
             {"key": "FFmpegMetadata", "add_metadata": True, "add_chapters": True,
              "add_infojson": "if_exists"},
+            {"key": "EmbedThumbnail", "already_have_thumbnail": False},
         ],
 
         # --- Output paths / template ---
@@ -814,14 +817,17 @@ def build_ydl_opts(
         deno_path = _find_deno_path()
         ydl_opts["js_runtimes"] = {"deno": {"path": deno_path}}
         ydl_opts["remote_components"] = ["ejs:github", "ejs:npm"]
-        # Keep TV clients out because they trigger unsupported EJS challenge paths.
-        # When cookies are used, yt-dlp skips android_vr/ios because those clients
-        # do not support cookies. Add web_safari so age-gated videos can still
-        # expose higher HLS formats instead of falling back to web's 360p format 18.
-        player_clients = ["web", "web_safari"] if has_cookies else ["android_vr", "web", "ios"]
-        ydl_opts["extractor_args"] = {
-            "youtube": {"player_client": player_clients}
-        }
+    # The mweb client needs a per-video GVS PO Token for direct streams. The
+    # bgutil plugin fetches it from the provider on the host or Compose network.
+    # Keep TV clients out because they trigger unsupported EJS challenge paths.
+    # With cookies, android_vr/ios are skipped because they do not support them;
+    # web_safari can still expose HLS formats for age-gated videos.
+    player_clients = ["mweb", "web", "web_safari"] if has_cookies else ["mweb", "android_vr", "web", "ios"]
+    provider_url = os.environ.get("DIHI_PO_TOKEN_PROVIDER_URL", "http://127.0.0.1:4416")
+    ydl_opts["extractor_args"] = {
+        "youtube": {"player_client": player_clients},
+        "youtubepot-bgutilhttp": {"base_url": [provider_url]},
+    }
     if extra_opts:
         # Allow caller to override anything (format, outtmpl, paths, etc.)
         ydl_opts.update(extra_opts)

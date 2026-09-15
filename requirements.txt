@@ -1,5 +1,6 @@
 blinker==1.9.0
 brotli==1.2.0
+bgutil-ytdlp-pot-provider==2.0.0
 certifi==2026.1.4
 cffi==2.0.0
 charset-normalizer==3.4.4
@@ -33,5 +34,5 @@ urllib3==2.6.3
 websockets==16.0
 Werkzeug==3.1.8
 wrapt==2.1.2
-yt-dlp==2026.3.17
+yt-dlp==2026.8.19
 yt-dlp-ejs==0.8.0

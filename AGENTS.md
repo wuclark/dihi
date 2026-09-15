@@ -47,6 +47,7 @@ gunicorn --bind 0.0.0.0:5000 --workers 1 --threads 8 app3:app
 make help
 make setup
 make dev-install
+make pot-provider
 make run
 venv/bin/pytest
 python src/dihi/app3.py
@@ -55,7 +56,7 @@ make git-add
 make git-commit-push MSG="Describe the change"
 ```
 
-`make help` works before setup and is the default Make target. `make setup` and `make dev-install` use the venv executables directly; to activate the venv in your shell, run `source venv/bin/activate` yourself (or use `make startup` to display that command). `make run` starts the active server in `src/dihi/app3.py`.
+`make help` works before setup and is the default Make target. `make setup` installs the pinned yt-dlp and PO Token plugin in the venv and writes `venv/.setup-complete` only after all installs succeed; a failed pip run remains retryable. `make dev-install` installs the CLI entry point. Both use venv executables directly. To activate the venv in your shell, run `source venv/bin/activate` yourself (or use `make startup` to display that command). `make <video ID or URL>` starts the Docker PO Token service before downloading unless `DIHI_PO_TOKEN_PROVIDER_URL` points to another provider. `make pot-provider` starts it explicitly for direct CLI calls or server-triggered downloads. `make run` starts the active server in `src/dihi/app3.py`.
 
 `make git-add` intentionally excludes local runtime data paths: `data/**`, root `archive.txt`, root `cookies.txt`, and `audio/**`.
 
@@ -97,6 +98,7 @@ Docker bind mounts:
 - `./data/archive.txt` -> `/app/archive.txt`
 - `./data/cookies.txt` -> `/app/cookies.txt`
 - `./data/merged` -> `/app/merged`
+- `./data/bestfallback` -> `/app/data/bestfallback`
 
 Downloads are stored under:
 
@@ -105,16 +107,21 @@ merged/
 └── <channel_id>/
     └── <video_id>/
         ├── <channel_id>.<video_id>.<date>.<title> [<video_id>].out.mkv
-        ├── <channel_id>.<video_id>.<date>.<title> [<video_id>].out.f140.m4a
+        ├── <channel_id>.<video_id>.<date>.<title> [<video_id>].out.f399.mp4
+        ├── <channel_id>.<video_id>.<date>.<title> [<video_id>].out.f251.webm
         ├── <channel_id>.<video_id>.<date>.<title> [<video_id>].out.m4a
         ├── <channel_id>.<video_id>.<date>.<title> [<video_id>].out.info.json
         ├── <channel_id>.<video_id>.<date>.<title> [<video_id>].out.formats.json
         ├── <channel_id>.<video_id>.<date>.<title> [<video_id>].out.description
-        ├── <channel_id>.<video_id>.<date>.<title> [<video_id>].out.png
+        ├── <channel_id>.<video_id>.<date>.<title> [<video_id>].out.webp (or .out.png)
         └── <channel_id>.<video_id>.<date>.<title> [<video_id>].out.en.vtt
 ```
 
 The exact set varies by source video and available formats. The `<channel_id>/<video_id>/` directory structure is intentional because those IDs are stable across title/channel renames.
+
+The default `.out.m4a` is the separately requested AAC audio download. `--audio-meta` can make additional clean, tagged copies from kept raw audio sidecars, such as `.out.f251.webm` to `.out.webm`.
+
+`merged/` is the strict output tree and uses root `archive.txt`. Failed strict downloads retry into `data/bestfallback/` with its own `archive.txt`; the fallback archive does not mark a strict download complete. `keepvideo: True` preserves raw `.f<id>.<ext>` streams alongside the merged MKV, so disk use includes duplicate media data.
 
 ## Download Logic
 
@@ -136,11 +143,15 @@ Meaning:
 
 ## Postprocessing Notes
 
-- Thumbnails are converted to PNG.
+- Thumbnails are converted to PNG for embedding when needed; the original WebP sidecar can remain on disk.
+- `FFmpegMetadata` runs before `EmbedThumbnail`; reversing them drops the M4A `covr` artwork atom during metadata remuxing.
 - Metadata, chapters, thumbnails, subtitles, descriptions, info JSON, and format manifests are written when available.
 - `AudioMetadataPostProcessor` can create clean audio copies with embedded metadata.
 - Server-triggered video and playlist downloads call `download_youtube(..., audio_meta=True)`.
 - Deno/`yt-dlp-ejs` is used for YouTube JS challenge solving unless `no_js=True`.
+- yt-dlp must be at least 2026.08.19; older releases can return HTTP 403 for `android_vr` video streams. `make setup` refreshes the pinned version after `requirements.txt` changes.
+- The `bgutil-ytdlp-pot-provider` plugin supplies per-video GVS PO Tokens for the `mweb` client. `make pot-provider` starts its Docker service, and `make <video ID or URL>` starts it automatically. Compose publishes its port only on `127.0.0.1:4416`; the app container uses `DIHI_PO_TOKEN_PROVIDER_URL=http://bgutil-provider:4416`. The host default is `http://127.0.0.1:4416`.
+- Host workflow: `make setup`, `make dev-install`, then `make <video ID or URL>`. `make setup` installs the Python plugin but does not start its Docker service. Direct `venv/bin/dihi download` and `make run` need `make pot-provider` first if they will download. `docker compose up -d --build` starts the provider with the app through `depends_on`; run `make data` first for bind-mount files.
 
 ## UI Notes
 

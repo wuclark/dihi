@@ -461,6 +461,16 @@ class TestMetadataSidecarRun:
 # ---------------------------------------------------------------------------
 
 class TestBuildYdlOpts:
+    def test_configures_mweb_token_provider(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("DIHI_PO_TOKEN_PROVIDER_URL", "http://provider:4416")
+        opts = build_ydl_opts(
+            merged_dir=tmp_path / "merged",
+            archive=tmp_path / "archive.txt",
+            no_js=True,
+        )
+        assert opts["extractor_args"]["youtube"]["player_client"][0] == "mweb"
+        assert opts["extractor_args"]["youtubepot-bgutilhttp"]["base_url"] == ["http://provider:4416"]
+
     def test_returns_expected_keys(self, tmp_path):
         opts = build_ydl_opts(
             merged_dir=tmp_path / "merged",

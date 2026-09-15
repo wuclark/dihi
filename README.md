@@ -5,6 +5,7 @@ A YouTube video archive management system. Downloads videos and playlists via yt
 ## Features
 
 - **CLI** — download videos and playlists, check archive status, embed audio metadata
+- **PO Token provider** — automatically supplies per-video YouTube GVS tokens for reliable `mweb` downloads
 - **REST API** — check archive status and trigger downloads over HTTP
 - **Browser Extension** — Chrome/Edge badge overlay on YouTube pages
 - **Docker** — production deployment via Docker Compose + Gunicorn
@@ -18,19 +19,22 @@ A YouTube video archive management system. Downloads videos and playlists via yt
 make setup        # create venv and install dependencies
 make dev-install  # install the `dihi` entry point
 
-# Download a video or playlist
+# Download a video or playlist (Make starts the PO Token service automatically)
 make dQw4w9WgXcQ                      # bare video ID
 make PLbpi6ZahtOH6Ar_3GPy3gD_U6v-DWxvXm  # playlist ID
 make "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
 
-# Or use the dihi command directly
-dihi download dQw4w9WgXcQ
-dihi download PLbpi6ZahtOH6Ar_3GPy3gD_U6v-DWxvXm
-dihi download dQw4w9WgXcQ --audio-meta   # also create clean .m4a with embedded metadata
-dihi check dQw4w9WgXcQ                  # check local archive (no server needed)
-dihi check dQw4w9WgXcQ --archive ./data/archive.txt
-dihi audio-meta ./data/merged/           # post-process already-downloaded files
+# For direct CLI downloads or local server-triggered downloads, start it first
+make pot-provider
+venv/bin/dihi download dQw4w9WgXcQ
+venv/bin/dihi download PLbpi6ZahtOH6Ar_3GPy3gD_U6v-DWxvXm
+venv/bin/dihi download dQw4w9WgXcQ --audio-meta  # tag copies of kept audio streams
+venv/bin/dihi check dQw4w9WgXcQ                  # check local archive (no server needed)
+venv/bin/dihi check dQw4w9WgXcQ --archive ./data/archive.txt
+venv/bin/dihi audio-meta ./merged/                # post-process host CLI downloads
 ```
+
+Docker must be running for the local PO Token service used by `make <video ID or URL>`. A direct CLI download needs `make pot-provider` first; the full Docker stack starts the service automatically.
 
 ### CLI reference
 
@@ -42,7 +46,7 @@ dihi download <target> [options]
   --cookies-browser X   load cookies from browser profile, e.g. "firefox"
   --no-js               disable Deno/JS runtime
   --quiet               suppress yt-dlp output
-  --audio-meta          create clean audio copies with embedded metadata
+  --audio-meta          create tagged copies of kept audio streams when available
 
 dihi check <target> [--archive PATH]
   exits 0 = found, 1 = not found, 2 = unrecognised ID/URL
@@ -56,16 +60,17 @@ dihi audio-meta <path> [--no-recursive]
 ## Docker Quick Start (REST API)
 
 ```bash
-# 1. Create data directory
-mkdir -p data
-touch data/archive.txt data/cookies.txt   # cookies.txt optional
+# 1. Create bind-mount data files
+make data
 
 # 2. Start
-docker-compose up -d --build
+docker compose up -d --build
 
 # 3. API available at http://localhost:5000
 curl http://localhost:5000/health
 ```
+
+Compose starts the PO Token provider with the app and publishes its service port only on host loopback.
 
 ---
 
@@ -291,18 +296,22 @@ merged/
     ├── .uploader_id                                                           # @handle history
     ├── .uploader_name                                                         # Uploader name history
     └── <video_id>/                                                            # YouTube video ID (never changes)
-        ├── <channel_id>.<video_id>.<date>.<title> [<video_id>].out.mkv       # Merged video (AV1 + Opus)
-        ├── <channel_id>.<video_id>.<date>.<title> [<video_id>].out.f140.m4a  # Pre-merge AAC audio sidecar
-        ├── <channel_id>.<video_id>.<date>.<title> [<video_id>].out.m4a       # Clean audio copy (--audio-meta)
+        ├── <channel_id>.<video_id>.<date>.<title> [<video_id>].out.mkv       # Merged video and audio
+        ├── <channel_id>.<video_id>.<date>.<title> [<video_id>].out.f399.mp4  # Kept raw video stream (format varies)
+        ├── <channel_id>.<video_id>.<date>.<title> [<video_id>].out.f251.webm # Kept raw audio stream (format varies)
+        ├── <channel_id>.<video_id>.<date>.<title> [<video_id>].out.m4a       # Separately downloaded AAC audio
+        ├── <channel_id>.<video_id>.<date>.<title> [<video_id>].out.webm      # Optional tagged audio copy (--audio-meta)
         ├── <channel_id>.<video_id>.<date>.<title> [<video_id>].out.info.json # Full yt-dlp metadata
         ├── <channel_id>.<video_id>.<date>.<title> [<video_id>].out.formats.json # Available formats manifest
         ├── <channel_id>.<video_id>.<date>.<title> [<video_id>].out.description
-        ├── <channel_id>.<video_id>.<date>.<title> [<video_id>].out.png       # Thumbnail (PNG)
+        ├── <channel_id>.<video_id>.<date>.<title> [<video_id>].out.webp      # Thumbnail (WebP or PNG)
         ├── <channel_id>.<video_id>.<date>.<title> [<video_id>].out.en.vtt    # English subtitles
         ├── <channel_id>.<video_id>.<date>.<title> [<video_id>].out.en-orig.vtt  # Non-English only
         ├── .title_name                                                        # Video title history
         └── .upload_date                                                       # Upload date history
 ```
+
+The exact files vary by video and selected formats. `--audio-meta` creates tagged copies from kept raw audio streams when available; the default `.out.m4a` is the separately requested AAC download.
 
 ### Why channel_id/video_id folders?
 
@@ -326,6 +335,16 @@ bestvideo+bestaudio/bv*+ba/best,140/bestaudio[ext=m4a]/bestaudio
 
 The fallback retry is not capped at 1080p, uses best available audio instead of pinning Opus `251`, and forces yt-dlp's fallback sort toward highest resolution first (`res`, then `fps`, then bitrate). It uses its own archive file at `data/bestfallback/archive.txt`. That keeps the main archive clean: a fallback `.out.mp4` or other less-ideal result will not prevent a later strict-format download from succeeding into `merged/`.
 
+If both strict and fallback downloads return HTTP 403, refresh dependencies and retry. The Make download target starts the PO Token provider automatically:
+
+```bash
+make setup
+make dev-install
+make j5ky8YidivQ
+```
+
+Releases before 2026.08.19 have a known `android_vr` 403 issue. The `bgutil` provider supplies per-video GVS tokens to the `mweb` client, which yt-dlp recommends when direct streams are missing or forbidden. Run `make pot-provider` before calling `venv/bin/dihi download` or `make run` directly. Its HTTP port is published only on `127.0.0.1:4416`; Docker runs of `dihi` use the service address instead. To use another provider endpoint, set `DIHI_PO_TOKEN_PROVIDER_URL` to its URL; `make <video ID or URL>` then skips the local provider startup. A token can help with 403 errors but does not guarantee that YouTube will allow every download; see yt-dlp's [PO Token guide](https://github.com/yt-dlp/yt-dlp/wiki/PO-Token-Guide).
+
 Age-restricted videos require authenticated YouTube cookies. The downloader looks for cookies in this order:
 
 1. `cookies.txt` next to the active archive file
@@ -334,22 +353,22 @@ Age-restricted videos require authenticated YouTube cookies. The downloader look
 
 Use `make cookies` or `make cookies-browser` to refresh `data/cookies.txt`. If running through Docker, restart the service after refreshing cookies so the container sees the updated file.
 
-The server also includes the `android_vr` YouTube client:
+The downloader tries `mweb` first with a GVS PO Token, then the existing clients:
 
 ```python
-{"youtube": {"player_client": ["android_vr", "web", "ios"]}}
+{"youtube": {"player_client": ["mweb", "android_vr", "web", "ios"]}}
 ```
 
 That matters because some DASH formats, including `399` and `251` for `dQw4w9WgXcQ`, may be visible from the Android VR client while missing from the web/ios client set. TV clients are intentionally excluded because they trigger unsupported EJS challenge paths.
 
-When cookies are active, yt-dlp skips `android_vr` and `ios` because those clients do not support cookies. In that case the server uses `["web", "web_safari"]`; `web_safari` exposes higher HLS formats for age-gated videos where the plain `web` client may only expose format `18` at 360p.
+When cookies are active, yt-dlp skips `android_vr` and `ios` because those clients do not support cookies. In that case the server uses `["mweb", "web", "web_safari"]`; `web_safari` exposes higher HLS formats for age-gated videos where the plain `web` client may only expose format `18` at 360p.
 
 For a one-off CLI equivalent:
 
 ```bash
-yt-dlp \
+venv/bin/yt-dlp \
   -f "399+251/bestvideo[height<=1080][vcodec^=av01]+251/bestvideo[height<=1080]+251/bestvideo[height<=1080]+bestaudio,140/bestaudio" \
-  --extractor-args "youtube:player_client=android_vr,web,ios" \
+  --extractor-args "youtube:player_client=mweb,android_vr,web,ios" \
   --merge-output-format mkv \
   --keep-video \
   dQw4w9WgXcQ
@@ -388,7 +407,7 @@ download_youtube(url, extra_opts={"skip_download": True, "download_archive": Non
 
 ### Embedded metadata
 
-The merged `.mkv` contains embedded subtitle streams, cover art, and full metadata tags. With `--audio-meta`, a clean `.out.m4a` copy is also produced with embedded cover art, chapter markers, and lyrics derived from the subtitle track.
+The merged `.mkv` contains embedded subtitle streams, cover art, and metadata tags. The separately downloaded `.out.m4a` receives title, artist, date, genre, description, source URL, and cover art; metadata is applied before artwork so the M4A `covr` atom survives yt-dlp's remux. The full YouTube metadata remains in `.info.json`. With `--audio-meta`, preserved raw audio sidecars can also produce clean tagged copies (for example, `.out.f251.webm` to `.out.webm`) with cover art, chapters, and subtitle-derived lyrics when available.
 
 ---
 

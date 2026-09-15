@@ -12,14 +12,15 @@ _WIN_USER     := $(shell cmd.exe /c "echo %USERNAME%" 2>/dev/null | tr -d '\r\n'
 _CHROME_PROF  := /mnt/c/Users/$(_WIN_USER)/AppData/Local/Google/Chrome/User Data
 _EDGE_PROF    := /mnt/c/Users/$(_WIN_USER)/AppData/Local/Microsoft/Edge/User Data
 
-.PHONY: help startup setup install dev-install run clean test data cookies cookies-browser install-chrome git-add git-commit-push
+.PHONY: help startup setup install dev-install pot-provider run clean test data cookies cookies-browser install-chrome git-add git-commit-push
 
 help:
 	@echo 'Available targets:'
 	@echo '  help             Show this help'
-	@echo '  setup            Create venv and install dependencies'
+	@echo '  setup            Create venv and install dependencies, including the PO Token plugin'
 	@echo '  install          Alias for setup'
 	@echo '  dev-install      Install the dihi CLI in editable mode'
+	@echo '  pot-provider     Start the Docker PO Token service for host downloads'
 	@echo '  startup          Show the venv activation command'
 	@echo '  run              Run the app with the venv Python'
 	@echo '  test             Run unit tests with coverage'
@@ -32,34 +33,42 @@ help:
 	@echo '  clean            Remove the venv'
 	@echo '  <video ID or URL> Download a video or playlist'
 
-# Build the venv (and install requirements) when requirements.txt changes
-$(VENV)/bin/activate: requirements.txt
+# Mark setup complete only after every install succeeds. The activate script
+# exists before pip runs, so using it as the target would hide failed installs.
+$(VENV)/.setup-complete: requirements.txt
 	$(PYTHON) -m venv $(VENV)
 	$(PIP) install --upgrade pip
 	$(PIP) install -r requirements.txt
+	@touch $@
 
 startup:
 	@echo 'To activate the venv in your shell, run: source $(VENV)/bin/activate'
 
 # Create/refresh venv + deps
-setup: $(VENV)/bin/activate
+setup: $(VENV)/.setup-complete
 
 # Install dependencies (alias)
-install: $(VENV)/bin/activate
+install: $(VENV)/.setup-complete
 
 # Install the dihi package in editable mode; re-runs when pyproject.toml changes
-$(DIHI): pyproject.toml $(VENV)/bin/activate
+$(DIHI): pyproject.toml $(VENV)/.setup-complete
 	$(PIP) install -q -e .
 
 # Alias for the editable install
 dev-install: $(DIHI)
 
+# Start the per-video PO Token provider on host loopback. Docker Compose also
+# starts this service automatically when the full server stack is launched.
+pot-provider:
+	@command -v docker >/dev/null || { echo 'Docker is required for the PO Token provider.'; exit 1; }
+	@docker compose up -d bgutil-provider
+
 # Run your app using the venv's python
-run: $(VENV)/bin/activate
+run: $(VENV)/.setup-complete
 	$(VENV)/bin/python src/dihi/app3.py
 
 # Run unit tests (pure — no network, no ffmpeg, no HTTP)
-test: $(VENV)/bin/activate
+test: $(VENV)/.setup-complete
 	$(PIP) install -q -r requirements-dev.txt
 	$(PYTEST) tests/ -v --tb=short --cov=src/dihi --cov-report=term-missing
 
@@ -92,7 +101,7 @@ data:
 # Tries Chrome → Edge → Firefox in order; stops at the first one found.
 # Run this before `docker compose up` so the bind-mount target is a real file.
 #   make cookies
-cookies: data $(VENV)/bin/activate
+cookies: data $(VENV)/.setup-complete
 	@if [ -d "$(_CHROME_PROF)" ]; then \
 		echo "Found Chrome ($(_WIN_USER)) — exporting cookies…"; \
 		$(YTDLP) --cookies-from-browser "chrome:$(_CHROME_PROF)" \
@@ -115,7 +124,7 @@ cookies: data $(VENV)/bin/activate
 # the session cookies once you close the window.
 # Requires a display: WSLg on Windows 11, or an X server (VcXsrv/Xming) on W10.
 # If no browser is installed, run `make install-chrome` first.
-cookies-browser: data $(VENV)/bin/activate
+cookies-browser: data $(VENV)/.setup-complete
 	@set -e; \
 	[ -n "$${DISPLAY:-}$${WAYLAND_DISPLAY:-}" ] || { \
 		echo "ERROR: no display detected."; \
@@ -178,7 +187,9 @@ clean:
 #   make dQw4w9WgXcQ
 #   make PLxxxxxxxxxxxxxx
 #   make "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
-# Requires: make dev-install (run once after setup)
+# Requires: make dev-install (run once after setup). The provider is started
+# automatically unless DIHI_PO_TOKEN_PROVIDER_URL names an external endpoint.
 .DEFAULT:
 	@test -x "$(DIHI)" || { echo "Run 'make dev-install' first to install the dihi CLI."; exit 1; }
+	@if [ -z "$${DIHI_PO_TOKEN_PROVIDER_URL:-}" ]; then $(MAKE) --no-print-directory pot-provider; fi
 	@$(DIHI) download "$@"
