@@ -289,6 +289,15 @@ select {
   </div>
 </header>
 
+<section id="dl-bar" aria-label="Add download">
+  <div class="dl-row">
+    <input id="dl-input" type="text" placeholder="Paste a video ID, playlist ID, or YouTube URL…" autocomplete="off" aria-label="Video or playlist to download">
+    <button id="dl-btn" type="button" onclick="submitDownload()">Add download</button>
+  </div>
+  <div id="dl-queue-status" class="empty">Queue Empty</div>
+  <div id="dl-queue"></div>
+</section>
+
 <div id="player-wrap" role="region" aria-label="Media player">
   <div class="player-inner">
     <div class="player-media">
@@ -1004,6 +1013,7 @@ $('apanel').addEventListener('error', () => {
 
 $('search').addEventListener('input', applyFilters);
 $('sort').addEventListener('change', applyFilters);
+$('dl-input').addEventListener('keydown', e => { if (e.key === 'Enter') submitDownload(); });
 
 fetchLibrary();
 // Keep a direct-link player visible after asynchronous library rendering.

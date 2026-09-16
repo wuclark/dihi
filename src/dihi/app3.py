@@ -782,7 +782,13 @@ def _scan_library() -> list[dict]:
                     "title": title or video_id,
                     "date": date,
                     "files": files,
-                    "details": {"files": detail_files, "metadata": {"description": description}},
+                    "details": {
+                        "files": detail_files,
+                        "metadata": {
+                            "description": description,
+                            "info_json": {k: _safe_metadata_value(v) for k, v in (info or {}).items()},
+                        },
+                    },
                 }
             )
     return videos
@@ -880,6 +886,18 @@ def downloaded_page():
 @app.get("/catalog")
 def catalog_page():
     return render_template("catalog.html")
+
+
+@app.post("/api/media/catalog/refresh")
+@limiter.limit("6 per minute")
+def api_media_catalog_refresh():
+    """Rebuild the filesystem-backed catalog and remove stale rows."""
+    try:
+        count = catalog.refresh([MERGED_DIR, LEGACY_MERGED_DIR, FALLBACK_DIR], CATALOG_DB, CHECK_FILE)
+    except Exception:
+        app.logger.exception("Catalog refresh failed")
+        return jsonify(ok=False, error="catalog refresh failed"), 503
+    return jsonify(ok=True, count=count)
 
 
 @app.get("/wordcloud")
@@ -1016,7 +1034,10 @@ def api_media_catalog():
     sort = request.args.get("sort", "date-desc")
     order = "upload_date ASC" if sort == "date-asc" else "artist COLLATE NOCASE ASC, title COLLATE NOCASE ASC" if sort == "artist" else "title COLLATE NOCASE ASC" if sort == "title" else "upload_date DESC"
     try:
-        with sqlite3.connect(CATALOG_DB) as db:
+        with sqlite3.connect(CATALOG_DB, timeout=10) as db:
+            # The initial filesystem scan runs in a background thread. Ensure
+            # the readable catalog schema exists even while that scan is busy.
+            db.executescript(catalog.SCHEMA)
             total = db.execute("SELECT COUNT(DISTINCT video_id) FROM videos").fetchone()[0]
             # A video may exist in both the primary and fallback trees. Show
             # one catalog row, preferring the complete primary copy.
