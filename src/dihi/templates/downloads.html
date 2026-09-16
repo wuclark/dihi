@@ -76,10 +76,16 @@ h2 { font-size: 0.95rem; font-weight: 650; }
 .links { display: flex; gap: 8px; flex-wrap: wrap; }
 .links a { color: var(--accent); text-decoration: none; font-size: 0.78rem; }
 .links a:hover { text-decoration: underline; }
+.copy-url { color: var(--accent); background: none; border: 0; cursor: pointer; padding: 0; font-size: .78rem; }
+.copy-url:hover { text-decoration: underline; }
+.retry-download { color: var(--yellow); background: none; border: 0; cursor: pointer; padding: 0; font-size: .78rem; }
 .progress-detail { grid-column: 1 / -1; min-width: 0; }
 .progress-bar { height: 7px; background: var(--surface2); border-radius: 5px; overflow: hidden; margin: 5px 0; }
 .progress-fill { height: 100%; background: var(--accent); transition: width .3s ease; }
 .progress-file { color: var(--muted); font-size: .75rem; overflow-wrap: anywhere; }
+.file-progress-list { display: grid; gap: 4px; margin: 7px 0; }
+.file-progress-row { display: grid; grid-template-columns: minmax(120px, 1fr) 58px; gap: 6px; align-items: center; font-size: .72rem; color: var(--muted); }
+.file-progress-row .progress-bar { grid-column: 1 / -1; margin: 0; }
 .progress-log { margin-top: 5px; max-height: 120px; overflow: auto; color: var(--muted); font: .72rem/1.4 ui-monospace, monospace; white-space: pre-wrap; }
 .empty {
   border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface);
@@ -186,32 +192,64 @@ function renderRow(item) {
   const seconds = active ? item.elapsed_seconds : item.age_seconds;
   const timeLabel = active ? `${fmtDuration(seconds)} elapsed` : `${fmtDuration(seconds)} ago`;
   const status = esc(item.status || 'unknown');
+  const reason = !active && item.reason ? `<div class="muted">${esc(item.reason)}${item.error ? `: ${esc(item.error)}` : ''}</div>` : '';
   const percent = Number(item.percent);
   const progress = item.active && (item.phase || Number.isFinite(percent))
     ? `<div class="progress-detail">
          <div class="progress-bar"><div class="progress-fill" style="width:${Number.isFinite(percent) ? Math.max(0, Math.min(100, percent)) : 8}%"></div></div>
-         <div class="progress-file">${esc(item.phase || item.filename || 'Working…')}</div>
+         <div class="progress-file">Overall: ${Number.isFinite(percent) ? `${percent}%` : 'working'} · ${item.files_completed || 0} of ${item.files_total || 0} files complete</div>
+         ${renderFiles(item.files)}
          ${item.logs?.length ? `<details open><summary class="muted">yt-dlp output (${item.logs.length} lines)</summary><pre class="progress-log">${esc(item.logs.join('\\n'))}</pre></details>` : ''}
        </div>` : '';
   return `<div class="row">
     <div>${esc(item.kind || '')}</div>
     <div class="id">${esc(item.id || '')}</div>
-    <div><span class="status ${status}">${status}</span></div>
+    <div><span class="status ${status}">${status}</span>${reason}</div>
     <div class="muted">${timeLabel}</div>
     <div class="links">${linksFor(item)}</div>${progress}
   </div>`;
 }
 
+function renderFiles(files) {
+  const rows = Object.values(files || {});
+  if (!rows.length) return '';
+  return `<div class="file-progress-list">${rows.map(file => {
+    const percent = Number(file.percent);
+    return `<div class="file-progress-row"><span title="${esc(file.filename || '')}">${esc(file.filename || 'current')}</span><span>${file.status === 'completed' ? '✓' : Number.isFinite(percent) ? `${percent}%` : 'queued'}</span><div class="progress-bar"><div class="progress-fill" style="width:${file.status === 'completed' ? 100 : Number.isFinite(percent) ? Math.max(0, Math.min(100, percent)) : 0}%"></div></div></div>`;
+  }).join('')}</div>`;
+}
+
 function linksFor(item) {
   const id = encodeURIComponent(item.id || '');
+  const youtubeUrl = item.kind === 'playlist'
+    ? `https://www.youtube.com/playlist?list=${id}`
+    : `https://www.youtube.com/watch?v=${id}`;
   if (item.kind === 'playlist') {
-    return `<a href="https://www.youtube.com/playlist?list=${id}" target="_blank" rel="noreferrer">YouTube</a>`;
+    return `<button class="copy-url" data-copy-url="${youtubeUrl}">Copy YouTube URL</button>`;
   }
-  return [
-    `<a href="https://www.youtube.com/watch?v=${id}" target="_blank" rel="noreferrer">YouTube</a>`,
-    `<a href="/?play=${id}">Library</a>`
-  ].join('');
+  const retry = item.status === 'failed' ? `<button class="retry-download" data-retry-id="${id}">Retry</button>` : '';
+  return `<button class="copy-url" data-copy-url="${youtubeUrl}">Copy YouTube URL</button><a href="/?play=${id}">Library</a>${retry}`;
 }
+
+document.addEventListener('click', async (event) => {
+  const retry = event.target.closest('[data-retry-id]');
+  if (retry) {
+    retry.disabled = true;
+    await fetch(`/api/youtube/retry/${retry.dataset.retryId}`, {method: 'POST'});
+    await loadStatus();
+    return;
+  }
+  const button = event.target.closest('[data-copy-url]');
+  if (!button) return;
+  try {
+    await navigator.clipboard.writeText(button.dataset.copyUrl);
+    const original = button.textContent;
+    button.textContent = 'Copied';
+    setTimeout(() => { button.textContent = original; }, 1200);
+  } catch {
+    button.textContent = 'Copy failed';
+  }
+});
 
 function fmtDuration(value) {
   const seconds = Math.max(0, Math.floor(Number(value) || 0));

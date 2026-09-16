@@ -61,6 +61,7 @@ make pot-provider
 make docker-up
 make docker-down
 make docker-logs
+make test-docker
 make run
 venv/bin/pytest
 python src/dihi/app3.py
@@ -73,6 +74,9 @@ make git-commit-push MSG="Describe the change"
 
 `make docker-up` initializes bind-mount data files, then builds and starts the dihi server and PO Token provider. `make docker-down` stops the Compose services; `make docker-logs` follows their logs. `make git-add` intentionally excludes local runtime data paths: `data/**`, root `archive.txt`, root `cookies.txt`, and `audio/**`.
 
+`make test-docker` starts the Compose stack and runs opt-in smoke tests against
+the live HTTP service. The normal `venv/bin/pytest` suite remains Docker-free.
+
 ## Server Routes
 
 Core UI/media routes:
@@ -81,18 +85,31 @@ Core UI/media routes:
 - `GET /extension.zip` downloads the browser extension bundle for local installation
 - `GET /tags` renders the tag browser UI
 - `GET /downloads` renders the active/recent download status UI
+- `GET /catalog` renders the paginated metadata/file catalog table
 - `GET /api/media/library` lists library cards
 - `GET /api/media/details/<channel_id>/<video_id>` returns per-video files and metadata
 - `GET /api/media/resolve/<video_id>` returns the archived media record and preferred playable URL for one YouTube ID
 - `GET /api/media/tags` returns tag counts and tag-grouped videos
+- `GET /api/media/catalog` returns paginated catalog rows with metadata and local file/format details
 - `GET /api/downloads/status` returns active video/playlist downloads, recent completed/failed results, queue summary fields including `Queue Empty` when idle, and yt-dlp progress details (`phase`, `percent`, `filename`, and recent `logs`)
 - `GET /media/<path>` serves downloaded files with conditional/range-capable responses
+- `GET /media-legacy/<path>` serves files from the legacy `data/merged` tree
+- `GET /media-fallback/<path>` serves fallback-library files with conditional responses
+
+The rebuildable SQLite catalog now scans both `merged/` and
+`data/bestfallback/`, retaining source-root and per-file format/subtitle
+details. Download failures are classified and persisted as retry information.
+The planned indexed artist/album pages and safe rollback are documented in
+[`plan.media-catalog.md`](plan.media-catalog.md). It is not required by the
+current filesystem-backed library; it remains a rebuildable runtime index while
+media and `.info.json` files stay authoritative.
 
 Archive/download API routes:
 
 - `GET /health`
 - `GET /api/youtube/<video_id>`
 - `POST /api/youtube/get/<video_id>`
+- `POST /api/youtube/retry/<video_id>` resumes or retries a failed/partial download
 - `GET /api/youtube/status/<video_id>`
 - `POST /api/youtube/playlist/get/<playlist_id>`
 - `GET /api/youtube/playlist/status/<playlist_id>`
@@ -111,7 +128,8 @@ Docker bind mounts:
 
 - `./data/archive.txt` -> `/app/archive.txt`
 - `./data/cookies.txt` -> `/app/cookies.txt`
-- `./data/merged` -> `/app/merged`
+- `./merged` -> `/app/merged`
+- `./data/merged` -> `/app/data/merged` (legacy media compatibility)
 - `./data/bestfallback` -> `/app/data/bestfallback`
 
 Downloads are stored under:
@@ -171,7 +189,7 @@ Meaning:
 
 The web UI is part of `app3.py`, not a separate server yet. It lists the archive, batches thumbnail rendering, supports video/audio playback, exposes VLC URLs, loads per-video details lazily, and includes `/downloads` for active/recent download status with a remaining queue output. Queue state changes are also written to the server log, including `Queue Empty` when all active downloads finish.
 
-The browser extension tracks per-video YouTube visit counts in `chrome.storage.local`. When enabled, it auto-downloads missing videos after the configured visit threshold and notifies when the automatic request starts. It calls `/api/media/resolve/<video_id>` before posting a download request and skips the request if local media already exists. Counts reset only once the video is found in the archive, so still-missing videos at or above the threshold are requested again on later visits. When archived playback redirection is enabled, archived YouTube watch pages are redirected to the server UI at `/?play=<video_id>&autoplay=1` after `/api/media/resolve/<video_id>` confirms a local media file exists.
+The browser extension tracks per-video YouTube visit counts in `chrome.storage.local`. When enabled, it auto-downloads missing videos after the configured visit threshold and notifies when the automatic request starts. It calls `/api/media/resolve/<video_id>` before posting a download request and skips the request if local media already exists. Counts reset only once the video is found in the archive, so still-missing videos at or above the threshold are requested again on later visits. Archived playback can use a preflight redirect, an in-page local player replacement, or an ask prompt. In-page replacement keeps YouTube around the player but still loads YouTube page resources; local autoplay starts muted because audible autoplay requires browser permission or a user gesture. The dihi downloads UI exposes source YouTube URLs as copy-only controls instead of direct links.
 
 Browser playback of `.mkv` is inconsistent across browsers and codecs. Keep the VLC URL path available when changing playback behavior.
 

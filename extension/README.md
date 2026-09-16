@@ -48,6 +48,18 @@ Open the extension’s **Options** page to set:
 - Auto-download missing videos
 - Auto-download visit threshold
 - Open archived videos from the server instead of YouTube
+- Archived playback mode: preflight redirect, in-page player replacement, or ask
+
+The archive playback option can be disabled when you want YouTube pages to
+remain the default. The options page also includes a direct link to the
+configured dihi server. Dihi's download status page exposes YouTube URLs as
+copy-only buttons, so opening YouTube is an explicit address-bar navigation
+without a referrer from the dihi page.
+
+In-page replacement keeps the YouTube page around the local player but still
+loads YouTube's page resources. The local player starts muted because browsers
+block audible autoplay without a user gesture or prior site permission; click
+the player's unmute control to enable sound.
 
 ## Folder Layout
 
@@ -55,6 +67,7 @@ Open the extension’s **Options** page to set:
 extension/
   manifest.json
   service_worker.js
+  content_player.js
   popup.html
   popup.js
   options.html

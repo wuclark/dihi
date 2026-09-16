@@ -5,6 +5,7 @@ const DEFAULTS = {
   autoDownloadEnabled: false,
   autoDownloadVisitThreshold: 3,
   playArchivedFromServer: true
+  ,playbackMode: "redirect"
 };
 
 // tabId -> { videoId, isTrue, lastCheckedAt, visitCount }
@@ -78,6 +79,8 @@ async function getConfig() {
     "autoDownloadEnabled",
     "autoDownloadVisitThreshold",
     "playArchivedFromServer"
+    ,"playbackMode"
+    ,"playbackMode"
   ]);
   return {
     serverOrigin: (cfg.serverOrigin || DEFAULTS.serverOrigin).replace(/\/$/, ""),
@@ -88,7 +91,8 @@ async function getConfig() {
       1,
       Number(cfg.autoDownloadVisitThreshold || DEFAULTS.autoDownloadVisitThreshold)
     ),
-    playArchivedFromServer: Boolean(cfg.playArchivedFromServer ?? DEFAULTS.playArchivedFromServer)
+    playArchivedFromServer: Boolean(cfg.playArchivedFromServer ?? DEFAULTS.playArchivedFromServer),
+    playbackMode: ["redirect", "inpage", "ask"].includes(cfg.playbackMode) ? cfg.playbackMode : DEFAULTS.playbackMode
   };
 }
 
@@ -114,6 +118,7 @@ chrome.runtime.onInstalled.addListener(() => {
     if (cfg.playArchivedFromServer === undefined) {
       updates.playArchivedFromServer = DEFAULTS.playArchivedFromServer;
     }
+    if (cfg.playbackMode === undefined) updates.playbackMode = DEFAULTS.playbackMode;
     if (Object.keys(updates).length) chrome.storage.sync.set(updates);
   });
 });
@@ -187,7 +192,7 @@ async function resolveArchivedMedia(serverOrigin, videoId, timeoutMs) {
 }
 
 async function maybePlayFromServer(tabId, videoId, cfg) {
-  if (!cfg.playArchivedFromServer) return false;
+  if (!cfg.playArchivedFromServer || cfg.playbackMode !== "redirect") return false;
 
   try {
     const mediaUrl = await resolveArchivedMedia(cfg.serverOrigin, videoId, cfg.timeoutMs);

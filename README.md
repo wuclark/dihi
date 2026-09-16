@@ -82,6 +82,7 @@ Compose starts the PO Token provider with the app and publishes its service port
 | `GET` | `/extension.zip` | — | Download the current browser extension bundle |
 | `GET` | `/api/youtube/<id>` | 60/min | Check if a video is in the archive |
 | `POST` | `/api/youtube/get/<id>` | 10/min | Trigger a video download in the background |
+| `POST` | `/api/youtube/retry/<id>` | 10/min | Resume or retry a failed/partial video download |
 | `GET` | `/api/youtube/status/<id>` | 60/min | Poll video download progress |
 | `POST` | `/api/youtube/playlist/get/<playlist_id>` | 5/min | Trigger a full playlist download |
 | `GET` | `/api/youtube/playlist/status/<playlist_id>` | 60/min | Poll playlist download progress |
@@ -89,6 +90,7 @@ Compose starts the PO Token provider with the app and publishes its service port
 | `GET` | `/api/media/resolve/<id>` | 60/min | Resolve one archived YouTube ID to its media record and preferred playback URL |
 | `GET` | `/api/media/details/<channel_id>/<id>` | 60/min | Return files and metadata for one archived video |
 | `GET` | `/api/media/tags` | 30/min | Return tag counts and tag-grouped videos |
+| `GET` | `/api/media/catalog` | 60/min | Paginated text catalog of videos, dates, sources, files, formats, and subtitles |
 | `GET` | `/api/downloads/status` | 60/min | Return active video/playlist downloads, recent results, and yt-dlp progress details |
 
 Video IDs are exactly 11 characters (`[A-Za-z0-9_-]{11}`). Playlist IDs are 2–128 characters from the same alphabet.
@@ -285,6 +287,10 @@ make docker-up
 
 Stop it with `make docker-down`; follow logs with `make docker-logs`.
 
+Run the Docker smoke checks with `make test-docker`. They verify health, the
+library and catalog APIs, extension ZIP delivery, and serving a catalog media
+file. The regular unit tests do not require Docker.
+
 Docker dependency installation is cached separately from application source;
 routine code and template edits therefore rebuild quickly. Changes to
 `requirements.txt` or `pyproject.toml` invalidate that dependency layer; a
@@ -334,6 +340,12 @@ merged/
 ```
 
 The exact files vary by video and selected formats. `--audio-meta` creates tagged copies from kept raw audio streams when available; the default `.out.m4a` is the separately requested AAC download.
+
+The planned SQLite catalog for large archives is documented in
+[`plan.media-catalog.md`](plan.media-catalog.md). It will scan existing
+`.info.json` files, provide indexed artist/channel and album pages, and remain
+rebuildable. The filesystem and metadata files stay authoritative so deleting
+or disabling the catalog is a safe rollback.
 
 ### Why channel_id/video_id folders?
 
@@ -441,7 +453,7 @@ The merged `.mkv` contains embedded subtitle streams, cover art, and metadata ta
 |-----------|---------------|-------------|
 | `./data/archive.txt` | `/app/archive.txt` | Download archive |
 | `./data/cookies.txt` | `/app/cookies.txt` | YouTube cookies (optional) |
-| `./data/merged` | `/app/merged` | Downloaded files |
+| `./merged` | `/app/merged` | Downloaded files |
 | `./data/bestfallback` | `/app/data/bestfallback` | Fallback downloads and fallback archive |
 
 ### Environment Variables

@@ -6,11 +6,13 @@ import mimetypes
 import json
 import os
 import re
+import sqlite3
 import threading
 import time
 import zipfile
 from pathlib import Path
 from typing import Optional, Set
+from urllib.parse import quote
 
 from flask import Flask, abort, jsonify, render_template, request, send_file
 from flask_cors import CORS
@@ -23,6 +25,7 @@ mimetypes.add_type("text/vtt", ".vtt")
 mimetypes.add_type("audio/opus", ".opus")
 
 import getvidyt  # must be importable in this environment
+import catalog
 
 app = Flask(__name__)
 CORS(app)  # Allow all origins
@@ -48,6 +51,9 @@ MAX_CONCURRENT_PLAYLIST_DOWNLOADS = 2
 # Archive lines look like: "youtube <id>"
 CHECK_FILE = Path("./archive.txt").expanduser().resolve()
 MERGED_DIR = Path("./merged").expanduser().resolve()
+LEGACY_MERGED_DIR = Path("./data/merged").expanduser().resolve()
+FALLBACK_DIR = Path("./data/bestfallback").expanduser().resolve()
+CATALOG_DB = Path(os.environ.get("DIHI_CATALOG_DB", "./data/media-catalog.db")).expanduser().resolve()
 _APP_DIR = Path(__file__).resolve().parent
 _SOURCE_EXTENSION_DIR = _APP_DIR / "extension"
 for _parent in _APP_DIR.parents:
@@ -86,6 +92,17 @@ _playlist_result_timestamps: dict[str, float] = {}
 _playlist_history: dict[str, str] = {}
 _playlist_history_timestamps: dict[str, float] = {}
 _last_queue_log_message: Optional[str] = None
+
+
+def _refresh_catalog() -> None:
+    try:
+        count = catalog.refresh([MERGED_DIR, LEGACY_MERGED_DIR, FALLBACK_DIR], CATALOG_DB, CHECK_FILE)
+        app.logger.info("Media catalog indexed %d videos", count)
+    except Exception:
+        app.logger.exception("Media catalog refresh failed")
+
+
+threading.Thread(target=_refresh_catalog, name="media-catalog", daemon=True).start()
 
 
 def _normalize_id(raw: str) -> Optional[str]:
@@ -226,12 +243,48 @@ def _progress_hook(video_id: str):
             phase += f" ({percent:g}%)"
         with _lock:
             detail = _download_details.setdefault(video_id, {"logs": []})
-            detail.update({"phase": phase, "filename": filename, "percent": percent})
+            files = detail.setdefault("files", {})
+            file_state = files.setdefault(filename or "current", {"filename": filename})
+            file_state.update({
+                "filename": filename,
+                "status": "completed" if status == "finished" else "downloading",
+                "percent": 100 if status == "finished" else percent,
+                "downloaded_bytes": downloaded,
+                "total_bytes": total,
+                "phase": phase,
+            })
+            known = [item for item in files.values() if item.get("total_bytes")]
+            total_bytes = sum(item["total_bytes"] for item in known)
+            downloaded_bytes = sum(
+                min(item.get("downloaded_bytes") or 0, item["total_bytes"])
+                for item in known
+            )
+            detail.update({
+                "phase": phase,
+                "filename": filename,
+                "percent": round(downloaded_bytes * 100 / total_bytes, 1) if total_bytes else None,
+                "files_completed": sum(item.get("status") == "completed" for item in files.values()),
+                "files_total": len(files),
+            })
             logs = detail.setdefault("logs", [])
             if not logs or logs[-1] != phase:
                 logs.append(phase)
                 del logs[:-40]
     return hook
+
+
+def _classify_download_error(message: str) -> tuple[str, bool]:
+    text = (message or "").lower()
+    patterns = [
+        ("private", "private", False), ("age", "age_restricted", True),
+        ("members only", "members_only", False), ("not available in your country", "region_blocked", False),
+        ("format is not available", "format_unavailable", True), ("403", "http_403", True),
+        ("video unavailable", "not_found", False), ("sign in", "login_required", True),
+    ]
+    for needle, reason, retryable in patterns:
+        if needle in text:
+            return reason, retryable
+    return "unknown", True
 
 
 def _queue_summary_from_active(active_videos: int, active_playlists: int) -> dict:
@@ -324,8 +377,10 @@ def _download_worker(video_id: str) -> None:
     Tracks completion status for proper UI feedback.
     """
     success = False
+    error_text = ""
+    started_at = time.time()
     try:
-        getvidyt.download_youtube(
+        result_code = getvidyt.download_youtube(
             video_id,
             audio_meta=True,
             extra_opts={"progress_hooks": [_progress_hook(video_id)]},
@@ -339,7 +394,10 @@ def _download_worker(video_id: str) -> None:
         _ensure_cache()
         with _lock:
             success = video_id in _cached_ids
+        if result_code:
+            error_text = f"yt-dlp returned exit code {result_code}"
     except Exception as e:
+        error_text = str(e)
         app.logger.exception("Download failed for %s: %s", video_id, e)
         success = False
     finally:
@@ -359,6 +417,16 @@ def _download_worker(video_id: str) -> None:
             _cleanup_old_results()
             _cleanup_old_download_history()
             _log_queue_state_locked()
+        if success:
+            _refresh_catalog()
+        else:
+            reason, retryable = _classify_download_error(error_text)
+            with _lock:
+                _download_details.setdefault(video_id, {}).update(
+                    {"reason": reason, "error": error_text, "retryable": retryable}
+                )
+            catalog.record_attempt(CATALOG_DB, video_id, "failed", reason, error_text,
+                                   retryable, started_at, time.time())
 
 
 def _cleanup_old_playlist_results() -> None:
@@ -463,11 +531,11 @@ def _file_kind(path: Path) -> str:
     return "file"
 
 
-def _media_file_entry(path: Path, channel_id: str, video_id: str) -> dict:
+def _media_file_entry(path: Path, channel_id: str, video_id: str, media_prefix: str = "/media") -> dict:
     stat = path.stat()
     return {
         "name": path.name,
-        "url": f"/media/{channel_id}/{video_id}/{path.name}",
+        "url": f"{media_prefix}/{quote(channel_id, safe='')}/{quote(video_id, safe='')}/{quote(path.name, safe='')}",
         "kind": _file_kind(path),
         "size": stat.st_size,
         "mtime": stat.st_mtime,
@@ -475,7 +543,7 @@ def _media_file_entry(path: Path, channel_id: str, video_id: str) -> dict:
 
 
 def _media_file_url(channel_id: str, video_id: str, filename: str) -> str:
-    return f"/media/{channel_id}/{video_id}/{filename}"
+    return f"/media/{quote(channel_id, safe='')}/{quote(video_id, safe='')}/{quote(filename, safe='')}"
 
 
 def _read_history_file(path: Path) -> list[dict]:
@@ -509,11 +577,13 @@ def _load_info_json(video_dir: Path) -> tuple[Optional[dict], Optional[str]]:
 
 
 def _scan_library() -> list[dict]:
-    """Walk merged/<channel>/<video_id>/ and return a list of video dicts."""
-    if not MERGED_DIR.exists():
-        return []
+    """Walk primary and legacy merged trees, preferring the primary copy."""
     videos = []
-    for channel_dir in sorted(MERGED_DIR.iterdir()):
+    seen: Set[str] = set()
+    for root, media_prefix in ((MERGED_DIR, "/media"), (LEGACY_MERGED_DIR, "/media-legacy")):
+      if not root.exists():
+        continue
+      for channel_dir in sorted(root.iterdir()):
         if not channel_dir.is_dir():
             continue
         channel_id = channel_dir.name
@@ -521,7 +591,12 @@ def _scan_library() -> list[dict]:
             if not video_dir.is_dir():
                 continue
             video_id = video_dir.name
+            if video_id in seen:
+                continue
+            seen.add(video_id)
             files: dict = {}
+            detail_files: list[dict] = []
+            description = ""
             title: Optional[str] = None
             date: Optional[str] = None
             for f in sorted(video_dir.iterdir()):
@@ -531,8 +606,14 @@ def _scan_library() -> list[dict]:
                 if m and title is None:
                     title = m.group("title")
                     date = m.group("date")
-                url = _media_file_url(channel_id, video_id, f.name)
+                url = f"{media_prefix}/{quote(channel_id, safe='')}/{quote(video_id, safe='')}/{quote(f.name, safe='')}"
                 _classify_file(f.name, url, files)
+                detail_files.append(_media_file_entry(f, channel_id, video_id, media_prefix))
+                if f.suffix.lower() == ".description" and not description:
+                    try:
+                        description = f.read_text(encoding="utf-8", errors="replace")[:2_000_000]
+                    except OSError:
+                        pass
             videos.append(
                 {
                     "video_id": video_id,
@@ -540,6 +621,7 @@ def _scan_library() -> list[dict]:
                     "title": title or video_id,
                     "date": date,
                     "files": files,
+                    "details": {"files": detail_files, "metadata": {"description": description}},
                 }
             )
     return videos
@@ -617,8 +699,39 @@ def downloads_page():
     return render_template("downloads.html")
 
 
+@app.get("/catalog")
+def catalog_page():
+    return render_template("catalog.html")
+
+
+@app.get("/api/media/catalog")
+@limiter.limit("60 per minute")
+def api_media_catalog():
+    try:
+        page = max(1, int(request.args.get("page", 1)))
+        per_page = min(200, max(1, int(request.args.get("per_page", 50))))
+    except ValueError:
+        return jsonify(error="page and per_page must be integers"), 400
+    sort = request.args.get("sort", "date-desc")
+    order = "upload_date ASC" if sort == "date-asc" else "artist COLLATE NOCASE ASC, title COLLATE NOCASE ASC" if sort == "artist" else "title COLLATE NOCASE ASC" if sort == "title" else "upload_date DESC"
+    try:
+        with sqlite3.connect(CATALOG_DB) as db:
+            total = db.execute("SELECT COUNT(DISTINCT video_id) FROM videos").fetchone()[0]
+            # A video may exist in both the primary and fallback trees. Show
+            # one catalog row, preferring the complete primary copy.
+            rows = db.execute(f"""SELECT video_id, source_root, channel_id, title, artist, album, uploader, upload_date, duration, files_json, formats_json
+                FROM (SELECT v.*, ROW_NUMBER() OVER (PARTITION BY video_id ORDER BY CASE source_root WHEN 'merged' THEN 0 WHEN 'legacy' THEN 1 ELSE 2 END) AS rn FROM videos v)
+                WHERE rn = 1 ORDER BY {order} LIMIT ? OFFSET ?""", (per_page, (page - 1) * per_page)).fetchall()
+    except sqlite3.Error:
+        return jsonify(error="catalog is still being built"), 503
+    items = []
+    for row in rows:
+        files = json.loads(row[9] or "{}")
+        items.append({"video_id": row[0], "source_root": row[1], "channel_id": row[2], "title": row[3], "artist": row[4], "album": row[5], "uploader": row[6], "upload_date": row[7], "duration": row[8], "files": files, "formats": json.loads(row[10] or "[]")})
+    return jsonify(items=items, page=page, per_page=per_page, total=total, pages=(total + per_page - 1) // per_page)
+
+
 @app.get("/api/media/library")
-@limiter.limit("30 per minute")
 def api_media_library():
     return jsonify(videos=_scan_library())
 
@@ -637,8 +750,8 @@ def api_media_resolve(video_id: str):
         return jsonify(error="invalid video id"), 400
 
     video = _resolve_media_by_video_id(vid)
-    if not video:
-        return jsonify(result=False, video_id=vid), 404
+    if not video or not video.get("player_url"):
+        return jsonify(result=False, video_id=vid, reason="metadata exists but no playable media file is present"), 404
 
     return jsonify(result=True, video=video)
 
@@ -650,13 +763,16 @@ def api_downloads_status():
 
 
 @app.get("/api/media/details/<string:channel_id>/<string:video_id>")
-@limiter.limit("60 per minute")
 def api_media_details(channel_id: str, video_id: str):
     if not PLAYLIST_ID_RE.match(channel_id) or not YOUTUBE_ID_RE.match(video_id):
         return jsonify(error="invalid id"), 400
 
     video_dir = (MERGED_DIR / channel_id / video_id).resolve()
-    if not video_dir.is_relative_to(MERGED_DIR):
+    media_root = MERGED_DIR
+    if not video_dir.is_dir():
+        video_dir = (LEGACY_MERGED_DIR / channel_id / video_id).resolve()
+        media_root = LEGACY_MERGED_DIR
+    if not video_dir.is_relative_to(media_root):
         abort(403)
     if not video_dir.is_dir():
         abort(404)
@@ -671,6 +787,13 @@ def api_media_details(channel_id: str, video_id: str):
         info_json = {k: _safe_metadata_value(v) for k, v in info_json.items()}
 
     channel_dir = MERGED_DIR / channel_id
+    description = ""
+    description_files = sorted(video_dir.glob("*.description"))
+    if description_files:
+        try:
+            description = description_files[0].read_text(encoding="utf-8", errors="replace")[:2_000_000]
+        except OSError:
+            description = ""
     metadata = {
         "channel": {
             "channel_name": _read_history_file(channel_dir / ".channel_name"),
@@ -683,6 +806,7 @@ def api_media_details(channel_id: str, video_id: str):
         },
         "info_json": info_json,
         "info_json_error": info_error,
+        "description": description,
     }
 
     return jsonify(channel_id=channel_id, video_id=video_id, files=files, metadata=metadata)
@@ -702,6 +826,28 @@ def serve_media(filepath: str):
     response.headers.setdefault("Accept-Ranges", "bytes")
     response.headers.setdefault("Cache-Control", "public, max-age=86400")
     return response
+
+
+@app.get("/media-fallback/<path:filepath>")
+def serve_fallback_media(filepath: str):
+    try:
+        full_path = (FALLBACK_DIR / filepath).resolve()
+    except Exception:
+        abort(400)
+    if not full_path.is_relative_to(FALLBACK_DIR) or not full_path.is_file():
+        abort(404)
+    return send_file(full_path, conditional=True)
+
+
+@app.get("/media-legacy/<path:filepath>")
+def serve_legacy_media(filepath: str):
+    try:
+        full_path = (LEGACY_MERGED_DIR / filepath).resolve()
+    except Exception:
+        abort(400)
+    if not full_path.is_relative_to(LEGACY_MERGED_DIR) or not full_path.is_file():
+        abort(404)
+    return send_file(full_path, conditional=True)
 
 
 @app.get("/api/youtube/<string:video_id>")
@@ -746,7 +892,7 @@ def api_youtube_get(video_id: str):
                 return jsonify(ok=False, error="too many concurrent downloads"), 429
             _active_downloads.add(vid)
             _download_started_at[vid] = time.time()
-            _download_details[vid] = {"phase": "queued", "percent": 0, "filename": "", "logs": []}
+            _download_details[vid] = {"phase": "queued", "percent": 0, "filename": "", "files": {}, "logs": []}
             _log_queue_state_locked()
             threading.Thread(target=_download_worker, args=(vid,), daemon=True).start()
 
@@ -756,6 +902,13 @@ def api_youtube_get(video_id: str):
         started=(not already_running),
         already_running=already_running,
     )
+
+
+@app.post("/api/youtube/retry/<string:video_id>")
+@limiter.limit("10 per minute")
+def api_youtube_retry(video_id: str):
+    """Explicitly retry a failed or partial download, resuming local parts."""
+    return api_youtube_get(video_id)
 
 
 @app.get("/api/youtube/status/<string:video_id>")
@@ -808,7 +961,7 @@ def api_youtube_playlist_get(playlist_id: str):
                 return jsonify(ok=False, error="too many concurrent playlist downloads"), 429
             _active_playlist_downloads.add(pid)
             _playlist_started_at[pid] = time.time()
-            _download_details[pid] = {"phase": "queued", "percent": 0, "filename": "", "logs": []}
+            _download_details[pid] = {"phase": "queued", "percent": 0, "filename": "", "files": {}, "logs": []}
             _log_queue_state_locked()
             threading.Thread(
                 target=_playlist_download_worker, args=(pid,), daemon=True

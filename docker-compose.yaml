@@ -13,8 +13,12 @@ services:
       # create them as directories. Run `make data` to initialise them.
       - ./data/archive.txt:/app/archive.txt
       - ./data/cookies.txt:/app/cookies.txt
-      - ./data/merged:/app/merged
+      # The downloader's default output is the repository-level merged/ tree.
+      - ./merged:/app/merged
+      # Legacy downloads made before the primary merged/ mount was aligned.
+      - ./data/merged:/app/data/merged
       - ./data/bestfallback:/app/data/bestfallback
+      - ./data/media-catalog.db:/app/data/media-catalog.db
     environment:
       - PORT=5000
       # App container reaches the provider by Compose service name; host CLI uses loopback.

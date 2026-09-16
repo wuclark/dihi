@@ -32,6 +32,7 @@ from app3 import (
     _download_status_snapshot,
     _log_queue_state_locked,
     _RESULT_TTL,
+    _progress_hook,
 )
 
 
@@ -95,6 +96,20 @@ def test_extension_zip_download_contains_manifest():
     assert response.mimetype == "application/zip"
     with zipfile.ZipFile(io.BytesIO(response.data)) as bundle:
         assert "manifest.json" in bundle.namelist()
+
+
+def test_progress_hook_tracks_each_file_and_overall_bytes():
+    hook = _progress_hook("dQw4w9WgXcQ")
+    hook({"status": "downloading", "filename": "/tmp/video.mp4", "downloaded_bytes": 50, "total_bytes": 100})
+    hook({"status": "finished", "filename": "/tmp/video.mp4", "downloaded_bytes": 100, "total_bytes": 100})
+    hook({"status": "downloading", "filename": "/tmp/audio.webm", "downloaded_bytes": 25, "total_bytes": 100})
+
+    detail = app3._download_details["dQw4w9WgXcQ"]
+    assert detail["files_completed"] == 1
+    assert detail["files_total"] == 2
+    assert detail["percent"] == 62.5
+    assert detail["files"]["video.mp4"]["status"] == "completed"
+    assert detail["files"]["audio.webm"]["percent"] == 25
 
 
 # ---------------------------------------------------------------------------

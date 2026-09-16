@@ -5,6 +5,7 @@ const DEFAULTS = {
   autoDownloadEnabled: false,
   autoDownloadVisitThreshold: 3,
   playArchivedFromServer: true
+  ,playbackMode: "redirect"
 };
 
 function showSaved() {
@@ -20,7 +21,7 @@ async function load() {
     "debounceMs",
     "autoDownloadEnabled",
     "autoDownloadVisitThreshold",
-    "playArchivedFromServer"
+    "playArchivedFromServer", "playbackMode"
   ]);
   document.getElementById("serverOrigin").value = cfg.serverOrigin || DEFAULTS.serverOrigin;
   document.getElementById("timeoutMs").value = Number(cfg.timeoutMs || DEFAULTS.timeoutMs);
@@ -34,6 +35,12 @@ async function load() {
   document.getElementById("playArchivedFromServer").checked = Boolean(
     cfg.playArchivedFromServer ?? DEFAULTS.playArchivedFromServer
   );
+  document.getElementById("playbackMode").value = ["redirect", "inpage", "ask"].includes(cfg.playbackMode) ? cfg.playbackMode : DEFAULTS.playbackMode;
+  updateServerLink(cfg.serverOrigin || DEFAULTS.serverOrigin);
+}
+
+function updateServerLink(origin) {
+  document.getElementById("serverLink").href = origin.replace(/\/$/, "");
 }
 
 async function save() {
@@ -46,6 +53,7 @@ async function save() {
     Number(document.getElementById("autoDownloadVisitThreshold").value || DEFAULTS.autoDownloadVisitThreshold)
   );
   const playArchivedFromServer = document.getElementById("playArchivedFromServer").checked;
+  const playbackMode = document.getElementById("playbackMode").value;
 
   await chrome.storage.sync.set({
     serverOrigin,
@@ -53,8 +61,9 @@ async function save() {
     debounceMs,
     autoDownloadEnabled,
     autoDownloadVisitThreshold,
-    playArchivedFromServer
+    playArchivedFromServer, playbackMode
   });
+  updateServerLink(serverOrigin);
   showSaved();
 }
 

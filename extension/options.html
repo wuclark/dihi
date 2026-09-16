@@ -51,9 +51,17 @@
     </div>
 
     <div class="row">
+      <label for="playbackMode">Archived playback mode</label>
+      <select id="playbackMode">
+        <option value="redirect">Preflight redirect (recommended)</option>
+        <option value="inpage">Replace YouTube player in place</option>
+        <option value="ask">Ask before using the local player</option>
+      </select>
+    </div>
+    <div class="row">
       <label class="check-label" for="playArchivedFromServer">
         <input id="playArchivedFromServer" type="checkbox" />
-        Open archived videos from the server instead of YouTube
+        Archive preflight: open archived videos from the server instead of YouTube
       </label>
     </div>
 
@@ -64,7 +72,10 @@
     </div>
 
     <div class="note">
-      The extension tracks YouTube video visits locally, checks <code>GET /api/youtube/&lt;id&gt;</code>, redirects archived videos through <code>GET /api/media/resolve/&lt;id&gt;</code>, and triggers <code>POST /api/youtube/get/&lt;id&gt;</code> when a missing video reaches the configured visit threshold.
+      The extension tracks YouTube video visits locally, checks <code>GET /api/youtube/&lt;id&gt;</code>, and can redirect or replace the YouTube player with local DIHI media. Browser autoplay policy may require clicking Unmute.
+    </div>
+    <div class="actions">
+      <a id="serverLink" href="#" target="_blank" rel="noreferrer">Open dihi server</a>
     </div>
   </div>
 

@@ -12,7 +12,7 @@ _WIN_USER     := $(shell cmd.exe /c "echo %USERNAME%" 2>/dev/null | tr -d '\r\n'
 _CHROME_PROF  := /mnt/c/Users/$(_WIN_USER)/AppData/Local/Google/Chrome/User Data
 _EDGE_PROF    := /mnt/c/Users/$(_WIN_USER)/AppData/Local/Microsoft/Edge/User Data
 
-.PHONY: help startup setup install dev-install pot-provider docker-up docker-down docker-logs run clean test data cookies cookies-browser install-chrome git-add git-commit-push
+.PHONY: help startup setup install dev-install pot-provider docker-up docker-down docker-logs test-docker run clean test data cookies cookies-browser install-chrome git-add git-commit-push
 
 help:
 	@echo 'Available targets:'
@@ -24,6 +24,7 @@ help:
 	@echo '  docker-up        Build and start the dihi server and PO Token provider'
 	@echo '  docker-down      Stop the Docker Compose services'
 	@echo '  docker-logs      Follow Docker Compose service logs'
+	@echo '  test-docker      Start Docker and run end-to-end smoke tests'
 	@echo '  startup          Show the venv activation command'
 	@echo '  run              Run the app with the venv Python'
 	@echo '  test             Run unit tests with coverage'
@@ -76,6 +77,9 @@ docker-down:
 docker-logs:
 	docker compose logs -f
 
+test-docker: docker-up
+	DIHI_DOCKER_TESTS=1 $(PYTEST) tests/test_docker_smoke.py -v --tb=short
+
 # Run your app using the venv's python
 run: $(VENV)/.setup-complete
 	$(VENV)/bin/python src/dihi/app3.py
@@ -107,8 +111,8 @@ git-commit-push: git-add
 # Docker creates missing mount targets as directories; running this first
 # ensures they are plain files so yt-dlp can read/write them correctly.
 data:
-	mkdir -p data/merged data/bestfallback
-	touch data/archive.txt data/cookies.txt data/bestfallback/archive.txt
+	mkdir -p merged data/bestfallback
+	touch data/archive.txt data/cookies.txt data/bestfallback/archive.txt data/media-catalog.db
 
 # Export YouTube cookies from your Windows browser into data/cookies.txt (WSL2 only).
 # Tries Chrome → Edge → Firefox in order; stops at the first one found.
