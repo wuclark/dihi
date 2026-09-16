@@ -86,11 +86,18 @@ Core UI/media routes:
 - `GET /tags` renders the tag browser UI
 - `GET /downloads` renders the active/recent download status UI
 - `GET /catalog` renders the paginated metadata/file catalog table
+- `GET /wordcloud` renders a local description/lyrics word cloud
+- `GET /tagcloud` renders a tag frequency cloud
+- `GET /tools` renders the analysis/tools hub
+- `GET /status` renders disk and cookie diagnostics
 - `GET /api/media/library` lists library cards
 - `GET /api/media/details/<channel_id>/<video_id>` returns per-video files and metadata
 - `GET /api/media/resolve/<video_id>` returns the archived media record and preferred playable URL for one YouTube ID
 - `GET /api/media/tags` returns tag counts and tag-grouped videos
 - `GET /api/media/catalog` returns paginated catalog rows with metadata and local file/format details
+- `GET /api/media/wordcloud` returns description word frequencies, filterable by tag or playlist
+- `GET /api/media/failures` lists recorded failed download attempts and reasons
+- `GET /api/system/status` reports disk capacity and safe cookie-file diagnostics without cookie values
 - `GET /api/downloads/status` returns active video/playlist downloads, recent completed/failed results, queue summary fields including `Queue Empty` when idle, and yt-dlp progress details (`phase`, `percent`, `filename`, and recent `logs`)
 - `GET /media/<path>` serves downloaded files with conditional/range-capable responses
 - `GET /media-legacy/<path>` serves files from the legacy `data/merged` tree
@@ -109,7 +116,7 @@ Archive/download API routes:
 - `GET /health`
 - `GET /api/youtube/<video_id>`
 - `POST /api/youtube/get/<video_id>`
-- `POST /api/youtube/retry/<video_id>` resumes or retries a failed/partial download
+- `POST /api/youtube/retry/<video_id>` resumes or retries a failed/partial download; add `?authenticated=1&browser=chrome` for browser-cookie authentication or omit `browser` to use `data/cookies.txt`
 - `GET /api/youtube/status/<video_id>`
 - `POST /api/youtube/playlist/get/<playlist_id>`
 - `GET /api/youtube/playlist/status/<playlist_id>`

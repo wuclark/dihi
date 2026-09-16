@@ -106,6 +106,8 @@ h2 { font-size: 0.95rem; font-weight: 650; }
   <a class="logo" href="/">DIHI</a>
   <a class="hbtn" href="/">Library</a>
   <a class="hbtn" href="/tags">Tags</a>
+  <a class="hbtn" href="/tools">Tools</a>
+  <a class="hbtn" href="/status">Status</a>
   <button class="hbtn" type="button" onclick="loadStatus()">Refresh</button>
   <span id="summary">Loading...</span>
 </header>
@@ -123,6 +125,7 @@ h2 { font-size: 0.95rem; font-weight: 650; }
     </div>
     <span class="muted" id="queue-detail"></span>
   </section>
+  <section class="queue-output"><div><div class="queue-title">System status</div><div class="muted" id="system-status">Checking disk and cookies…</div></div></section>
 
   <section>
     <div class="section-head">
@@ -130,6 +133,10 @@ h2 { font-size: 0.95rem; font-weight: 650; }
       <span class="muted" id="active-count"></span>
     </div>
     <div id="active"></div>
+  </section>
+  <section>
+    <div class="section-head"><h2>Failed downloads</h2><span class="muted">Retry or use cookies for age/login failures</span></div>
+    <div id="failures"></div>
   </section>
 
   <section>
@@ -171,8 +178,23 @@ function render(data) {
   $('active-count').textContent = `${counts.active_videos || 0}/${counts.max_videos || 0} videos, ${counts.active_playlists || 0}/${counts.max_playlists || 0} playlists`;
   $('recent-count').textContent = `${counts.recent || 0} kept for ${data.result_ttl_seconds || 0}s`;
   renderTable('active', data.active || [], 'No downloads are currently running.');
-  renderTable('recent', data.recent || [], 'No recent download results.');
+    renderTable('recent', data.recent || [], 'No recent download results.');
+    loadFailures();
+    loadSystemStatus();
 }
+
+async function loadSystemStatus() { try { const d=(await (await fetch('/api/system/status',{cache:'no-store'})).json()).result; const c=d.cookies,gb=n=>(n/1073741824).toFixed(1); $('system-status').textContent=`Disk: ${gb(d.disk.free_bytes)} GiB free of ${gb(d.disk.total_bytes)} GiB (${d.disk.free_percent}%). Cookies: ${c.present?'file found':'no file'}; ${c.netscape_format?'Netscape format':'invalid/unknown format'}; ${c.count} entries, ${c.youtube_domains.length} YouTube/Google domains, ${c.expired} expired.`; } catch(e){$('system-status').textContent='Status unavailable';} }
+
+async function loadFailures() {
+  const box = $('failures');
+  try { const data = await (await fetch('/api/media/failures', {cache:'no-store'})).json();
+    if (!(data.failures||[]).length) { box.innerHTML='<div class="empty">No failed downloads.</div>'; return; }
+    box.innerHTML = `<div class="table"><div class="row head"><div>Video ID</div><div>Reason</div><div>Auth status</div><div>Error / actions</div></div>${data.failures.map(f=>`<div class="row"><div class="id">${esc(f.video_id)}</div><div><span class="status failed">${esc(f.reason)}</span>${f.age_restricted?'<div class="muted">Age restricted</div>':''}</div><div class="muted">${f.authenticated?'Used cookies':'No cookies used'}</div><div><div class="muted">${esc(f.error||'')}</div><div class="links"><button class="retry-download" data-retry="${esc(f.video_id)}">Retry</button>${['age_restricted','login_required'].includes(f.reason)?`<button class="retry-download" data-auth="${esc(f.video_id)}">Retry with cookies</button>`:''}</div></div></div>`).join('')}</div>`;
+    box.querySelectorAll('[data-retry]').forEach(b=>b.onclick=()=>retryFailed(b.dataset.retry,false));
+    box.querySelectorAll('[data-auth]').forEach(b=>b.onclick=()=>retryFailed(b.dataset.auth,true));
+  } catch(e) { box.innerHTML=`<div class="empty">Failed to load failure history: ${esc(e.message)}</div>`; }
+}
+async function retryFailed(id, authenticated) { const browser=authenticated?prompt('Browser name (chrome, edge, firefox) or leave blank to use data/cookies.txt:',''):''; const q=authenticated?'?authenticated=1'+(browser?'&browser='+encodeURIComponent(browser):''):''; await fetch('/api/youtube/retry/'+encodeURIComponent(id)+q,{method:'POST'}); loadFailures(); loadStatus(); }
 
 function renderTable(targetId, rows, emptyText) {
   if (!rows.length) {

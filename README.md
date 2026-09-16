@@ -91,7 +91,9 @@ Compose starts the PO Token provider with the app and publishes its service port
 | `GET` | `/api/media/details/<channel_id>/<id>` | 60/min | Return files and metadata for one archived video |
 | `GET` | `/api/media/tags` | 30/min | Return tag counts and tag-grouped videos |
 | `GET` | `/api/media/catalog` | 60/min | Paginated text catalog of videos, dates, sources, files, formats, and subtitles |
+| `GET` | `/wordcloud` / `/tagcloud` | — | Browse local description words and metadata tag frequencies |
 | `GET` | `/api/downloads/status` | 60/min | Return active video/playlist downloads, recent results, and yt-dlp progress details |
+| `GET` | `/api/media/failures` | — | List failed download attempts with reasons and retryability |
 
 Video IDs are exactly 11 characters (`[A-Za-z0-9_-]{11}`). Playlist IDs are 2–128 characters from the same alphabet.
 

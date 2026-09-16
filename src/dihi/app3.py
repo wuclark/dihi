@@ -7,6 +7,7 @@ import json
 import os
 import re
 import sqlite3
+import shutil
 import threading
 import time
 import zipfile
@@ -370,7 +371,7 @@ def _download_status_snapshot() -> dict:
     }
 
 
-def _download_worker(video_id: str) -> None:
+def _download_worker(video_id: str, cookies_browser: str | None = None) -> None:
     """
     Actually runs:
       getvidyt.download_youtube(video_id, audio_meta=True)
@@ -383,6 +384,7 @@ def _download_worker(video_id: str) -> None:
         result_code = getvidyt.download_youtube(
             video_id,
             audio_meta=True,
+            cookies_browser=cookies_browser,
             extra_opts={"progress_hooks": [_progress_hook(video_id)]},
         )
         # Give filesystem time to sync archive.txt
@@ -419,13 +421,14 @@ def _download_worker(video_id: str) -> None:
             _log_queue_state_locked()
         if success:
             _refresh_catalog()
+            catalog.record_attempt(CATALOG_DB, video_id, "completed", "authenticated" if cookies_browser else "standard", "", True, started_at, time.time())
         else:
             reason, retryable = _classify_download_error(error_text)
             with _lock:
                 _download_details.setdefault(video_id, {}).update(
                     {"reason": reason, "error": error_text, "retryable": retryable}
                 )
-            catalog.record_attempt(CATALOG_DB, video_id, "failed", reason, error_text,
+            catalog.record_attempt(CATALOG_DB, video_id, "failed", reason, ("[cookies] " if cookies_browser else "") + error_text,
                                    retryable, started_at, time.time())
 
 
@@ -704,6 +707,50 @@ def catalog_page():
     return render_template("catalog.html")
 
 
+@app.get("/wordcloud")
+def wordcloud_page():
+    return render_template("wordcloud.html")
+
+
+@app.get("/tagcloud")
+def tagcloud_page():
+    return render_template("tagcloud.html")
+
+
+@app.get("/status")
+def status_page():
+    return render_template("status.html")
+
+
+@app.get("/tools")
+def tools_page():
+    return render_template("tools.html")
+
+
+@app.get("/api/media/wordcloud")
+def api_media_wordcloud():
+    """Return word frequencies from saved descriptions, optionally filtered."""
+    tag = request.args.get("tag", "").strip().lower()
+    playlist = request.args.get("playlist", "").strip().lower()
+    stop = {"the", "and", "you", "that", "this", "with", "from", "your", "for", "are", "was", "auf", "und", "der", "die", "das", "to", "of", "a", "in", "on", "is", "it", "http", "https", "www", "com", "youtube", "provided", "music", "copyright"}
+    counts: dict[str, int] = {}
+    try:
+        with sqlite3.connect(CATALOG_DB) as db:
+            rows = db.execute("SELECT metadata_json FROM videos").fetchall()
+    except sqlite3.Error:
+        return jsonify(words=[]), 200
+    for (raw,) in rows:
+        try: info = json.loads(raw or "{}")
+        except ValueError: continue
+        tags = {str(x).lower() for x in (info.get("tags") or [])}
+        if tag and tag not in tags: continue
+        if playlist and playlist not in str(info.get("playlist_title") or info.get("playlist") or "").lower(): continue
+        text = re.sub(r"https?://\S+|www\.\S+", " ", str(info.get("description") or ""), flags=re.IGNORECASE)
+        for word in re.findall(r"[\wÀ-ÿ']{3,}", text.lower(), re.UNICODE):
+            if word not in stop and not word.isdigit(): counts[word] = counts.get(word, 0) + 1
+    return jsonify(words=[{"word": w, "count": n} for w, n in sorted(counts.items(), key=lambda x: (-x[1], x[0]))[:300]])
+
+
 @app.get("/api/media/catalog")
 @limiter.limit("60 per minute")
 def api_media_catalog():
@@ -908,7 +955,60 @@ def api_youtube_get(video_id: str):
 @limiter.limit("10 per minute")
 def api_youtube_retry(video_id: str):
     """Explicitly retry a failed or partial download, resuming local parts."""
+    authenticated = request.args.get("authenticated") == "1"
+    browser = request.args.get("browser", "").strip() or None
+    if authenticated:
+        # The normal cookiefile (data/cookies.txt) is always used by getvidyt;
+        # this optional value adds cookies-from-browser for local installs.
+        vid = _normalize_id(video_id)
+        if not vid:
+            return jsonify(error="invalid video id"), 400
+        with _lock:
+            if vid in _active_downloads or len(_active_downloads) >= MAX_CONCURRENT_DOWNLOADS:
+                return jsonify(ok=False, error="download already running or queue full"), 429
+            _active_downloads.add(vid); _download_started_at[vid] = time.time()
+            _download_details[vid] = {"phase":"queued", "percent":0, "filename":"", "files":{}, "logs":[], "authenticated":True}
+            _log_queue_state_locked()
+        threading.Thread(target=_download_worker, args=(vid, browser), daemon=True).start()
+        return jsonify(ok=True, id=vid, started=True, authenticated=True)
     return api_youtube_get(video_id)
+
+
+@app.get("/api/media/failures")
+def api_media_failures():
+    with sqlite3.connect(CATALOG_DB) as db:
+        rows = db.execute("""SELECT video_id,status,reason,raw_error,retryable,started_at,finished_at
+          FROM (SELECT a.*, ROW_NUMBER() OVER (PARTITION BY video_id ORDER BY finished_at DESC) rn FROM download_attempts a)
+          WHERE rn=1 AND status='failed' AND NOT EXISTS
+          (SELECT 1 FROM archive_entries e WHERE e.video_id=video_id AND e.status='complete')
+          ORDER BY finished_at DESC""").fetchall()
+    return jsonify(failures=[{"video_id":r[0],"status":r[1],"reason":r[2],"error":r[3],"retryable":bool(r[4]),"started_at":r[5],"finished_at":r[6],"age_restricted":r[2]=="age_restricted","authenticated":str(r[3] or '').startswith('[cookies]')} for r in rows])
+
+
+@app.get("/api/system/status")
+def api_system_status():
+    """Return safe operational diagnostics without exposing cookie contents."""
+    usage = shutil.disk_usage(Path.cwd())
+    # Docker mounts the host export at /app/cookies.txt; local runs commonly
+    # keep it at data/cookies.txt. Inspect whichever active path exists.
+    cookie_candidates = [Path("./cookies.txt"), Path("./data/cookies.txt")]
+    cookie = next((candidate for candidate in cookie_candidates if candidate.is_file()), cookie_candidates[0])
+    result = {"disk": {"free_bytes": usage.free, "total_bytes": usage.total, "free_percent": round(usage.free * 100 / usage.total, 1)}, "cookies": {"present": cookie.is_file(), "netscape_format": False, "youtube_domains": [], "count": 0, "expired": 0}}
+    if cookie.is_file():
+        try:
+            lines = cookie.read_text(encoding="utf-8", errors="ignore").splitlines()
+            result["cookies"]["netscape_format"] = any(line.startswith("# Netscape HTTP Cookie File") for line in lines)
+            now = time.time()
+            for line in lines:
+                if not line or line.startswith("#") or len(line.split("\t")) < 7: continue
+                fields = line.split("\t"); domain = fields[0].lstrip(".").lower(); result["cookies"]["count"] += 1
+                if "youtube.com" in domain or "google.com" in domain: result["cookies"]["youtube_domains"].append(domain)
+                try:
+                    if float(fields[4]) and float(fields[4]) < now: result["cookies"]["expired"] += 1
+                except ValueError: pass
+            result["cookies"]["youtube_domains"] = sorted(set(result["cookies"]["youtube_domains"]))
+        except OSError: pass
+    return jsonify(result)
 
 
 @app.get("/api/youtube/status/<string:video_id>")
