@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Optional, Set
 from urllib.parse import quote
 
-from flask import Flask, abort, jsonify, render_template, request, send_file
+from flask import Flask, Response, abort, jsonify, render_template, request, send_file
 from flask_cors import CORS
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
@@ -93,6 +93,7 @@ _playlist_result_timestamps: dict[str, float] = {}
 _playlist_history: dict[str, str] = {}
 _playlist_history_timestamps: dict[str, float] = {}
 _last_queue_log_message: Optional[str] = None
+_queue_wakeup = threading.Event()
 
 
 def _refresh_catalog() -> None:
@@ -233,6 +234,11 @@ def _progress_hook(video_id: str):
     """Create a yt-dlp hook that keeps concise progress text for the UI."""
     def hook(event: dict) -> None:
         status = event.get("status", "")
+        info = event.get("info_dict") or {}
+        entry_id = str(info.get("id") or "").strip()
+        entry_title = str(info.get("title") or entry_id).strip()
+        entry_index = info.get("playlist_index")
+        entry_total = info.get("n_entries") or info.get("playlist_count")
         filename = Path(event.get("filename", "")).name if event.get("filename") else ""
         total = event.get("total_bytes") or event.get("total_bytes_estimate")
         downloaded = event.get("downloaded_bytes") or 0
@@ -244,6 +250,21 @@ def _progress_hook(video_id: str):
             phase += f" ({percent:g}%)"
         with _lock:
             detail = _download_details.setdefault(video_id, {"logs": []})
+            if entry_id:
+                playlist_items = detail.setdefault("playlist_items", {})
+                item = playlist_items.setdefault(entry_id, {"id": entry_id, "title": entry_title})
+                item.update({
+                    "id": entry_id,
+                    "title": entry_title,
+                    "index": entry_index if entry_index is not None else item.get("index"),
+                    "total": entry_total if entry_total is not None else item.get("total"),
+                    "status": "completed" if status == "finished" else "downloading",
+                    "percent": 100 if status == "finished" else percent,
+                })
+                if entry_index is not None:
+                    detail["playlist_index"] = entry_index
+                if entry_total:
+                    detail["playlist_total"] = entry_total
             files = detail.setdefault("files", {})
             file_state = files.setdefault(filename or "current", {"filename": filename})
             file_state.update({
@@ -254,6 +275,8 @@ def _progress_hook(video_id: str):
                 "total_bytes": total,
                 "phase": phase,
             })
+            if entry_id:
+                detail["playlist_items"][entry_id].setdefault("files", {})[filename or "current"] = file_state
             known = [item for item in files.values() if item.get("total_bytes")]
             total_bytes = sum(item["total_bytes"] for item in known)
             downloaded_bytes = sum(
@@ -281,6 +304,7 @@ def _classify_download_error(message: str) -> tuple[str, bool]:
         ("members only", "members_only", False), ("not available in your country", "region_blocked", False),
         ("format is not available", "format_unavailable", True), ("403", "http_403", True),
         ("video unavailable", "not_found", False), ("sign in", "login_required", True),
+        ("did not produce both", "incomplete", True),
     ]
     for needle, reason, retryable in patterns:
         if needle in text:
@@ -371,7 +395,7 @@ def _download_status_snapshot() -> dict:
     }
 
 
-def _download_worker(video_id: str, cookies_browser: str | None = None) -> None:
+def _download_worker(video_id: str, cookies_browser: str | None = None, queue_item_id: int | None = None) -> None:
     """
     Actually runs:
       getvidyt.download_youtube(video_id, audio_meta=True)
@@ -394,10 +418,16 @@ def _download_worker(video_id: str, cookies_browser: str | None = None) -> None:
         with _lock:
             _cached_mtime = None  # Force refresh
         _ensure_cache()
+        media = _resolve_media_by_video_id(video_id) or {}
+        media_files = media.get("files") or {}
+        has_video = bool(media_files.get("video"))
+        has_audio = bool(media_files.get("audio"))
         with _lock:
-            success = video_id in _cached_ids
+            success = result_code == 0 and video_id in _cached_ids and has_video and has_audio
         if result_code:
             error_text = f"yt-dlp returned exit code {result_code}"
+        elif not success:
+            error_text = "download did not produce both a playable video and audio file"
     except Exception as e:
         error_text = str(e)
         app.logger.exception("Download failed for %s: %s", video_id, e)
@@ -422,6 +452,8 @@ def _download_worker(video_id: str, cookies_browser: str | None = None) -> None:
         if success:
             _refresh_catalog()
             catalog.record_attempt(CATALOG_DB, video_id, "completed", "authenticated" if cookies_browser else "standard", "", True, started_at, time.time())
+            if queue_item_id:
+                catalog.queue_set_status(CATALOG_DB, queue_item_id, "completed", finished_at=time.time())
         else:
             reason, retryable = _classify_download_error(error_text)
             with _lock:
@@ -430,6 +462,8 @@ def _download_worker(video_id: str, cookies_browser: str | None = None) -> None:
                 )
             catalog.record_attempt(CATALOG_DB, video_id, "failed", reason, ("[cookies] " if cookies_browser else "") + error_text,
                                    retryable, started_at, time.time())
+            if queue_item_id:
+                catalog.queue_set_status(CATALOG_DB, queue_item_id, "failed", error=error_text, finished_at=time.time())
 
 
 def _cleanup_old_playlist_results() -> None:
@@ -452,14 +486,80 @@ def _cleanup_old_playlist_history() -> None:
         _playlist_history_timestamps.pop(pid, None)
 
 
-def _playlist_download_worker(playlist_id: str) -> None:
-    """Download all videos from a YouTube playlist via getvidyt."""
+def _prepare_playlist_membership(playlist_id: str, cookies_browser: str | None = None) -> Optional[list[dict]]:
+    """Read playlist metadata first so skipped videos still become members."""
     try:
-        rc = getvidyt.download_youtube(
-            playlist_id,
-            audio_meta=True,
-            extra_opts={"progress_hooks": [_progress_hook(playlist_id)]},
+        url = getvidyt.to_youtube_url(playlist_id)
+        opts = getvidyt.build_ydl_opts(
+            merged_dir=MERGED_DIR, archive=CHECK_FILE, cookies_browser=cookies_browser,
+            extra_opts={"skip_download": True, "extract_flat": "in_playlist", "quiet": True,
+                        "no_warnings": True, "ignoreerrors": True},
         )
+        with getvidyt.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False) or {}
+        entries = info.get("entries") or []
+        members = []
+        _ensure_cache()
+        with _lock:
+            archived = set(_cached_ids)
+        for index, entry in enumerate(entries, 1):
+            if not entry:
+                continue
+            video_id = str(entry.get("id") or "").strip()
+            if not YOUTUBE_ID_RE.match(video_id):
+                continue
+            members.append({
+                "video_id": video_id,
+                "playlist_index": entry.get("playlist_index") or index,
+                "title": entry.get("title") or video_id,
+                "video_url": entry.get("webpage_url") or f"https://www.youtube.com/watch?v={video_id}",
+            })
+        catalog.record_playlist_membership(
+            CATALOG_DB, playlist_id,
+            str(info.get("title") or info.get("playlist_title") or playlist_id),
+            str(info.get("webpage_url") or f"https://www.youtube.com/playlist?list={playlist_id}"),
+            members,
+        )
+        with _lock:
+            detail = _download_details.setdefault(playlist_id, {"logs": []})
+            detail["playlist_items"] = {
+                item["video_id"]: {**item, "status": "completed" if item["video_id"] in archived else "queued"}
+                for item in members
+            }
+            detail["playlist_total"] = len(members)
+            detail["playlist_index"] = sum(item["video_id"] in archived for item in members)
+        return members
+    except Exception as exc:
+        app.logger.warning("Playlist preflight failed for %s; continuing download: %s", playlist_id, exc)
+        return None
+
+
+def _playlist_download_worker(playlist_id: str, queue_item_id: int | None = None) -> None:
+    """Download all videos from a YouTube playlist via getvidyt."""
+    members = _prepare_playlist_membership(playlist_id)
+    try:
+        if members is not None:
+            # Download each child independently. This keeps a strict success
+            # from being downloaded again when a different playlist child
+            # needs the fallback format.
+            rc = 0
+            for member in members:
+                child_rc = getvidyt.download_youtube(
+                    member["video_id"],
+                    audio_meta=True,
+                    extra_opts={"progress_hooks": [_progress_hook(playlist_id)]},
+                )
+                if child_rc:
+                    rc = child_rc
+        else:
+            # If preflight cannot read the playlist, do not retry the entire
+            # playlist into the fallback tree; that can duplicate successes.
+            rc = getvidyt.download_youtube(
+                playlist_id,
+                audio_meta=True,
+                best_fallback=False,
+                extra_opts={"progress_hooks": [_progress_hook(playlist_id)]},
+            )
         # Force cache refresh so status can report archive contents
         global _cached_mtime
         with _lock:
@@ -478,9 +578,64 @@ def _playlist_download_worker(playlist_id: str) -> None:
             _playlist_result_timestamps[playlist_id] = finished_at
             _playlist_history[playlist_id] = result
             _playlist_history_timestamps[playlist_id] = finished_at
+            if queue_item_id:
+                catalog.queue_set_status(CATALOG_DB, queue_item_id, result, finished_at=finished_at)
             _cleanup_old_playlist_results()
             _cleanup_old_playlist_history()
             _log_queue_state_locked()
+
+
+def _start_queue_item(item: dict) -> bool:
+    """Start one persisted queue item if its in-memory concurrency slot is free."""
+    target, kind, item_id = item["target"], item["kind"], int(item["id"])
+    with _lock:
+        active = _active_downloads if kind == "video" else _active_playlist_downloads
+        limit = MAX_CONCURRENT_DOWNLOADS if kind == "video" else MAX_CONCURRENT_PLAYLIST_DOWNLOADS
+        if target in active or len(active) >= limit:
+            return False
+        active.add(target)
+        started = time.time()
+        (_download_started_at if kind == "video" else _playlist_started_at)[target] = started
+        _download_details[target] = {"phase": "queued", "percent": 0, "filename": "", "files": {}, "logs": []}
+        _log_queue_state_locked()
+    catalog.queue_set_status(CATALOG_DB, item_id, "running", started_at=started)
+    worker = _download_worker if kind == "video" else _playlist_download_worker
+    args = (target, item.get("cookies_browser"), item_id) if kind == "video" else (target, item_id)
+    threading.Thread(target=worker, args=args, daemon=True).start()
+    return True
+
+
+def _queue_scheduler() -> None:
+    while True:
+        try:
+            now = time.time()
+            for item in catalog.queue_items(CATALOG_DB, 100):
+                if item["status"] != "pending":
+                    continue
+                if item["scheduled_at"] and item["scheduled_at"] > now:
+                    continue
+                _start_queue_item(item)
+        except Exception:
+            app.logger.exception("Download queue scheduler failed")
+        _queue_wakeup.wait(2)
+        _queue_wakeup.clear()
+
+
+threading.Thread(target=_queue_scheduler, name="download-queue", daemon=True).start()
+
+
+def _enqueue_target(target: str, kind: str, scheduled_at: float | None = None,
+                    cookies_browser: str | None = None, status: str = "pending") -> tuple[int | None, bool]:
+    """Add a target to the persistent queue, returning (id, already_queued)."""
+    try:
+        item_id = catalog.queue_add(CATALOG_DB, target, kind, scheduled_at, cookies_browser, status)
+        _queue_wakeup.set()
+        return item_id, False
+    except sqlite3.IntegrityError:
+        for item in catalog.queue_items(CATALOG_DB, 2000):
+            if item["target"] == target and item["kind"] == kind and item["status"] in {"pending", "paused"}:
+                return int(item["id"]), True
+        raise
 
 
 def _classify_file(fname: str, url: str, files: dict) -> None:
@@ -593,6 +748,9 @@ def _scan_library() -> list[dict]:
         for video_dir in sorted(channel_dir.iterdir()):
             if not video_dir.is_dir():
                 continue
+            info, _info_error = _load_info_json(video_dir)
+            if info and info.get("_type") == "playlist":
+                continue
             video_id = video_dir.name
             if video_id in seen:
                 continue
@@ -670,6 +828,13 @@ def index():
     return render_template("index.html")
 
 
+@app.get("/video/<string:video_id>")
+def video_page(video_id: str):
+    if not _normalize_id(video_id):
+        abort(404)
+    return render_template("video.html", video_id=video_id)
+
+
 @app.get("/extension.zip")
 def download_extension():
     """Download the browser extension as a ZIP for local installation."""
@@ -702,6 +867,16 @@ def downloads_page():
     return render_template("downloads.html")
 
 
+@app.get("/queue")
+def queue_page():
+    return render_template("queue.html")
+
+
+@app.get("/downloaded")
+def downloaded_page():
+    return render_template("downloaded.html")
+
+
 @app.get("/catalog")
 def catalog_page():
     return render_template("catalog.html")
@@ -727,12 +902,68 @@ def tools_page():
     return render_template("tools.html")
 
 
+@app.get("/api-docs")
+def api_docs_page():
+    endpoints = [
+        ("GET", "/health", "Health and active download counts"),
+        ("GET", "/api/youtube/<video_id>", "Check archive status"),
+        ("POST", "/api/youtube/get/<video_id>", "Add or start a video download"),
+        ("POST", "/api/youtube/retry/<video_id>", "Retry a failed video"),
+        ("GET", "/api/youtube/status/<video_id>", "Video download progress"),
+        ("POST", "/api/youtube/playlist/get/<playlist_id>", "Add or start a playlist download"),
+        ("GET", "/api/youtube/playlist/status/<playlist_id>", "Playlist download progress"),
+        ("GET", "/api/downloads/status", "Active and recent download status"),
+        ("GET", "/api/queue", "Persistent queue items and default mode"),
+        ("POST", "/api/queue", "Add a video or playlist to the queue"),
+        ("POST", "/api/queue/<item_id>/start", "Start a paused queue item"),
+        ("POST", "/api/queue/<item_id>/cancel", "Cancel a pending queue item"),
+        ("GET/POST", "/api/settings", "Read or update queue defaults"),
+        ("GET", "/api/media/library", "List local media"),
+        ("GET", "/api/media/resolve/<video_id>", "Resolve playable local media"),
+        ("GET", "/api/media/details/<channel_id>/<video_id>", "Return files and metadata"),
+        ("GET", "/api/media/playlists", "List indexed playlists"),
+        ("GET", "/api/media/playlists/<playlist_id>", "Return playlist members"),
+        ("GET", "/api/media/playlists/<playlist_id>.m3u?mode=video|audio", "Export a VLC playlist"),
+        ("GET", "/api/media/catalog", "Paginated catalog data"),
+        ("GET", "/api/media/tags", "Tag counts and grouped videos"),
+        ("GET", "/api/media/failures", "Latest unresolved failures"),
+        ("GET", "/api/media/download-history", "Persistent download history"),
+        ("GET", "/api/media/wordcloud", "Description word frequencies"),
+        ("GET", "/api/system/status", "Disk, directory, and cookie diagnostics"),
+    ]
+    return render_template("api-docs.html", endpoints=endpoints)
+
+
+@app.get("/sitemap")
+def sitemap_page():
+    groups = [
+        ("Library", [("Media library", "/"), ("Playlists", "/playlists"), ("Video detail", "/video/dQw4w9WgXcQ"), ("Catalog", "/catalog")]),
+        ("Downloads", [("Downloads status", "/downloads"), ("Persistent queue", "/queue"), ("Downloaded history", "/downloaded")]),
+        ("Tools", [("Tools hub", "/tools"), ("API documentation", "/api-docs"), ("System status", "/status"), ("Tags", "/tags"), ("Word cloud", "/wordcloud"), ("Tag cloud", "/tagcloud")]),
+        ("Integration", [("Health API", "/health"), ("Extension download", "/extension.zip")]),
+    ]
+    return render_template("sitemap.html", groups=groups)
+
+
+@app.get("/playlists")
+def playlists_page():
+    return render_template("playlists.html")
+
+
 @app.get("/api/media/wordcloud")
 def api_media_wordcloud():
     """Return word frequencies from saved descriptions, optionally filtered."""
     tag = request.args.get("tag", "").strip().lower()
     playlist = request.args.get("playlist", "").strip().lower()
-    stop = {"the", "and", "you", "that", "this", "with", "from", "your", "for", "are", "was", "auf", "und", "der", "die", "das", "to", "of", "a", "in", "on", "is", "it", "http", "https", "www", "com", "youtube", "provided", "music", "copyright"}
+    stop = {
+        "the", "and", "you", "that", "this", "with", "from", "your", "for", "are", "was",
+        "auf", "und", "der", "die", "das", "to", "of", "a", "in", "on", "is", "it",
+        "http", "https", "www", "com", "youtube", "provided", "music", "copyright",
+        # Description credits, promotion, and production boilerplate.
+        "video", "lyrics", "channel", "director", "producer", "production", "gaffer", "mua",
+        "official", "support", "subscribe", "instagram", "spotify", "album", "management",
+        "tickets", "written", "welcome", "song",
+    }
     counts: dict[str, int] = {}
     try:
         with sqlite3.connect(CATALOG_DB) as db:
@@ -751,6 +982,29 @@ def api_media_wordcloud():
     return jsonify(words=[{"word": w, "count": n} for w, n in sorted(counts.items(), key=lambda x: (-x[1], x[0]))[:300]])
 
 
+@app.get("/api/media/wordcloud/videos")
+def api_media_wordcloud_videos():
+    """Return archived videos whose saved description contains a word."""
+    word = request.args.get("word", "").strip().lower()
+    if not re.fullmatch(r"[\wÀ-ÿ']{3,}", word, re.UNICODE):
+        return jsonify(video_ids=[])
+    matches = []
+    try:
+        with sqlite3.connect(CATALOG_DB) as db:
+            rows = db.execute("SELECT video_id, metadata_json FROM videos").fetchall()
+    except sqlite3.Error:
+        return jsonify(video_ids=[])
+    pattern = re.compile(rf"(?<![\wÀ-ÿ]){re.escape(word)}(?![\wÀ-ÿ])", re.IGNORECASE)
+    for video_id, raw in rows:
+        try:
+            info = json.loads(raw or "{}")
+        except ValueError:
+            continue
+        if pattern.search(str(info.get("description") or "")):
+            matches.append(video_id)
+    return jsonify(video_ids=matches)
+
+
 @app.get("/api/media/catalog")
 @limiter.limit("60 per minute")
 def api_media_catalog():
@@ -766,21 +1020,69 @@ def api_media_catalog():
             total = db.execute("SELECT COUNT(DISTINCT video_id) FROM videos").fetchone()[0]
             # A video may exist in both the primary and fallback trees. Show
             # one catalog row, preferring the complete primary copy.
-            rows = db.execute(f"""SELECT video_id, source_root, channel_id, title, artist, album, uploader, upload_date, duration, files_json, formats_json
-                FROM (SELECT v.*, ROW_NUMBER() OVER (PARTITION BY video_id ORDER BY CASE source_root WHEN 'merged' THEN 0 WHEN 'legacy' THEN 1 ELSE 2 END) AS rn FROM videos v)
+            rows = db.execute(f"""SELECT video_id, source_root, channel_id, title, artist, album, uploader, upload_date, duration, files_json, formats_json,
+                (SELECT CASE WHEN a.status='failed' THEN a.reason ELSE '' END
+                 FROM download_attempts a WHERE a.video_id=catalog_rows.video_id
+                 ORDER BY a.finished_at DESC LIMIT 1) AS failure_reason
+                FROM (SELECT v.*, ROW_NUMBER() OVER (PARTITION BY video_id ORDER BY CASE source_root WHEN 'merged' THEN 0 WHEN 'legacy' THEN 1 ELSE 2 END) AS rn FROM videos v) AS catalog_rows
                 WHERE rn = 1 ORDER BY {order} LIMIT ? OFFSET ?""", (per_page, (page - 1) * per_page)).fetchall()
     except sqlite3.Error:
         return jsonify(error="catalog is still being built"), 503
     items = []
     for row in rows:
         files = json.loads(row[9] or "{}")
-        items.append({"video_id": row[0], "source_root": row[1], "channel_id": row[2], "title": row[3], "artist": row[4], "album": row[5], "uploader": row[6], "upload_date": row[7], "duration": row[8], "files": files, "formats": json.loads(row[10] or "[]")})
+        items.append({"video_id": row[0], "source_root": row[1], "channel_id": row[2], "title": row[3], "artist": row[4], "album": row[5], "uploader": row[6], "upload_date": row[7], "duration": row[8], "files": files, "formats": json.loads(row[10] or "[]"), "failure_reason": row[11] or ""})
     return jsonify(items=items, page=page, per_page=per_page, total=total, pages=(total + per_page - 1) // per_page)
 
 
 @app.get("/api/media/library")
 def api_media_library():
     return jsonify(videos=_scan_library())
+
+
+@app.get("/api/media/playlists")
+def api_media_playlists():
+    return jsonify(playlists=catalog.playlists(CATALOG_DB))
+
+
+@app.get("/api/media/playlists/<string:playlist_id>")
+def api_media_playlist(playlist_id: str):
+    if not PLAYLIST_ID_RE.match(playlist_id):
+        return jsonify(error="invalid playlist id"), 400
+    playlist_rows = catalog.playlists(CATALOG_DB)
+    playlist = next((item for item in playlist_rows if item["playlist_id"] == playlist_id), None)
+    if not playlist:
+        return jsonify(error="playlist not found"), 404
+    videos_by_id = {item["video_id"]: item for item in _scan_library()}
+    members = []
+    for member in catalog.playlist_video_ids(CATALOG_DB, playlist_id):
+        video = videos_by_id.get(member["video_id"])
+        members.append({**member, "video": video})
+    return jsonify(playlist=playlist, videos=members)
+
+
+@app.get("/api/media/playlists/<string:playlist_id>.m3u")
+def api_media_playlist_m3u(playlist_id: str):
+    if not PLAYLIST_ID_RE.match(playlist_id):
+        return jsonify(error="invalid playlist id"), 400
+    mode = request.args.get("mode", "video").strip().lower()
+    if mode not in {"video", "audio"}:
+        return jsonify(error="mode must be video or audio"), 400
+    members = catalog.playlist_video_ids(CATALOG_DB, playlist_id)
+    videos_by_id = {item["video_id"]: item for item in _scan_library()}
+    lines = ["#EXTM3U"]
+    for member in members:
+        video = videos_by_id.get(member["video_id"]) or {}
+        files = video.get("files") or {}
+        media_url = files.get(mode)
+        if not media_url:
+            continue
+        lines.extend([
+            f"#EXTINF:-1,{member.get('title') or video.get('title') or member['video_id']}",
+            request.host_url.rstrip("/") + media_url,
+        ])
+    return Response("\n".join(lines) + "\n", mimetype="audio/x-mpegurl",
+                    headers={"Content-Disposition": f'attachment; filename="{playlist_id}-{mode}.m3u"'})
 
 
 @app.get("/api/media/tags")
@@ -807,6 +1109,77 @@ def api_media_resolve(video_id: str):
 @limiter.limit("60 per minute")
 def api_downloads_status():
     return jsonify(_download_status_snapshot())
+
+
+@app.get("/api/queue")
+def api_queue_list():
+    return jsonify(items=catalog.queue_items(CATALOG_DB),
+                   default_mode=catalog.setting(CATALOG_DB, "default_download_mode", "immediate"))
+
+
+@app.post("/api/queue")
+def api_queue_add():
+    payload = request.get_json(silent=True) or {}
+    raw = str(payload.get("target") or "").strip()
+    # Accept IDs and the same YouTube URL forms as the library download bar.
+    video_id = _normalize_id(raw)
+    kind = "video" if video_id else "playlist"
+    target = video_id or _normalize_playlist_id(raw)
+    if not target:
+        match = re.search(r"[?&]v=([A-Za-z0-9_-]{11})", raw)
+        target = _normalize_id(match.group(1)) if match else None
+        kind = "video"
+        if not target:
+            match = re.search(r"[?&]list=([A-Za-z0-9_-]{2,128})", raw)
+            target = _normalize_playlist_id(match.group(1)) if match else None
+            kind = "playlist"
+    if not target:
+        return jsonify(ok=False, error="enter a YouTube video ID, playlist ID, or URL"), 400
+    scheduled_at = payload.get("scheduled_at")
+    try:
+        scheduled_at = float(scheduled_at) if scheduled_at not in (None, "") else None
+    except (TypeError, ValueError):
+        return jsonify(ok=False, error="scheduled_at must be a timestamp"), 400
+    start_now = payload.get("start_now")
+    if start_now is None:
+        start_now = catalog.setting(CATALOG_DB, "default_download_mode", "immediate") == "immediate"
+    if scheduled_at is not None:
+        start_now = False
+    queue_status = "pending" if start_now or scheduled_at is not None else "paused"
+    item_id, already = _enqueue_target(target, kind, scheduled_at, status=queue_status)
+    if start_now and not scheduled_at:
+        _queue_wakeup.set()
+    return jsonify(ok=True, id=item_id, target=target, kind=kind, already_queued=already, started=bool(start_now and not already))
+
+
+@app.post("/api/queue/<int:item_id>/start")
+def api_queue_start(item_id: int):
+    for item in catalog.queue_items(CATALOG_DB, 2000):
+        if int(item["id"]) == item_id and item["status"] in {"pending", "paused"}:
+            catalog.queue_set_status(CATALOG_DB, item_id, "pending", scheduled_at=time.time())
+            _queue_wakeup.set()
+            return jsonify(ok=True, id=item_id)
+    return jsonify(ok=False, error="pending queue item not found"), 404
+
+
+@app.post("/api/queue/<int:item_id>/cancel")
+def api_queue_cancel(item_id: int):
+    for item in catalog.queue_items(CATALOG_DB, 2000):
+        if int(item["id"]) == item_id and item["status"] == "pending":
+            catalog.queue_set_status(CATALOG_DB, item_id, "cancelled", finished_at=time.time())
+            return jsonify(ok=True, id=item_id)
+    return jsonify(ok=False, error="pending queue item not found"), 404
+
+
+@app.route("/api/settings", methods=["GET", "POST"])
+def api_settings():
+    if request.method == "POST":
+        payload = request.get_json(silent=True) or {}
+        mode = str(payload.get("default_download_mode") or "").strip().lower()
+        if mode not in {"immediate", "queue"}:
+            return jsonify(ok=False, error="default_download_mode must be immediate or queue"), 400
+        catalog.set_setting(CATALOG_DB, "default_download_mode", mode)
+    return jsonify(default_download_mode=catalog.setting(CATALOG_DB, "default_download_mode", "immediate"))
 
 
 @app.get("/api/media/details/<string:channel_id>/<string:video_id>")
@@ -931,23 +1304,15 @@ def api_youtube_get(video_id: str):
     if not vid:
         return jsonify(ok=False, error="invalid video id"), 400
 
-    with _lock:
-        already_running = vid in _active_downloads
-        if not already_running:
-            # Check max concurrent downloads limit
-            if len(_active_downloads) >= MAX_CONCURRENT_DOWNLOADS:
-                return jsonify(ok=False, error="too many concurrent downloads"), 429
-            _active_downloads.add(vid)
-            _download_started_at[vid] = time.time()
-            _download_details[vid] = {"phase": "queued", "percent": 0, "filename": "", "files": {}, "logs": []}
-            _log_queue_state_locked()
-            threading.Thread(target=_download_worker, args=(vid,), daemon=True).start()
+    queue_status = "pending" if catalog.setting(CATALOG_DB, "default_download_mode", "immediate") == "immediate" else "paused"
+    item_id, already_queued = _enqueue_target(vid, "video", status=queue_status)
 
     return jsonify(
         ok=True,
         id=vid,
-        started=(not already_running),
-        already_running=already_running,
+        queue_id=item_id,
+        started=not already_queued,
+        already_running=already_queued,
     )
 
 
@@ -963,26 +1328,32 @@ def api_youtube_retry(video_id: str):
         vid = _normalize_id(video_id)
         if not vid:
             return jsonify(error="invalid video id"), 400
-        with _lock:
-            if vid in _active_downloads or len(_active_downloads) >= MAX_CONCURRENT_DOWNLOADS:
-                return jsonify(ok=False, error="download already running or queue full"), 429
-            _active_downloads.add(vid); _download_started_at[vid] = time.time()
-            _download_details[vid] = {"phase":"queued", "percent":0, "filename":"", "files":{}, "logs":[], "authenticated":True}
-            _log_queue_state_locked()
-        threading.Thread(target=_download_worker, args=(vid, browser), daemon=True).start()
-        return jsonify(ok=True, id=vid, started=True, authenticated=True)
+        item_id, already_queued = _enqueue_target(vid, "video", cookies_browser=browser)
+        return jsonify(ok=True, id=vid, queue_id=item_id, started=not already_queued, authenticated=True)
     return api_youtube_get(video_id)
 
 
 @app.get("/api/media/failures")
 def api_media_failures():
     with sqlite3.connect(CATALOG_DB) as db:
-        rows = db.execute("""SELECT video_id,status,reason,raw_error,retryable,started_at,finished_at
-          FROM (SELECT a.*, ROW_NUMBER() OVER (PARTITION BY video_id ORDER BY finished_at DESC) rn FROM download_attempts a)
-          WHERE rn=1 AND status='failed' AND NOT EXISTS
-          (SELECT 1 FROM archive_entries e WHERE e.video_id=video_id AND e.status='complete')
-          ORDER BY finished_at DESC""").fetchall()
+        db.executescript(catalog.SCHEMA)
+        rows = db.execute("""SELECT latest.video_id,latest.status,latest.reason,latest.raw_error,latest.retryable,latest.started_at,latest.finished_at
+          FROM (SELECT a.*, ROW_NUMBER() OVER (PARTITION BY a.video_id ORDER BY a.finished_at DESC) rn FROM download_attempts a)
+          AS latest
+          WHERE latest.rn=1 AND latest.status='failed' AND NOT EXISTS
+          (SELECT 1 FROM archive_entries e WHERE e.video_id=latest.video_id AND e.status='complete')
+          ORDER BY latest.finished_at DESC""").fetchall()
     return jsonify(failures=[{"video_id":r[0],"status":r[1],"reason":r[2],"error":r[3],"retryable":bool(r[4]),"started_at":r[5],"finished_at":r[6],"age_restricted":r[2]=="age_restricted","authenticated":str(r[3] or '').startswith('[cookies]')} for r in rows])
+
+
+@app.get("/api/media/download-history")
+def api_media_download_history():
+    """Return persistent completed and failed download attempts."""
+    try:
+        rows = catalog.download_attempts(CATALOG_DB, request.args.get("limit", 500))
+    except (TypeError, ValueError):
+        return jsonify(error="limit must be a number"), 400
+    return jsonify(attempts=rows)
 
 
 @app.get("/api/system/status")
@@ -993,7 +1364,18 @@ def api_system_status():
     # keep it at data/cookies.txt. Inspect whichever active path exists.
     cookie_candidates = [Path("./cookies.txt"), Path("./data/cookies.txt")]
     cookie = next((candidate for candidate in cookie_candidates if candidate.is_file()), cookie_candidates[0])
-    result = {"disk": {"free_bytes": usage.free, "total_bytes": usage.total, "free_percent": round(usage.free * 100 / usage.total, 1)}, "cookies": {"present": cookie.is_file(), "netscape_format": False, "youtube_domains": [], "count": 0, "expired": 0}}
+    def directory_size(path: Path) -> int:
+        total = 0
+        if not path.is_dir():
+            return total
+        try:
+            for item in path.rglob("*"):
+                if item.is_file():
+                    try: total += item.stat().st_size
+                    except OSError: pass
+        except OSError: pass
+        return total
+    result = {"disk": {"free_bytes": usage.free, "total_bytes": usage.total, "free_percent": round(usage.free * 100 / usage.total, 1)}, "directories": {str(path): directory_size(path) for path in (MERGED_DIR, LEGACY_MERGED_DIR, FALLBACK_DIR, Path("./audio").resolve())}, "cookies": {"present": cookie.is_file(), "netscape_format": False, "youtube_domains": [], "count": 0, "expired": 0}}
     if cookie.is_file():
         try:
             lines = cookie.read_text(encoding="utf-8", errors="ignore").splitlines()
@@ -1054,24 +1436,15 @@ def api_youtube_playlist_get(playlist_id: str):
     if not pid:
         return jsonify(ok=False, error="invalid playlist id"), 400
 
-    with _lock:
-        already_running = pid in _active_playlist_downloads
-        if not already_running:
-            if len(_active_playlist_downloads) >= MAX_CONCURRENT_PLAYLIST_DOWNLOADS:
-                return jsonify(ok=False, error="too many concurrent playlist downloads"), 429
-            _active_playlist_downloads.add(pid)
-            _playlist_started_at[pid] = time.time()
-            _download_details[pid] = {"phase": "queued", "percent": 0, "filename": "", "files": {}, "logs": []}
-            _log_queue_state_locked()
-            threading.Thread(
-                target=_playlist_download_worker, args=(pid,), daemon=True
-            ).start()
+    queue_status = "pending" if catalog.setting(CATALOG_DB, "default_download_mode", "immediate") == "immediate" else "paused"
+    item_id, already_queued = _enqueue_target(pid, "playlist", status=queue_status)
 
     return jsonify(
         ok=True,
         id=pid,
-        started=(not already_running),
-        already_running=already_running,
+        queue_id=item_id,
+        started=not already_queued,
+        already_running=already_queued,
     )
 
 

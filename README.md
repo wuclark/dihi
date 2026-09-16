@@ -87,13 +87,26 @@ Compose starts the PO Token provider with the app and publishes its service port
 | `POST` | `/api/youtube/playlist/get/<playlist_id>` | 5/min | Trigger a full playlist download |
 | `GET` | `/api/youtube/playlist/status/<playlist_id>` | 60/min | Poll playlist download progress |
 | `GET` | `/api/media/library` | 30/min | List archived media cards for the web UI |
+| `GET` | `/playlists` | — | Browse downloaded playlists, play all locally, or load a playlist in VLC |
 | `GET` | `/api/media/resolve/<id>` | 60/min | Resolve one archived YouTube ID to its media record and preferred playback URL |
 | `GET` | `/api/media/details/<channel_id>/<id>` | 60/min | Return files and metadata for one archived video |
 | `GET` | `/api/media/tags` | 30/min | Return tag counts and tag-grouped videos |
-| `GET` | `/api/media/catalog` | 60/min | Paginated text catalog of videos, dates, sources, files, formats, and subtitles |
+| `GET` | `/api/media/catalog` | 60/min | Paginated text catalog of videos, dates, sources, files, formats, subtitles, and latest failure reasons |
 | `GET` | `/wordcloud` / `/tagcloud` | — | Browse local description words and metadata tag frequencies |
 | `GET` | `/api/downloads/status` | 60/min | Return active video/playlist downloads, recent results, and yt-dlp progress details |
+| `GET` | `/queue` | — | Manage persistent pending, scheduled, and completed queue items |
+| `GET` | `/api-docs` | — | Browse the available API endpoint reference |
+| `GET` | `/sitemap` | — | Browse the site map |
+| `GET` | `/api/queue` | — | List persistent download queue items and default add behavior |
+| `POST` | `/api/queue` | — | Add a video or playlist immediately, manually, or at a scheduled time |
+| `POST` | `/api/queue/<item_id>/start` | — | Start a paused queue item immediately |
+| `POST` | `/api/queue/<item_id>/cancel` | — | Cancel a pending queue item |
+| `GET/POST` | `/api/settings` | — | Read or set the default add mode: immediate or queue-only |
 | `GET` | `/api/media/failures` | — | List failed download attempts with reasons and retryability |
+| `GET` | `/api/media/download-history` | — | List persistent completed and failed download attempts |
+| `GET` | `/api/media/playlists` | — | List downloaded playlists and member counts |
+| `GET` | `/api/media/playlists/<id>` | — | Return playlist metadata and ordered video members |
+| `GET` | `/api/media/playlists/<id>.m3u?mode=video\|audio` | — | Download a VLC-compatible video or audio-only playlist of local media URLs |
 
 Video IDs are exactly 11 characters (`[A-Za-z0-9_-]{11}`). Playlist IDs are 2–128 characters from the same alphabet.
 
@@ -217,7 +230,13 @@ curl http://localhost:5000/api/downloads/status
 }
 ```
 
-The `/downloads` page polls this endpoint and shows active video/playlist downloads, recent completed or failed results, and a queue output. When there are no active downloads it shows `Queue Empty`. Queue state changes are also logged by the server.
+The `/downloads` page polls this endpoint and shows active video/playlist downloads, recent completed or failed results, persistent completed/failed attempt history, and a queue output. Playlist progress groups each item's video, audio, and metadata files beneath that item's title. The `/downloaded` page shows the persistent history in a scrollable panel. The `/playlists` page groups indexed videos by their saved YouTube playlist metadata, with ordered links, browser play-all, and separate video and audio-only M3U files for VLC. Playlist preflight records all members, including videos already in the archive. The `/video/<id>` page provides dedicated local playback, description, metadata, and VLC access. The `/status` page reports total disk capacity and usage for each media directory. The `/wordcloud` page generates on request and displays a spinner/progress state while descriptions are scanned and the cloud is arranged. A download is complete only when the archive entry and playable video/audio files are present; the catalog shows the missing-media reason and retry actions, including retry with browser cookies. When there are no active downloads it shows `Queue Empty`. Queue state changes are also logged by the server.
+
+The `/queue` page manages a persistent download queue. New downloads start immediately by default, but the setting can be changed to queue-only. Items can also be assigned a future start time; the scheduler starts eligible items automatically after a restart as well. Playlist jobs preflight their entries and download children sequentially, isolating fallback retries to failed videos instead of retrying successful playlist items.
+
+### Extension/API compatibility roadmap
+
+The browser extension must mirror the active site flows and API endpoints. Changes to queue, playlist, playback, settings, or API response shapes should update the extension code, extension README, and extension version together, followed by endpoint-focused tests.
 
 ---
 
@@ -257,7 +276,7 @@ Options also control automatic behavior:
 
 Visit counts are stored locally in the browser and reset when a video is found in the archive. When auto-download starts after a threshold match, the extension shows a notification. Before posting a download request, it resolves local media again and skips the request if the video is already downloaded. If the video is still missing on a later visit and its count is still at or above the threshold, the extension requests the download again.
 
-The server UI accepts `/?play=<video_id>&autoplay=1` to open an archived video directly.
+The server UI accepts `/video/<video_id>` to open an archived video directly; the library remains available at `/`.
 
 ---
 

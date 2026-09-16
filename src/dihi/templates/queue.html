@@ -1,0 +1,21 @@
+<!doctype html>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DIHI Queue</title>
+<style>
+body{background:#0f0f0f;color:#eee;font:14px system-ui;margin:0}main{max-width:1000px;margin:auto;padding:24px}.panel,.item{background:#1b1b1b;border:1px solid #3b3b3b;border-radius:8px;padding:16px;margin:14px 0}.add{display:flex;gap:8px;flex-wrap:wrap}.add input{flex:1;min-width:260px;background:#272727;border:1px solid #555;color:#fff;padding:9px;border-radius:6px}.btn{background:#272727;border:1px solid #555;color:#eee;padding:8px 11px;border-radius:6px;cursor:pointer}.primary{background:#7cf;color:#000;border-color:#7cf}.muted{color:#aaa}.items{max-height:60vh;overflow:auto}.item{display:grid;grid-template-columns:minmax(180px,1fr) 90px 150px 150px;gap:10px;align-items:center}.pending{color:#fc6}.running{color:#7cf}.completed{color:#5d7}.failed{color:#f77}.paused{color:#fc6}.actions{display:flex;gap:8px;flex-wrap:wrap}@media(max-width:700px){.item{grid-template-columns:1fr}.actions{grid-column:1}}
+</style>
+{% include "_header.html" %}
+<main><h1>Download queue</h1><p class="muted">Add items without downloading, schedule them, or start them manually. The default add behavior is controlled below.</p>
+<section class="panel"><div class="add"><input id="target" placeholder="YouTube video or playlist URL / ID"><label class="muted">Start at <input id="schedule" type="datetime-local"></label><button class="btn primary" id="add">Add to queue</button></div><p id="message" class="muted"></p></section>
+<section class="panel"><label>Default when adding downloads: <select id="default-mode"><option value="immediate">Download immediately</option><option value="queue">Add to queue only</option></select></label><button class="btn" id="save">Save setting</button><span id="saved" class="muted"></span></section>
+<section><h2>Queued downloads</h2><div id="items" class="items"><p class="muted">Loading…</p></div></section></main>
+<script>
+'use strict';
+const $=id=>document.getElementById(id), esc=x=>String(x??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+async function load(){const d=await (await fetch('/api/queue',{cache:'no-store'})).json();$('default-mode').value=d.default_mode||'immediate';const rows=d.items||[];$('items').innerHTML=rows.length?rows.map(row).join(''):'<p class="muted">Queue is empty.</p>';}
+function row(x){const active=x.status==='pending'||x.status==='paused';return `<div class="item"><div><strong>${esc(x.target)}</strong><div class="muted">${esc(x.kind)} · added ${x.created_at?new Date(x.created_at*1000).toLocaleString():''}${x.error?`<br>${esc(x.error)}`:''}</div></div><span class="${esc(x.status)}">${esc(x.status)}</span><div class="muted">${x.scheduled_at?`Scheduled ${new Date(x.scheduled_at*1000).toLocaleString()}`:''}</div><div class="actions">${active?`<button class="btn" data-start="${x.id}">Start</button><button class="btn" data-cancel="${x.id}">Cancel</button>`:''}</div></div>`;}
+$('add').onclick=async()=>{const target=$('target').value.trim();if(!target)return;const schedule=$('schedule').value;const scheduled_at=schedule?new Date(schedule).getTime()/1000:null;$('message').textContent='Adding…';const r=await fetch('/api/queue',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({target,scheduled_at})});const d=await r.json();$('message').textContent=d.ok?'Added to queue.':(d.error||'Could not add item');if(d.ok){$('target').value='';$('schedule').value='';load();}};
+$('save').onclick=async()=>{const mode=$('default-mode').value;await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({default_download_mode:mode})});$('saved').textContent='Saved';setTimeout(()=>{$('saved').textContent='';},1500);};
+document.addEventListener('click',async e=>{const start=e.target.closest('[data-start]'),cancel=e.target.closest('[data-cancel]');if(start)await fetch(`/api/queue/${start.dataset.start}/start`,{method:'POST'});if(cancel)await fetch(`/api/queue/${cancel.dataset.cancel}/cancel`,{method:'POST'});if(start||cancel)load();});
+load();setInterval(load,3000);
+</script>

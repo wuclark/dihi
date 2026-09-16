@@ -203,7 +203,7 @@ async function maybePlayFromServer(tabId, videoId, cfg) {
 
     const playerPage = buildUrl(
       cfg.serverOrigin,
-      `/?play=${encodeURIComponent(videoId)}&autoplay=1`
+      `/video/${encodeURIComponent(videoId)}`
     );
     await chrome.tabs.update(tabId, { url: playerPage });
     return true;
@@ -324,7 +324,8 @@ async function startDownloadFlow(tabId, tabUrl, opts = {}) {
       return { ok: false, reason: "post_failed", status: res.status };
     }
 
-    await setBadge(tabId, "DL", "#FFD000");
+    const queued = data?.started === false;
+    await setBadge(tabId, queued ? "Q" : "DL", queued ? "#F0A000" : "#FFD000");
 
     if (opts.notifyStarted) {
       await notifyDownloadStarted(
@@ -335,7 +336,7 @@ async function startDownloadFlow(tabId, tabUrl, opts = {}) {
       );
     }
 
-    downloadPollByTab.set(tabId, { videoId: state.videoId, serverOrigin });
+    downloadPollByTab.set(tabId, { videoId: state.videoId, serverOrigin, queueId: data?.queue_id || null });
     chrome.alarms.create(`poll_${tabId}`, { periodInMinutes: 0.05 });
 
     return {
@@ -398,12 +399,28 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
   }
 
   const { videoId, serverOrigin } = info;
-  const statusUrl = buildUrl(serverOrigin, `/api/youtube/status/${encodeURIComponent(videoId)}`);
 
   try {
     const { timeoutMs } = await getConfig();
-    const res = await fetchWithTimeout(statusUrl, { method: "GET" }, timeoutMs);
-    const data = await safeJson(res);
+    let data;
+    if (info.queueId) {
+      const queueRes = await fetchWithTimeout(buildUrl(serverOrigin, "/api/queue"), { method: "GET" }, timeoutMs);
+      const queue = await safeJson(queueRes);
+      const item = (queue.items || []).find(row => Number(row.id) === Number(info.queueId));
+      if (item?.status === "pending" || item?.status === "paused") {
+        await setBadge(tabId, "Q", "#F0A000");
+        return;
+      }
+      if (item?.status === "failed" || item?.status === "cancelled") data = { downloading: false, result: "failed" };
+      else if (item?.status === "running") {
+        const res = await fetchWithTimeout(buildUrl(serverOrigin, `/api/youtube/status/${encodeURIComponent(videoId)}`), { method: "GET" }, timeoutMs);
+        data = await safeJson(res);
+      } else if (!item) return;
+      else data = { downloading: false, result: "completed" };
+    } else {
+      const res = await fetchWithTimeout(buildUrl(serverOrigin, `/api/youtube/status/${encodeURIComponent(videoId)}`), { method: "GET" }, timeoutMs);
+      data = await safeJson(res);
+    }
 
     if (data?.downloading === true) {
       await setBadge(tabId, "DL", "#FFD000");
@@ -415,7 +432,7 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
     chrome.alarms.clear(alarm.name);
 
     // Notify user download finished
-    await notifyDownloadFinished(videoId, true);
+    await notifyDownloadFinished(videoId, data?.result !== "failed");
 
     const tab = await chrome.tabs.get(tabId);
     if (tab?.url) {

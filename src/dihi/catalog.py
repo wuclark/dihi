@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+import time
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -35,6 +36,27 @@ CREATE TABLE IF NOT EXISTS download_attempts (
 CREATE INDEX IF NOT EXISTS idx_attempts_video ON download_attempts(video_id, finished_at);
 CREATE TABLE IF NOT EXISTS archive_entries (
   video_id TEXT PRIMARY KEY, status TEXT NOT NULL, checked_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS playlists (
+  playlist_id TEXT PRIMARY KEY, title TEXT NOT NULL, webpage_url TEXT,
+  updated_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS playlist_videos (
+  playlist_id TEXT NOT NULL, video_id TEXT NOT NULL, playlist_index INTEGER,
+  title TEXT, video_url TEXT, PRIMARY KEY (playlist_id, video_id),
+  FOREIGN KEY (playlist_id) REFERENCES playlists(playlist_id)
+);
+CREATE INDEX IF NOT EXISTS idx_playlist_videos_video ON playlist_videos(video_id);
+CREATE TABLE IF NOT EXISTS download_queue (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, target TEXT NOT NULL, kind TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending', created_at REAL NOT NULL,
+  scheduled_at REAL, started_at REAL, finished_at REAL, error TEXT,
+  cookies_browser TEXT,
+  UNIQUE(target, kind, status)
+);
+CREATE INDEX IF NOT EXISTS idx_download_queue_ready ON download_queue(status, scheduled_at, created_at);
+CREATE TABLE IF NOT EXISTS app_settings (
+  key TEXT PRIMARY KEY, value TEXT NOT NULL
 );
 """
 
@@ -114,6 +136,7 @@ def refresh(merged_dir: Path | list[Path], database: Path, archive: Path | None 
         for root in roots:
           # ``merged/`` and legacy ``data/merged/`` share a basename.
           source_root = "legacy" if root.as_posix().rstrip("/").endswith("data/merged") else root.name
+          seen_video_ids: set[str] = set()
           for channel_dir in sorted(root.iterdir()) if root.is_dir() else []:
             if not channel_dir.is_dir():
                 continue
@@ -121,7 +144,10 @@ def refresh(merged_dir: Path | list[Path], database: Path, archive: Path | None 
                 if not video_dir.is_dir():
                     continue
                 info = _info(video_dir)
+                if info.get("_type") == "playlist":
+                    continue
                 video_id = video_dir.name
+                seen_video_ids.add(video_id)
                 uploader = info.get("uploader") or info.get("channel") or channel_dir.name
                 artist = info.get("artist") or uploader
                 album = info.get("album") or info.get("playlist_title") or "Uncategorized"
@@ -144,7 +170,40 @@ def refresh(merged_dir: Path | list[Path], database: Path, archive: Path | None 
                 db.execute("DELETE FROM video_tags WHERE video_id = ?", (video_id,))
                 for tag in info.get("tags") or []:
                     db.execute("INSERT OR IGNORE INTO video_tags VALUES (?, ?)", (video_id, str(tag)))
+                playlist_id = str(info.get("playlist_id") or "").strip()
+                if playlist_id:
+                    playlist_title = str(info.get("playlist_title") or playlist_id).strip()
+                    playlist_url = str(
+                        info.get("playlist_webpage_url")
+                        or f"https://www.youtube.com/playlist?list={playlist_id}"
+                    )
+                    db.execute(
+                        """INSERT INTO playlists(playlist_id,title,webpage_url,updated_at)
+                           VALUES(?,?,?,strftime('%s','now'))
+                           ON CONFLICT(playlist_id) DO UPDATE SET
+                             title=excluded.title, webpage_url=excluded.webpage_url,
+                             updated_at=excluded.updated_at""",
+                        (playlist_id, playlist_title, playlist_url),
+                    )
+                    db.execute(
+                        """INSERT INTO playlist_videos
+                           (playlist_id,video_id,playlist_index,title,video_url)
+                           VALUES(?,?,?,?,?)
+                           ON CONFLICT(playlist_id,video_id) DO UPDATE SET
+                             playlist_index=excluded.playlist_index,
+                             title=excluded.title, video_url=excluded.video_url""",
+                        (playlist_id, video_id, info.get("playlist_index"),
+                         info.get("title") or video_id, info.get("webpage_url")),
+                    )
                 count += 1
+          if seen_video_ids:
+              placeholders = ",".join("?" for _ in seen_video_ids)
+              db.execute(
+                  f"DELETE FROM videos WHERE source_root = ? AND video_id NOT IN ({placeholders})",
+                  (source_root, *sorted(seen_video_ids)),
+              )
+          else:
+              db.execute("DELETE FROM videos WHERE source_root = ?", (source_root,))
         if archive and Path(archive).is_file():
             db.execute("DELETE FROM archive_entries")
             rows = db.execute("SELECT video_id, files_json FROM videos").fetchall()
@@ -174,3 +233,182 @@ def record_attempt(database: Path, video_id: str, status: str, reason: str | Non
         db.execute("INSERT INTO download_attempts(video_id,status,reason,raw_error,retryable,started_at,finished_at) VALUES (?,?,?,?,?,?,?)",
                    (video_id, status, reason, raw_error, int(retryable), started_at, finished_at))
         db.commit()
+
+
+def _ensure_queue_columns(db: sqlite3.Connection) -> None:
+    columns = {row[1] for row in db.execute("PRAGMA table_info(download_queue)")}
+    if "cookies_browser" not in columns:
+        db.execute("ALTER TABLE download_queue ADD COLUMN cookies_browser TEXT")
+
+
+def playlists(database: Path) -> list[dict[str, Any]]:
+    """Return known playlists and their indexed video counts."""
+    with sqlite3.connect(database) as db:
+        db.executescript(SCHEMA)
+        _ensure_queue_columns(db)
+        rows = db.execute(
+            """SELECT p.playlist_id, p.title, p.webpage_url,
+                      COUNT(pv.video_id), p.updated_at
+                 FROM playlists p LEFT JOIN playlist_videos pv
+                   ON pv.playlist_id = p.playlist_id
+                GROUP BY p.playlist_id ORDER BY lower(p.title), p.playlist_id"""
+        ).fetchall()
+    return [
+        {"playlist_id": r[0], "title": r[1], "webpage_url": r[2], "video_count": r[3], "updated_at": r[4]}
+        for r in rows
+    ]
+
+
+def playlist_video_ids(database: Path, playlist_id: str) -> list[dict[str, Any]]:
+    """Return playlist members in playlist order."""
+    with sqlite3.connect(database) as db:
+        db.executescript(SCHEMA)
+        _ensure_queue_columns(db)
+        rows = db.execute(
+            """SELECT video_id, playlist_index, title, video_url
+                 FROM playlist_videos WHERE playlist_id = ?
+                ORDER BY playlist_index IS NULL, playlist_index, video_id""",
+            (playlist_id,),
+        ).fetchall()
+    return [{"video_id": r[0], "playlist_index": r[1], "title": r[2], "video_url": r[3]} for r in rows]
+
+
+def record_playlist_membership(database: Path, playlist_id: str, title: str,
+                               webpage_url: str | None, members: list[dict[str, Any]]) -> None:
+    """Persist a playlist and its entries independently of video downloads."""
+    with sqlite3.connect(database) as db:
+        db.executescript(SCHEMA)
+        db.execute(
+            """INSERT INTO playlists(playlist_id,title,webpage_url,updated_at)
+               VALUES(?,?,?,?) ON CONFLICT(playlist_id) DO UPDATE SET
+               title=excluded.title, webpage_url=excluded.webpage_url,
+               updated_at=excluded.updated_at""",
+            (playlist_id, title or playlist_id, webpage_url, time.time()),
+        )
+        for member in members:
+            video_id = str(member.get("video_id") or "").strip()
+            if not video_id:
+                continue
+            db.execute(
+                """INSERT INTO playlist_videos(playlist_id,video_id,playlist_index,title,video_url)
+                   VALUES(?,?,?,?,?) ON CONFLICT(playlist_id,video_id) DO UPDATE SET
+                   playlist_index=excluded.playlist_index, title=excluded.title,
+                   video_url=excluded.video_url""",
+                (playlist_id, video_id, member.get("playlist_index"),
+                 member.get("title") or video_id, member.get("video_url")),
+            )
+        db.commit()
+
+
+def queue_add(database: Path, target: str, kind: str, scheduled_at: float | None = None,
+              cookies_browser: str | None = None, status: str = "pending") -> int:
+    """Persist a pending queue item and return its id."""
+    now = time.time()
+    with sqlite3.connect(database) as db:
+        db.executescript(SCHEMA)
+        _ensure_queue_columns(db)
+        db.execute(
+            """INSERT INTO download_queue(target,kind,status,created_at,scheduled_at,cookies_browser)
+               VALUES(?, ?, ?, ?, ?, ?)""",
+            (target, kind, status, now, scheduled_at, cookies_browser),
+        )
+        item_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
+        db.commit()
+    return int(item_id)
+
+
+def queue_items(database: Path, limit: int = 500) -> list[dict[str, Any]]:
+    with sqlite3.connect(database) as db:
+        db.executescript(SCHEMA)
+        _ensure_queue_columns(db)
+        rows = db.execute(
+            """SELECT id,target,kind,status,created_at,scheduled_at,started_at,finished_at,error,cookies_browser
+                 FROM download_queue ORDER BY CASE status WHEN 'running' THEN 0 WHEN 'pending' THEN 1 ELSE 2 END,
+                 COALESCE(scheduled_at, created_at), id LIMIT ?""",
+            (max(1, min(int(limit), 2000)),),
+        ).fetchall()
+    keys = ("id", "target", "kind", "status", "created_at", "scheduled_at", "started_at", "finished_at", "error", "cookies_browser")
+    return [dict(zip(keys, row)) for row in rows]
+
+
+def queue_set_status(database: Path, item_id: int, status: str, **fields: Any) -> None:
+    allowed = {"scheduled_at", "started_at", "finished_at", "error"}
+    updates = {key: value for key, value in fields.items() if key in allowed}
+    updates["status"] = status
+    assignments = ", ".join(f"{key} = ?" for key in updates)
+    with sqlite3.connect(database) as db:
+        db.executescript(SCHEMA)
+        _ensure_queue_columns(db)
+        db.execute(f"UPDATE download_queue SET {assignments} WHERE id = ?", (*updates.values(), item_id))
+        db.commit()
+
+
+def setting(database: Path, key: str, default: str) -> str:
+    with sqlite3.connect(database) as db:
+        db.executescript(SCHEMA)
+        row = db.execute("SELECT value FROM app_settings WHERE key = ?", (key,)).fetchone()
+    return row[0] if row else default
+
+
+def set_setting(database: Path, key: str, value: str) -> None:
+    with sqlite3.connect(database) as db:
+        db.executescript(SCHEMA)
+        db.execute("INSERT OR REPLACE INTO app_settings(key,value) VALUES (?,?)", (key, value))
+        db.commit()
+
+
+def download_attempts(database: Path, limit: int = 500) -> list[dict[str, Any]]:
+    """Return the durable download attempt history, newest first."""
+    database.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(database) as db:
+        db.executescript(SCHEMA)
+        rows = db.execute(
+            """SELECT a.id, a.video_id, a.status, a.reason, a.raw_error,
+                      a.retryable, a.started_at, a.finished_at,
+                      COALESCE(v.title, a.video_id)
+                 FROM download_attempts AS a
+                 LEFT JOIN (
+                   SELECT video_id, MAX(title) AS title
+                     FROM videos GROUP BY video_id
+                 ) AS v ON v.video_id = a.video_id
+                ORDER BY COALESCE(a.finished_at, a.started_at) DESC, a.id DESC
+                LIMIT ?""",
+            (max(1, min(int(limit), 2000)),),
+        ).fetchall()
+        archived = db.execute(
+            """SELECT v.video_id, COALESCE(MAX(v.title), v.video_id), MAX(v.scanned_at)
+                 FROM videos AS v
+                GROUP BY v.video_id"""
+        ).fetchall()
+    attempts = [
+        {
+            "attempt_id": row[0],
+            "video_id": row[1],
+            "status": row[2],
+            "reason": row[3],
+            "error": row[4],
+            "retryable": bool(row[5]),
+            "started_at": row[6],
+            "finished_at": row[7],
+            "title": row[8],
+        }
+        for row in rows
+    ]
+    known = {item["video_id"] for item in attempts}
+    attempts.extend(
+        {
+            "attempt_id": f"archive:{video_id}",
+            "video_id": video_id,
+            "status": "completed",
+            "reason": "archived media",
+            "error": "",
+            "retryable": False,
+            "started_at": scanned_at,
+            "finished_at": scanned_at,
+            "title": title,
+        }
+        for video_id, title, scanned_at in archived
+        if video_id not in known
+    )
+    attempts.sort(key=lambda item: (item["finished_at"] or item["started_at"], str(item["attempt_id"])), reverse=True)
+    return attempts[: max(1, min(int(limit), 2000))]

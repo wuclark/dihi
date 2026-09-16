@@ -277,10 +277,7 @@ select {
     <button class="hbtn" id="play-all-btn" type="button" onclick="playAll()">▶ Play All</button>
     <a class="hbtn" href="/downloads">Downloads</a>
     <a class="hbtn" href="/catalog">Catalog</a>
-    <a class="hbtn" href="/tags">Tags</a>
-    <a class="hbtn" href="/wordcloud">Word cloud</a>
-    <a class="hbtn" href="/tagcloud">Tag cloud</a>
-    <a class="hbtn" href="/extension.zip">Edge extension</a>
+    <a class="hbtn" href="/tools">Tools</a>
     <select id="sort" aria-label="Sort order">
       <option value="date-desc">Newest first</option>
       <option value="date-asc">Oldest first</option>
@@ -291,17 +288,6 @@ select {
     <span id="count"></span>
   </div>
 </header>
-
-<div id="dl-bar">
-  <div class="dl-row">
-    <input id="dl-input" type="text"
-           placeholder="YouTube URL, video ID, or playlist ID…"
-           autocomplete="off" spellcheck="false" aria-label="YouTube URL or ID">
-    <button id="dl-btn" onclick="submitDownload()">+ Add</button>
-  </div>
-  <div id="dl-queue-status" class="empty" aria-live="polite">Queue Empty</div>
-  <ul id="dl-queue" aria-live="polite" aria-label="Download queue"></ul>
-</div>
 
 <div id="player-wrap" role="region" aria-label="Media player">
   <div class="player-inner">
@@ -348,6 +334,7 @@ const S = {
   mode: 'video',
   playAll: false,
   renderLimit: 96,
+  wordVideoIds: null,
 };
 const GRID_BATCH = 96;
 const VIDEO_ID_RE = /^[A-Za-z0-9_-]{11}$/;
@@ -358,16 +345,28 @@ const $ = id => document.getElementById(id);
 
 async function fetchLibrary() {
   try {
-    const r = await fetch('/api/media/library');
+    const params = new URLSearchParams(location.search);
+    const playlistId = params.get('playlist');
+    const r = await fetch(playlistId
+      ? `/api/media/playlists/${encodeURIComponent(playlistId)}`
+      : '/api/media/library');
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const data = await r.json();
-    S.videos = data.videos || [];
+    S.videos = playlistId
+      ? (data.videos || []).map(item => item.video ? {...item.video, title: item.title || item.video.title} : null).filter(Boolean)
+      : data.videos || [];
+    const word = params.get('word');
+    if (word) {
+      const wr = await fetch('/api/media/wordcloud/videos?word=' + encodeURIComponent(word));
+      S.wordVideoIds = new Set((await wr.json()).video_ids || []);
+    }
   } catch (e) {
     $('grid').innerHTML = `<div id="status-msg">Failed to load library: ${esc(e.message)}</div>`;
     return;
   }
   applyFilters();
   openInitialVideoFromUrl();
+  if (playlistId && params.get('playall') === '1') playAll();
 }
 
 // ── Filter + sort ──────────────────────────────────────────────────────────
@@ -377,6 +376,7 @@ function applyFilters() {
   const sort = $('sort').value;
 
   let list = S.videos;
+  if (S.wordVideoIds) list = list.filter(v => S.wordVideoIds.has(v.video_id));
   if (q) {
     list = list.filter(v =>
       v.title.toLowerCase().includes(q) ||
@@ -853,6 +853,7 @@ function upsertDlItem(entry) {
   const newEl = renderDlItem(entry);
   if (existing) existing.replaceWith(newEl);
   else $('dl-queue').prepend(newEl);
+  requestAnimationFrame(() => newEl.querySelectorAll('.dl-log').forEach(log => { log.scrollTop = log.scrollHeight; }));
   updateDlQueueStatus();
 }
 
@@ -917,7 +918,9 @@ async function submitDownload() {
     }
     entry.state = 'queued';
     upsertDlItem(entry);
-    parsed.type === 'playlist' ? startPollPlaylist(entry) : startPollVideo(entry);
+    if (data.started) {
+      parsed.type === 'playlist' ? startPollPlaylist(entry) : startPollVideo(entry);
+    }
   } catch (e) {
     entry.state = 'error';
     entry.label = e.message;
@@ -965,7 +968,23 @@ function startPollPlaylist(entry) {
   }, 5000);
 }
 
-$('dl-input').addEventListener('keydown', e => { if (e.key === 'Enter') submitDownload(); });
+async function restoreDownloadQueue() {
+  try {
+    const data = await (await fetch('/api/downloads/status', {cache: 'no-store'})).json();
+    for (const item of [...(data.active || []), ...(data.recent || [])]) {
+      const entry = {
+        ...item,
+        type: item.kind || 'video',
+        label: item.kind === 'playlist' ? `Playlist ${item.id}` : item.id,
+        state: item.active ? 'running' : item.status === 'completed' ? 'done' : 'failed',
+      };
+      upsertDlItem(entry);
+      if (item.active) {
+        item.kind === 'playlist' ? startPollPlaylist(entry) : startPollVideo(entry);
+      }
+    }
+  } catch {}
+}
 
 $('vpanel').addEventListener('click', e => {
   const vp = e.currentTarget;

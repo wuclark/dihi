@@ -1,0 +1,43 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DIHI Playlists</title>
+<style>
+  :root { color-scheme:dark; --bg:#0f0f0f; --surface:#1b1b1b; --border:#3b3b3b; --muted:#aaa; --accent:#7cf; }
+  * { box-sizing:border-box; } body { margin:0; background:var(--bg); color:#eee; font:14px system-ui,sans-serif; }
+  main { max-width:1100px; margin:auto; padding:24px; } h1 { margin-top:0; }
+  .playlist { border:1px solid var(--border); border-radius:9px; background:var(--surface); margin:14px 0; padding:16px; }
+  .playlist-head { display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap; }
+  h2 { margin:0; font-size:1.05rem; } a { color:var(--accent); } .muted { color:var(--muted); }
+  .actions { display:flex; gap:8px; flex-wrap:wrap; } button, .button { background:#272727; border:1px solid var(--border); border-radius:6px; color:#eee; padding:7px 10px; text-decoration:none; cursor:pointer; }
+  .button.primary { color:#000; background:#7cf; border-color:#7cf; } .videos { margin-top:12px; display:grid; gap:5px; max-height:300px; overflow:auto; border-top:1px solid var(--border); padding-top:10px; }
+  .video { display:grid; grid-template-columns:44px minmax(0,1fr) 95px; gap:8px; } .video a { overflow-wrap:anywhere; }
+  .empty { color:var(--muted); padding:20px 0; }
+</style>
+{% include "_header.html" %}
+<main><h1>Downloaded playlists</h1><p class="muted">Playlists are built from playlist metadata saved with each downloaded video.</p><div id="list"><div class="empty">Loading playlists…</div></div></main>
+<script>
+'use strict';
+const esc = x => String(x ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const list = document.getElementById('list');
+async function load() {
+  try {
+    const response = await fetch('/api/media/playlists', {cache:'no-store'});
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const playlists = (await response.json()).playlists || [];
+    if (!playlists.length) { list.innerHTML = '<div class="empty">No downloaded playlist metadata found yet.</div>'; return; }
+    list.innerHTML = playlists.map(p => `<article class="playlist" data-id="${esc(p.playlist_id)}"><div class="playlist-head"><div><h2>${esc(p.title)}</h2><div class="muted">${p.video_count} video${p.video_count === 1 ? '' : 's'}</div></div><div class="actions"><a class="button primary" href="/?playlist=${encodeURIComponent(p.playlist_id)}&playall=1&autoplay=1">▶ Play all</a><a class="button" href="/api/media/playlists/${encodeURIComponent(p.playlist_id)}.m3u?mode=video">VLC video</a><a class="button" href="/api/media/playlists/${encodeURIComponent(p.playlist_id)}.m3u?mode=audio">VLC audio only</a><a class="button" href="${esc(p.webpage_url)}" target="_blank" rel="noopener">YouTube</a></div></div><div class="videos"><div class="muted">Loading videos…</div></div></article>`).join('');
+    await Promise.all([...document.querySelectorAll('.playlist')].map(loadVideos));
+  } catch (error) { list.innerHTML = `<div class="empty">Could not load playlists: ${esc(error.message)}</div>`; }
+}
+async function loadVideos(article) {
+  const id = article.dataset.id;
+  const box = article.querySelector('.videos');
+  try {
+    const data = await (await fetch(`/api/media/playlists/${encodeURIComponent(id)}`, {cache:'no-store'})).json();
+    const videos = data.videos || [];
+    box.innerHTML = videos.length ? videos.map((item, i) => `<div class="video"><span class="muted">${item.playlist_index || i + 1}</span><a href="/video/${encodeURIComponent(item.video_id)}">${esc(item.title || item.video?.title || item.video_id)}</a><span class="muted">${item.video ? (item.video.files.video ? 'video' : item.video.files.audio ? 'audio' : 'no media') : 'not local'}</span></div>`).join('') : '<div class="muted">No indexed videos in this playlist.</div>';
+  } catch (error) { box.innerHTML = `<div class="muted">Could not load videos: ${esc(error.message)}</div>`; }
+}
+load();
+</script>

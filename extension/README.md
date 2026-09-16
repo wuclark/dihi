@@ -4,7 +4,7 @@ Checks the current YouTube video ID against:
 
 - `GET /api/youtube/<id>` → `{ "result": true|false }`
 
-When a video is already archived, the extension can resolve the local server copy and open the server UI at `/?play=<id>&autoplay=1`:
+When a video is already archived, the extension can resolve the local server copy and open the server UI at `/video/<id>`:
 
 - `GET /api/media/resolve/<id>` → `{ "result": true, "video": { "player_url": "/media/..." } }`
 
@@ -19,6 +19,8 @@ While downloading, the badge shows **DL** and it polls:
 - `GET /api/youtube/status/<id>` → `{ "downloading": true|false }`
 
 When the server reports `downloading:false`, the extension shows a **notification**.
+
+If the server default download mode is queue-only, the extension accepts the `queue_id` returned by `POST /api/youtube/get/<id>`, shows a **Q** badge while the item is pending, and follows `/api/queue` until it starts or finishes.
 
 ## Install (Developer Mode)
 

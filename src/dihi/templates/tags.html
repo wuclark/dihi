@@ -41,6 +41,8 @@ header {
 }
 .hbtn:hover { border-color: var(--accent); }
 #count { margin-left: auto; color: var(--muted); font-size: 0.82rem; }
+.tag-toolbar { max-width: 1400px; margin: 0 auto; padding: 12px 24px 0; display: flex; align-items: center; gap: 10px; }
+.tag-toolbar #tag-search { flex: 1; max-width: 520px; }
 main { max-width: 1400px; margin: 0 auto; padding: 22px 24px 32px; }
 .layout {
   display: grid; grid-template-columns: minmax(240px, 360px) minmax(0, 1fr);
@@ -96,14 +98,9 @@ main { max-width: 1400px; margin: 0 auto; padding: 22px 24px 32px; }
 </style>
 </head>
 <body>
-<header>
-  <a class="logo" href="/">DIHI</a>
-  <input id="tag-search" type="search" placeholder="Search tags or videos..." autocomplete="off">
-  <button class="hbtn" type="button" onclick="clearTags()">Clear</button>
-  <a class="hbtn" href="/downloads">Downloads</a>
-  <a class="hbtn" href="/">Library</a>
-  <span id="count"></span>
-</header>
+{% include "_header.html" %}
+
+<div class="tag-toolbar"><input id="tag-search" type="search" placeholder="Search tags or videos…" autocomplete="off" aria-label="Search tags"><button class="hbtn" type="button" onclick="clearTags()">Clear</button><span id="count"></span></div>
 
 <main>
   <div class="layout">

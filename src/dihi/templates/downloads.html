@@ -55,6 +55,8 @@ h2 { font-size: 0.95rem; font-weight: 650; }
   border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden;
   background: var(--surface);
 }
+.history-table { max-height: 440px; overflow: auto; }
+.history-table .row:first-child { position: sticky; top: 0; z-index: 1; }
 .row {
   display: grid; grid-template-columns: 92px minmax(140px, 1fr) 122px 120px 150px;
   gap: 12px; align-items: center; padding: 10px 12px; border-top: 1px solid var(--border);
@@ -87,6 +89,11 @@ h2 { font-size: 0.95rem; font-weight: 650; }
 .file-progress-row { display: grid; grid-template-columns: minmax(120px, 1fr) 58px; gap: 6px; align-items: center; font-size: .72rem; color: var(--muted); }
 .file-progress-row .progress-bar { grid-column: 1 / -1; margin: 0; }
 .progress-log { margin-top: 5px; max-height: 120px; overflow: auto; color: var(--muted); font: .72rem/1.4 ui-monospace, monospace; white-space: pre-wrap; }
+.playlist-items { display: grid; gap: 3px; margin: 7px 0; padding: 7px 9px; border-left: 2px solid var(--accent); background: var(--surface2); }
+.playlist-item { display: grid; grid-template-columns: 48px minmax(0, 1fr) 55px; gap: 7px; align-items: center; font-size: .75rem; }
+.playlist-item a { color: var(--accent); overflow-wrap: anywhere; text-decoration: none; }
+.playlist-file-list { grid-column: 2 / -1; display: grid; gap: 2px; color: var(--muted); font-size: .7rem; padding-left: 8px; border-left: 1px solid var(--border); }
+.playlist-file { display: flex; justify-content: space-between; gap: 8px; overflow-wrap: anywhere; }
 .empty {
   border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface);
   color: var(--muted); padding: 26px 18px; text-align: center;
@@ -102,15 +109,7 @@ h2 { font-size: 0.95rem; font-weight: 650; }
 </style>
 </head>
 <body>
-<header>
-  <a class="logo" href="/">DIHI</a>
-  <a class="hbtn" href="/">Library</a>
-  <a class="hbtn" href="/tags">Tags</a>
-  <a class="hbtn" href="/tools">Tools</a>
-  <a class="hbtn" href="/status">Status</a>
-  <button class="hbtn" type="button" onclick="loadStatus()">Refresh</button>
-  <span id="summary">Loading...</span>
-</header>
+{% include "_header.html" %}
 
 <main>
   <div class="section-head">
@@ -146,6 +145,10 @@ h2 { font-size: 0.95rem; font-weight: 650; }
     </div>
     <div id="recent"></div>
   </section>
+  <section>
+    <div class="section-head"><h2>Download history</h2><span class="muted">Completed and failed attempts</span></div>
+    <div id="history"></div>
+  </section>
 </main>
 
 <script>
@@ -161,14 +164,13 @@ async function loadStatus() {
     const data = await r.json();
     render(data);
   } catch (e) {
-    $('summary').textContent = `Failed to load downloads: ${e.message}`;
+    $('updated').textContent = `Failed to load downloads: ${e.message}`;
   }
 }
 
 function render(data) {
   const counts = data.counts || {};
   const queue = data.queue || {};
-  $('summary').textContent = `${counts.active || 0} active, ${counts.recent || 0} recent`;
   $('updated').textContent = `Updated ${new Date().toLocaleTimeString()}`;
   $('queue-output').textContent = queue.empty ? 'Queue Empty' : `${queue.remaining_videos || 0} video${queue.remaining_videos === 1 ? '' : 's'} remaining in queue`;
   $('queue-output').className = `queue-value ${queue.empty ? 'empty' : 'busy'}`;
@@ -179,11 +181,29 @@ function render(data) {
   $('recent-count').textContent = `${counts.recent || 0} kept for ${data.result_ttl_seconds || 0}s`;
   renderTable('active', data.active || [], 'No downloads are currently running.');
     renderTable('recent', data.recent || [], 'No recent download results.');
+    scrollProgressLogs();
     loadFailures();
+    loadHistory();
     loadSystemStatus();
 }
 
-async function loadSystemStatus() { try { const d=(await (await fetch('/api/system/status',{cache:'no-store'})).json()).result; const c=d.cookies,gb=n=>(n/1073741824).toFixed(1); $('system-status').textContent=`Disk: ${gb(d.disk.free_bytes)} GiB free of ${gb(d.disk.total_bytes)} GiB (${d.disk.free_percent}%). Cookies: ${c.present?'file found':'no file'}; ${c.netscape_format?'Netscape format':'invalid/unknown format'}; ${c.count} entries, ${c.youtube_domains.length} YouTube/Google domains, ${c.expired} expired.`; } catch(e){$('system-status').textContent='Status unavailable';} }
+async function loadHistory() {
+  const box = $('history');
+  try {
+    const data = await (await fetch('/api/media/download-history?limit=500', {cache: 'no-store'})).json();
+    const rows = data.attempts || [];
+    if (!rows.length) { box.innerHTML = '<div class="empty">No persistent download history yet.</div>'; return; }
+    box.innerHTML = `<div class="table history-table"><div class="row head"><div>Video ID</div><div>Title</div><div>Status</div><div>Finished</div><div>Action</div></div>${rows.map(h => `<div class="row"><div class="id">${esc(h.video_id)}</div><div>${esc(h.title || '')}</div><div><span class="status ${esc(h.status)}">${esc(h.status)}</span>${h.reason ? `<div class="muted">${esc(h.reason)}</div>` : ''}</div><div class="muted">${formatTime(h.finished_at || h.started_at)}</div><div class="links"><a href="/video/${encodeURIComponent(h.video_id)}">${h.status === 'completed' ? 'Open video' : 'Library'}</a>${h.status === 'failed' ? `<button class="retry-download" data-history-retry="${esc(h.video_id)}">Retry</button>` : ''}</div></div>`).join('')}</div>`;
+    box.querySelectorAll('[data-history-retry]').forEach(b => b.onclick = async () => {
+      b.disabled = true;
+      await fetch(`/api/youtube/retry/${encodeURIComponent(b.dataset.historyRetry)}`, {method: 'POST'});
+      loadHistory();
+      loadStatus();
+    });
+  } catch (e) { box.innerHTML = `<div class="empty">Failed to load history: ${esc(e.message)}</div>`; }
+}
+
+async function loadSystemStatus() { try { const d=await (await fetch('/api/system/status',{cache:'no-store'})).json(); const c=d.cookies,gb=n=>(n/1073741824).toFixed(1); $('system-status').textContent=`Disk: ${gb(d.disk.free_bytes)} GiB free of ${gb(d.disk.total_bytes)} GiB (${d.disk.free_percent}%). Cookies: ${c.present?'file found':'no file'}; ${c.netscape_format?'Netscape format':'invalid/unknown format'}; ${c.count} entries, ${c.youtube_domains.length} YouTube/Google domains, ${c.expired} expired.`; } catch(e){$('system-status').textContent='Status unavailable';} }
 
 async function loadFailures() {
   const box = $('failures');
@@ -219,8 +239,8 @@ function renderRow(item) {
   const progress = item.active && (item.phase || Number.isFinite(percent))
     ? `<div class="progress-detail">
          <div class="progress-bar"><div class="progress-fill" style="width:${Number.isFinite(percent) ? Math.max(0, Math.min(100, percent)) : 8}%"></div></div>
-         <div class="progress-file">Overall: ${Number.isFinite(percent) ? `${percent}%` : 'working'} · ${item.files_completed || 0} of ${item.files_total || 0} files complete</div>
-         ${renderFiles(item.files)}
+         <div class="progress-file">${item.kind === 'playlist' && item.playlist_index ? `Playlist: ${item.playlist_index}/${item.playlist_total || '?'} · ` : ''}Overall: ${Number.isFinite(percent) ? `${percent}%` : 'working'} · ${item.files_completed || 0} of ${item.files_total || 0} files complete</div>
+         ${item.kind === 'playlist' ? renderPlaylistItems(item.playlist_items) : renderFiles(item.files)}
          ${item.logs?.length ? `<details open><summary class="muted">yt-dlp output (${item.logs.length} lines)</summary><pre class="progress-log">${esc(item.logs.join('\\n'))}</pre></details>` : ''}
        </div>` : '';
   return `<div class="row">
@@ -241,6 +261,28 @@ function renderFiles(files) {
   }).join('')}</div>`;
 }
 
+function scrollProgressLogs() {
+  document.querySelectorAll('.progress-log').forEach(log => {
+    log.scrollTop = log.scrollHeight;
+  });
+}
+
+function renderPlaylistItems(items) {
+  const rows = Object.values(items || {}).sort((a, b) => (a.index || 0) - (b.index || 0));
+  if (!rows.length) return '';
+  return `<div class="playlist-items">${rows.map(item => {
+    const index = item.index ? `${item.index}/${item.total || '?'}` : '';
+    const pct = Number(item.percent);
+    const state = item.status === 'completed' ? '✓' : Number.isFinite(pct) ? `${pct}%` : 'queued';
+    const files = Object.values(item.files || {});
+    const fileList = files.length ? `<div class="playlist-file-list">${files.map(file => {
+      const pct = Number(file.percent);
+      return `<div class="playlist-file"><span>${esc(file.filename || 'current')}</span><span>${file.status === 'completed' ? '✓' : Number.isFinite(pct) ? `${pct}%` : 'queued'}</span></div>`;
+    }).join('')}</div>` : '';
+    return `<div class="playlist-item"><span>${esc(index)}</span><a href="/video/${encodeURIComponent(item.id)}">${esc(item.title || item.id)}</a><span>${state}</span>${fileList}</div>`;
+  }).join('')}</div>`;
+}
+
 function linksFor(item) {
   const id = encodeURIComponent(item.id || '');
   const youtubeUrl = item.kind === 'playlist'
@@ -250,7 +292,7 @@ function linksFor(item) {
     return `<button class="copy-url" data-copy-url="${youtubeUrl}">Copy YouTube URL</button>`;
   }
   const retry = item.status === 'failed' ? `<button class="retry-download" data-retry-id="${id}">Retry</button>` : '';
-  return `<button class="copy-url" data-copy-url="${youtubeUrl}">Copy YouTube URL</button><a href="/?play=${id}">Library</a>${retry}`;
+  return `<button class="copy-url" data-copy-url="${youtubeUrl}">Copy YouTube URL</button><a href="/video/${id}">Video</a>${retry}`;
 }
 
 document.addEventListener('click', async (event) => {
@@ -282,6 +324,10 @@ function fmtDuration(value) {
   const mins = minutes % 60;
   if (hours < 1) return `${minutes}m ${remaining}s`;
   return `${hours}h ${mins}m`;
+}
+
+function formatTime(value) {
+  return value ? new Date(Number(value) * 1000).toLocaleString() : '';
 }
 
 function esc(s) {

@@ -1,0 +1,45 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DIHI Downloaded history</title>
+<style>
+  :root { color-scheme: dark; --bg:#111; --surface:#1b1b1b; --border:#444; --muted:#aaa; --accent:#7cf; --ok:#5d7; --bad:#f77; }
+  * { box-sizing:border-box; } body { background:var(--bg); color:#eee; font:14px system-ui,sans-serif; margin:0; }
+  .wrap { max-width:1200px; margin:auto; padding:24px; } .muted { color:var(--muted); }
+  .history { border:1px solid var(--border); border-radius:8px; overflow:auto; max-height:65vh; }
+  .row { display:grid; grid-template-columns:145px minmax(180px,1fr) 110px 190px 150px; gap:12px; padding:11px; border-top:1px solid #333; align-items:center; min-width:760px; }
+  .row:first-child { border-top:0; } .head { position:sticky; top:0; z-index:1; background:#292929; color:var(--muted); font-size:12px; text-transform:uppercase; }
+  .id { font:13px ui-monospace,monospace; overflow-wrap:anywhere; } .status { font-weight:700; } .completed { color:var(--ok); } .failed { color:var(--bad); }
+  a { color:var(--accent); margin-right:12px; } button { background:none; border:1px solid #555; color:#fc6; border-radius:5px; padding:5px 8px; cursor:pointer; }
+  .empty { padding:28px; color:var(--muted); text-align:center; } h1 { margin-bottom:4px; } h2 { margin-top:28px; }
+  @media (max-width:800px) { .wrap { padding:14px; } }
+</style>
+{% include "_header.html" %}
+<main class="wrap">
+  <h1>Downloaded history</h1>
+  <p class="muted">Persistent completed and failed download attempts. Scroll inside the history panel.</p>
+  <h2>All attempts</h2>
+  <div id="history" class="history"><div class="empty">Loading…</div></div>
+</main>
+<script>
+'use strict';
+const esc = x => String(x ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const time = x => x ? new Date(Number(x) * 1000).toLocaleString() : '';
+const historyBox = document.getElementById('history');
+async function load() {
+  try {
+    const response = await fetch('/api/media/download-history?limit=1000', {cache:'no-store'});
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const attempts = (await response.json()).attempts || [];
+    if (!attempts.length) { historyBox.innerHTML = '<div class="empty">No download attempts have been recorded yet.</div>'; return; }
+    historyBox.innerHTML = `<div class="row head"><div>Video ID</div><div>Title</div><div>Status</div><div>Finished</div><div>Action</div></div>${attempts.map(row).join('')}`;
+  } catch (error) { historyBox.innerHTML = `<div class="empty">Could not load history: ${esc(error.message)}</div>`; }
+}
+function row(item) {
+  const failed = item.status === 'failed';
+  const action = failed ? `<button data-retry="${esc(item.video_id)}">Retry</button>` : `<a href="/video/${encodeURIComponent(item.video_id)}">Open video</a>`;
+  return `<div class="row"><div class="id">${esc(item.video_id)}</div><div>${esc(item.title || '')}</div><div><span class="status ${failed ? 'failed' : 'completed'}">${esc(item.status)}</span>${item.reason ? `<div class="muted">${esc(item.reason)}</div>` : ''}</div><div class="muted">${time(item.finished_at || item.started_at)}</div><div>${action}</div></div>`;
+}
+historyBox.addEventListener('click', async event => { const button = event.target.closest('[data-retry]'); if (!button) return; button.disabled = true; await fetch(`/api/youtube/retry/${encodeURIComponent(button.dataset.retry)}`, {method:'POST'}); load(); });
+load();
+</script>
