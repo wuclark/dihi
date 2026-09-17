@@ -330,6 +330,7 @@ class TestResolveMediaByVideoId:
         media = video_dir / "UCchannel01.dQw4w9WgXcQ.20240101.Title [dQw4w9WgXcQ].out.mkv"
         media.write_text("video")
         monkeypatch.setattr(app3, "MERGED_DIR", tmp_path.resolve())
+        monkeypatch.setattr(app3, "LEGACY_MERGED_DIR", (tmp_path / "nolegacy").resolve())
 
         result = _resolve_media_by_video_id("dQw4w9WgXcQ")
 
@@ -344,6 +345,7 @@ class TestResolveMediaByVideoId:
         audio = video_dir / "UCchannel01.abc12345678.20240101.Title [abc12345678].out.m4a"
         audio.write_text("audio")
         monkeypatch.setattr(app3, "MERGED_DIR", tmp_path.resolve())
+        monkeypatch.setattr(app3, "LEGACY_MERGED_DIR", (tmp_path / "nolegacy").resolve())
 
         result = _resolve_media_by_video_id("abc12345678")
 
@@ -352,6 +354,7 @@ class TestResolveMediaByVideoId:
 
     def test_missing_video_returns_none(self, monkeypatch, tmp_path):
         monkeypatch.setattr(app3, "MERGED_DIR", tmp_path.resolve())
+        monkeypatch.setattr(app3, "LEGACY_MERGED_DIR", (tmp_path / "nolegacy").resolve())
 
         assert _resolve_media_by_video_id("dQw4w9WgXcQ") is None
 
@@ -363,6 +366,7 @@ class TestResolveMediaByVideoId:
             '{"id": "dQw4w9WgXcQ", "title": "Title", "formats": [{"format_id": "399"}]}')
         (video_dir / "UCchannel01.dQw4w9WgXcQ.20240101.Title [dQw4w9WgXcQ].out.description").write_text("lyrics here")
         monkeypatch.setattr(app3, "MERGED_DIR", tmp_path.resolve())
+        monkeypatch.setattr(app3, "LEGACY_MERGED_DIR", (tmp_path / "nolegacy").resolve())
         monkeypatch.setattr(app3, "LEGACY_MERGED_DIR", (tmp_path / "nolegacy").resolve())
 
         result = _resolve_media_by_video_id("dQw4w9WgXcQ")
@@ -444,6 +448,7 @@ class TestScanTags:
             '{"id": "dQw4w9WgXcQ", "title": "Title", "tags": ["rock", "live"]}')
         monkeypatch.setattr(app3, "MERGED_DIR", merged.resolve())
         monkeypatch.setattr(app3, "LEGACY_MERGED_DIR", (tmp_path / "nolegacy").resolve())
+        monkeypatch.setattr(app3, "FALLBACK_DIR", (tmp_path / "nofallback").resolve())
 
         result = _scan_tags()
 
@@ -452,6 +457,54 @@ class TestScanTags:
             for entry in entries:
                 assert "details" not in entry
                 assert set(entry) == {"video_id", "channel_id", "title", "date", "files"}
+
+
+# ---------------------------------------------------------------------------
+# fallback visibility (bestfallback = lowest precedence, strict-only resolve)
+# ---------------------------------------------------------------------------
+
+class TestFallbackVisibility:
+    def _roots(self, monkeypatch, tmp_path):
+        merged = tmp_path / "merged"
+        legacy = tmp_path / "legacy"
+        fallback = tmp_path / "fallback"
+        for d in (merged, legacy, fallback):
+            d.mkdir()
+        monkeypatch.setattr(app3, "MERGED_DIR", merged.resolve())
+        monkeypatch.setattr(app3, "LEGACY_MERGED_DIR", legacy.resolve())
+        monkeypatch.setattr(app3, "FALLBACK_DIR", fallback.resolve())
+        return merged, fallback
+
+    @staticmethod
+    def _video(root, channel="UCchannel01", vid="kIll0-AyMa0"):
+        d = root / channel / vid
+        d.mkdir(parents=True)
+        (d / f"{channel}.{vid}.20240101.Title [{vid}].out.mkv").write_text("video")
+        return d
+
+    def test_fallback_only_video_is_visible(self, monkeypatch, tmp_path):
+        _, fallback = self._roots(monkeypatch, tmp_path)
+        self._video(fallback)
+
+        videos = {v["video_id"]: v for v in _scan_library_cached()}
+
+        assert videos["kIll0-AyMa0"]["files"]["video"].startswith("/media-fallback/")
+
+    def test_strict_shadows_fallback(self, monkeypatch, tmp_path):
+        merged, fallback = self._roots(monkeypatch, tmp_path)
+        self._video(merged)
+        self._video(fallback)
+
+        videos = {v["video_id"]: v for v in _scan_library_cached()}
+
+        assert videos["kIll0-AyMa0"]["files"]["video"].startswith("/media/")
+        assert sum(1 for v in videos if v == "kIll0-AyMa0") == 1
+
+    def test_resolve_stays_strict_only(self, monkeypatch, tmp_path):
+        _, fallback = self._roots(monkeypatch, tmp_path)
+        self._video(fallback)
+
+        assert _resolve_media_by_video_id("kIll0-AyMa0") is None
 
 
 # ---------------------------------------------------------------------------

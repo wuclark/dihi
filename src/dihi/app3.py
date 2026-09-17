@@ -859,7 +859,7 @@ def _library_fingerprint() -> tuple:
     those only happen mid-download while files are incomplete anyway.
     """
     parts = []
-    for root in (MERGED_DIR, LEGACY_MERGED_DIR):
+    for root in (MERGED_DIR, LEGACY_MERGED_DIR, FALLBACK_DIR):
         try:
             channels = sorted(root.iterdir()) if root.is_dir() else []
         except OSError:
@@ -903,10 +903,17 @@ def _scan_library_cached() -> list[dict]:
 
 
 def _scan_library() -> list[dict]:
-    """Walk primary and legacy merged trees, preferring the primary copy."""
+    """Walk primary, legacy, and fallback trees, preferring strict copies.
+
+    bestfallback entries are lower-quality (non-strict formats) kept when the
+    strict download failed. They are shown and playable so nothing downloaded
+    is invisible, but resolve stays strict-only so the extension and retry
+    flows keep upgrading them to strict copies.
+    """
     videos = []
     seen: Set[str] = set()
-    for root, media_prefix in ((MERGED_DIR, "/media"), (LEGACY_MERGED_DIR, "/media-legacy")):
+    for root, media_prefix in ((MERGED_DIR, "/media"), (LEGACY_MERGED_DIR, "/media-legacy"),
+                               (FALLBACK_DIR, "/media-fallback")):
       if not root.exists():
         continue
       for channel_dir in sorted(root.iterdir()):
@@ -933,6 +940,9 @@ def _scan_single_video(video_id: str) -> Optional[dict]:
     Same shape and precedence as _scan_library, but stats channel folders
     instead of reading every video on disk. Used by the resolve endpoint
     (hit on every extension page visit) and the cleanup retry loop.
+
+    Strict copies only: fallback videos are intentionally invisible here so
+    the extension and retry flows keep upgrading them to strict downloads.
     """
     if not YOUTUBE_ID_RE.match(video_id):
         return None
@@ -1196,7 +1206,12 @@ def _scan_tags() -> dict:
     videos = _scan_library_cached()
     tags: dict[str, list[dict]] = {}
     for video in videos:
-        video_dir = MERGED_DIR / video["channel_id"] / video["video_id"]
+        video_dir = next(
+            (root / video["channel_id"] / video["video_id"]
+             for root in (MERGED_DIR, LEGACY_MERGED_DIR, FALLBACK_DIR)
+             if (root / video["channel_id"] / video["video_id"]).is_dir()),
+            MERGED_DIR / video["channel_id"] / video["video_id"],
+        )
         info, _error = _load_info_json(video_dir)
         for tag in info.get("tags") or [] if info else []:
             tag = str(tag).strip()
@@ -2081,17 +2096,20 @@ def api_media_details(channel_id: str, video_id: str):
         return jsonify(error="invalid id"), 400
 
     video_dir = (MERGED_DIR / channel_id / video_id).resolve()
-    media_root = MERGED_DIR
+    media_root, media_prefix = MERGED_DIR, "/media"
     if not video_dir.is_dir():
         video_dir = (LEGACY_MERGED_DIR / channel_id / video_id).resolve()
-        media_root = LEGACY_MERGED_DIR
+        media_root, media_prefix = LEGACY_MERGED_DIR, "/media-legacy"
+    if not video_dir.is_dir():
+        video_dir = (FALLBACK_DIR / channel_id / video_id).resolve()
+        media_root, media_prefix = FALLBACK_DIR, "/media-fallback"
     if not video_dir.is_relative_to(media_root):
         abort(403)
     if not video_dir.is_dir():
         abort(404)
 
     files = [
-        _media_file_entry(path, channel_id, video_id)
+        _media_file_entry(path, channel_id, video_id, media_prefix)
         for path in sorted(video_dir.iterdir())
         if path.is_file()
     ]
