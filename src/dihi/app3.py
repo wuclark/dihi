@@ -20,8 +20,6 @@ from urllib.parse import quote
 
 from flask import Flask, Response, abort, jsonify, render_template, request, send_file
 from flask_cors import CORS
-from flask_limiter import Limiter
-from flask_limiter.util import get_remote_address
 
 mimetypes.add_type("video/x-matroska", ".mkv")
 mimetypes.add_type("audio/mp4", ".m4a")
@@ -33,14 +31,6 @@ import catalog
 
 app = Flask(__name__)
 CORS(app)  # Allow all origins
-
-# Rate limiting per IP address
-limiter = Limiter(
-    get_remote_address,
-    app=app,
-    default_limits=["100 per minute"],
-    storage_uri="memory://",
-)
 
 # Validate YouTube video IDs (11 chars: alphanumeric, underscore, dash)
 YOUTUBE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
@@ -66,6 +56,7 @@ MERGED_DIR = Path("./merged").expanduser().resolve()
 LEGACY_MERGED_DIR = Path("./data/merged").expanduser().resolve()
 FALLBACK_DIR = Path("./data/bestfallback").expanduser().resolve()
 CATALOG_DB = Path(os.environ.get("DIHI_CATALOG_DB", "./data/media-catalog.db")).expanduser().resolve()
+PLAYLIST_METADATA_DIR = Path(os.environ.get("DIHI_PLAYLIST_METADATA_DIR", "./data/playlists")).expanduser().resolve()
 _APP_DIR = Path(__file__).resolve().parent
 _SOURCE_EXTENSION_DIR = _APP_DIR / "extension"
 for _parent in _APP_DIR.parents:
@@ -112,7 +103,8 @@ _VERIFY_CACHE = Path(os.environ.get("DIHI_VERIFY_CACHE", "./data/media-verificat
 
 def _refresh_catalog() -> None:
     try:
-        count = catalog.refresh([MERGED_DIR, LEGACY_MERGED_DIR, FALLBACK_DIR], CATALOG_DB, CHECK_FILE)
+        count = catalog.refresh([MERGED_DIR, LEGACY_MERGED_DIR, FALLBACK_DIR], CATALOG_DB, CHECK_FILE,
+                                PLAYLIST_METADATA_DIR)
         app.logger.info("Media catalog indexed %d videos", count)
     except Exception:
         app.logger.exception("Media catalog refresh failed")
@@ -135,6 +127,20 @@ def _normalize_playlist_id(raw: str) -> Optional[str]:
     if not pid or not PLAYLIST_ID_RE.match(pid):
         return None
     return pid
+
+
+def _save_playlist_metadata(playlist_id: str, title: str, webpage_url: str,
+                            members: list[dict]) -> None:
+    """Persist preflight membership independently of the SQLite catalog."""
+    PLAYLIST_METADATA_DIR.mkdir(parents=True, exist_ok=True)
+    path = PLAYLIST_METADATA_DIR / f"{playlist_id}.info.json"
+    payload = {
+        "_type": "playlist", "id": playlist_id, "title": title or playlist_id,
+        "webpage_url": webpage_url, "saved_at": time.time(), "entries": members,
+    }
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary.replace(path)
 
 
 def _parse_archive_line(line: str) -> Optional[str]:
@@ -435,7 +441,8 @@ def _download_worker(video_id: str, cookies_browser: str | None = None, queue_it
             video_id,
             audio_meta=True,
             cookies_browser=cookies_browser,
-            extra_opts={"progress_hooks": [_progress_hook(video_id)]},
+            extra_opts={"progress_hooks": [_progress_hook(video_id)],
+                        "download_archive": None if _media_needs_sidecar_retry(video_id) else "archive.txt"},
         )
         # Give filesystem time to sync archive.txt
         time.sleep(0.5)
@@ -540,12 +547,10 @@ def _prepare_playlist_membership(playlist_id: str, cookies_browser: str | None =
                 "title": entry.get("title") or video_id,
                 "video_url": entry.get("webpage_url") or f"https://www.youtube.com/watch?v={video_id}",
             })
-        catalog.record_playlist_membership(
-            CATALOG_DB, playlist_id,
-            str(info.get("title") or info.get("playlist_title") or playlist_id),
-            str(info.get("webpage_url") or f"https://www.youtube.com/playlist?list={playlist_id}"),
-            members,
-        )
+        playlist_title = str(info.get("title") or info.get("playlist_title") or playlist_id)
+        playlist_url = str(info.get("webpage_url") or f"https://www.youtube.com/playlist?list={playlist_id}")
+        _save_playlist_metadata(playlist_id, playlist_title, playlist_url, members)
+        catalog.record_playlist_membership(CATALOG_DB, playlist_id, playlist_title, playlist_url, members)
         with _lock:
             detail = _download_details.setdefault(playlist_id, {"logs": []})
             detail["playlist_items"] = {
@@ -573,7 +578,8 @@ def _playlist_download_worker(playlist_id: str, queue_item_id: int | None = None
                 child_rc = getvidyt.download_youtube(
                     member["video_id"],
                     audio_meta=True,
-                    extra_opts={"progress_hooks": [_progress_hook(playlist_id)]},
+                    extra_opts={"progress_hooks": [_progress_hook(playlist_id)],
+                                "download_archive": None if _media_needs_sidecar_retry(member["video_id"]) else "archive.txt"},
                 )
                 if child_rc:
                     rc = child_rc
@@ -631,15 +637,28 @@ def _start_queue_item(item: dict) -> bool:
     return True
 
 
+def _recover_running_queue_items() -> int:
+    """Pause jobs interrupted by a server restart instead of auto-resuming them."""
+    recovered = 0
+    for stale in catalog.queue_items(CATALOG_DB, 100):
+        if stale["status"] == "running":
+            catalog.queue_set_status(
+                CATALOG_DB,
+                int(stale["id"]),
+                "paused",
+                error="paused after server restart",
+            )
+            recovered += 1
+    return recovered
+
+
 def _queue_scheduler() -> None:
     recovered = False
     while True:
         try:
             now = time.time()
             if not recovered:
-                for stale in catalog.queue_items(CATALOG_DB, 100):
-                    if stale["status"] == "running":
-                        catalog.queue_set_status(CATALOG_DB, int(stale["id"]), "pending", error="recovered after server restart")
+                _recover_running_queue_items()
                 _repair_queue_kinds(catalog.queue_items(CATALOG_DB, 100))
                 recovered = True
             for item in catalog.queue_items(CATALOG_DB, 100):
@@ -856,6 +875,21 @@ def _resolve_media_by_video_id(video_id: str) -> Optional[dict]:
             "player_kind": "video" if files.get("video") else "audio" if files.get("audio") else None,
         }
     return None
+
+
+def _media_needs_sidecar_retry(video_id: str) -> bool:
+    """Return whether an existing media item is missing downloadable sidecars."""
+    for root in (MERGED_DIR, LEGACY_MERGED_DIR, FALLBACK_DIR):
+        for channel_dir in root.iterdir() if root.is_dir() else []:
+            directory = channel_dir / video_id
+            if not directory.is_dir() or _is_playlist_dir(directory):
+                continue
+            names = {path.name for path in directory.iterdir() if path.is_file()}
+            return not (any(name.endswith(".out.info.json") for name in names)
+                        and any(name.endswith(".out.formats.json") for name in names)
+                        and any(name.endswith((".out.webp", ".out.png", ".out.jpg")) for name in names)
+                        and any(name.endswith((".out.description", ".out.en.vtt", ".out.en-orig.vtt")) for name in names))
+    return False
 
 
 def _cleanup_report() -> dict:
@@ -1129,7 +1163,6 @@ def library_export_page():
 
 
 @app.post("/api/media/catalog/refresh")
-@limiter.limit("6 per minute")
 def api_media_catalog_refresh():
     """Rebuild the filesystem-backed catalog and remove stale rows."""
     try:
@@ -1146,7 +1179,6 @@ def cleanup_page():
 
 
 @app.get("/api/media/cleanup-report")
-@limiter.limit("12 per minute")
 def api_media_cleanup_report():
     return jsonify(_get_cleanup_report())
 
@@ -1227,7 +1259,6 @@ def api_media_cleanup_task(task_id: str):
 
 
 @app.post("/api/media/cleanup/verify")
-@limiter.limit("3 per minute")
 def api_media_cleanup_verify():
     def worker(task_id):
         report = _get_cleanup_report()
@@ -1262,7 +1293,6 @@ def api_media_cleanup_verify():
 
 
 @app.post("/api/media/cleanup/retry-missing")
-@limiter.limit("6 per minute")
 def api_media_cleanup_retry_missing():
     report = _get_cleanup_report()
     video_ids = set(report.get("inventory", {}))
@@ -1289,7 +1319,6 @@ def api_media_cleanup_retry_missing():
 
 
 @app.post("/api/media/cleanup/delete")
-@limiter.limit("30 per minute")
 def api_media_cleanup_delete():
     path = Path(str((request.get_json(silent=True) or {}).get("path") or "")).resolve()
     if path not in _cleanup_candidate_paths():
@@ -1302,7 +1331,6 @@ def api_media_cleanup_delete():
 
 
 @app.post("/api/media/cleanup/delete-all")
-@limiter.limit("3 per minute")
 def api_media_cleanup_delete_all():
     def worker(task_id):
         paths = list(_cleanup_candidate_paths())
@@ -1318,7 +1346,6 @@ def api_media_cleanup_delete_all():
 
 
 @app.post("/api/media/cleanup/move-legacy")
-@limiter.limit("10 per minute")
 def api_media_cleanup_move_legacy():
     video_id = str((request.get_json(silent=True) or {}).get("video_id") or "").strip()
     check = next((item for item in _legacy_move_checks() if item["video_id"] == video_id), None)
@@ -1338,7 +1365,6 @@ def api_media_cleanup_move_legacy():
 
 
 @app.post("/api/media/cleanup/move-legacy-all")
-@limiter.limit("2 per minute")
 def api_media_cleanup_move_legacy_all():
     movable = [item for item in _legacy_move_checks() if item["status"] == "movable"]
     def worker(task_id):
@@ -1356,7 +1382,6 @@ def api_media_cleanup_move_legacy_all():
 
 
 @app.post("/api/media/cleanup/delete-legacy-matches")
-@limiter.limit("10 per minute")
 def api_media_cleanup_delete_legacy_matches():
     video_id = str((request.get_json(silent=True) or {}).get("video_id") or "").strip()
     check = next((item for item in _legacy_move_checks() if item["video_id"] == video_id), None)
@@ -1375,7 +1400,6 @@ def api_media_cleanup_delete_legacy_matches():
 
 
 @app.post("/api/media/cleanup/delete-legacy-different")
-@limiter.limit("10 per minute")
 def api_media_cleanup_delete_legacy_different():
     video_id = str((request.get_json(silent=True) or {}).get("video_id") or "").strip()
     check = next((item for item in _legacy_move_checks() if item["video_id"] == video_id), None)
@@ -1393,7 +1417,6 @@ def api_media_cleanup_delete_legacy_different():
 
 
 @app.post("/api/media/cleanup/move-legacy-only")
-@limiter.limit("10 per minute")
 def api_media_cleanup_move_legacy_only():
     video_id = str((request.get_json(silent=True) or {}).get("video_id") or "").strip()
     check = next((item for item in _legacy_move_checks() if item["video_id"] == video_id), None)
@@ -1437,7 +1460,6 @@ def _empty_legacy_dirs(source: Path) -> int:
 
 
 @app.post("/api/media/cleanup/delete-empty-legacy")
-@limiter.limit("10 per minute")
 def api_media_cleanup_delete_empty_legacy():
     video_id = str((request.get_json(silent=True) or {}).get("video_id") or "").strip()
     check = next((item for item in _legacy_move_checks() if item["video_id"] == video_id), None)
@@ -1456,7 +1478,6 @@ def api_media_cleanup_delete_empty_legacy():
 
 
 @app.post("/api/media/cleanup/delete-empty-legacy-all")
-@limiter.limit("3 per minute")
 def api_media_cleanup_delete_empty_legacy_all():
     sources = []
     for check in _legacy_move_checks():
@@ -1476,7 +1497,6 @@ def api_media_cleanup_delete_empty_legacy_all():
 
 
 @app.post("/api/media/cleanup/delete-legacy-different-all")
-@limiter.limit("3 per minute")
 def api_media_cleanup_delete_legacy_different_all():
     paths = [Path(item["source"]).resolve()
              for check in _legacy_move_checks() if check["status"] == "conflict"
@@ -1623,7 +1643,6 @@ def api_media_wordcloud_videos():
 
 
 @app.get("/api/media/catalog")
-@limiter.limit("60 per minute")
 def api_media_catalog():
     try:
         page = max(1, int(request.args.get("page", 1)))
@@ -1766,7 +1785,6 @@ def api_media_playlist(playlist_id: str):
 
 
 @app.post("/api/media/playlists/<string:playlist_id>/refresh")
-@limiter.limit("5 per minute")
 def api_media_playlist_refresh(playlist_id: str):
     """Refresh membership only; never removes local media files."""
     if not PLAYLIST_ID_RE.match(playlist_id):
@@ -1778,7 +1796,6 @@ def api_media_playlist_refresh(playlist_id: str):
 
 
 @app.post("/api/media/playlists/<string:playlist_id>/finish")
-@limiter.limit("10 per minute")
 def api_media_playlist_finish(playlist_id: str):
     """Start the playlist worker; it downloads incomplete members sequentially."""
     if not PLAYLIST_ID_RE.match(playlist_id):
@@ -1816,13 +1833,11 @@ def api_media_playlist_m3u(playlist_id: str):
 
 
 @app.get("/api/media/tags")
-@limiter.limit("30 per minute")
 def api_media_tags():
     return jsonify(_scan_tags())
 
 
 @app.get("/api/media/resolve/<string:video_id>")
-@limiter.limit("60 per minute")
 def api_media_resolve(video_id: str):
     vid = _normalize_id(video_id)
     if not vid:
@@ -1836,7 +1851,6 @@ def api_media_resolve(video_id: str):
 
 
 @app.get("/api/downloads/status")
-@limiter.limit("60 per minute")
 def api_downloads_status():
     return jsonify(_download_status_snapshot())
 
@@ -1856,13 +1870,15 @@ def api_queue_add():
     kind = "video" if video_id else "playlist"
     target = video_id or _normalize_playlist_id(raw)
     if not target:
-        match = re.search(r"[?&]v=([A-Za-z0-9_-]{11})", raw)
-        target = _normalize_id(match.group(1)) if match else None
-        kind = "video"
+        # YouTube watch URLs often contain both v= and list=. When a playlist
+        # is present, queue the playlist and ignore the individual video.
+        match = re.search(r"[?&]list=([A-Za-z0-9_-]{2,128})", raw)
+        target = _normalize_playlist_id(match.group(1)) if match else None
+        kind = "playlist"
         if not target:
-            match = re.search(r"[?&]list=([A-Za-z0-9_-]{2,128})", raw)
-            target = _normalize_playlist_id(match.group(1)) if match else None
-            kind = "playlist"
+            match = re.search(r"[?&]v=([A-Za-z0-9_-]{11})", raw)
+            target = _normalize_id(match.group(1)) if match else None
+            kind = "video"
     if not target:
         return jsonify(ok=False, error="enter a YouTube video ID, playlist ID, or URL"), 400
     scheduled_at = payload.get("scheduled_at")
@@ -2033,7 +2049,6 @@ def serve_legacy_media(filepath: str):
 
 
 @app.get("/api/youtube/<string:video_id>")
-@limiter.limit("60 per minute")
 def api_youtube_check(video_id: str):
     """
     GET /api/youtube/<id>
@@ -2051,7 +2066,6 @@ def api_youtube_check(video_id: str):
 
 
 @app.post("/api/youtube/get/<string:video_id>")
-@limiter.limit("10 per minute")
 def api_youtube_get(video_id: str):
     """
     POST /api/youtube/get/<id>
@@ -2082,7 +2096,6 @@ def api_youtube_get(video_id: str):
 
 
 @app.post("/api/youtube/retry/<string:video_id>")
-@limiter.limit("10 per minute")
 def api_youtube_retry(video_id: str):
     """Explicitly retry a failed or partial download, resuming local parts."""
     authenticated = request.args.get("authenticated") == "1"
@@ -2159,7 +2172,6 @@ def api_system_status():
 
 
 @app.get("/api/youtube/status/<string:video_id>")
-@limiter.limit("60 per minute")
 def api_youtube_status(video_id: str):
     vid = _normalize_id(video_id)
     if not vid:
@@ -2189,7 +2201,6 @@ def api_youtube_status(video_id: str):
 
 
 @app.post("/api/youtube/playlist/get/<string:playlist_id>")
-@limiter.limit("5 per minute")
 def api_youtube_playlist_get(playlist_id: str):
     """
     POST /api/youtube/playlist/get/<playlist_id>
@@ -2214,20 +2225,27 @@ def api_youtube_playlist_get(playlist_id: str):
 
 
 @app.post("/api/youtube/playlist/prepare/<string:playlist_id>")
-@limiter.limit("5 per minute")
 def api_youtube_playlist_prepare(playlist_id: str):
-    """Read and save playlist membership without starting downloads."""
+    """Create playlist metadata if missing without starting downloads."""
     pid = _normalize_playlist_id(playlist_id)
     if not pid:
         return jsonify(ok=False, error="invalid playlist id"), 400
+    descriptor_path = PLAYLIST_METADATA_DIR / f"{pid}.info.json"
+    if descriptor_path.is_file():
+        try:
+            descriptor = json.loads(descriptor_path.read_text(encoding="utf-8"))
+            if isinstance(descriptor, dict) and descriptor.get("_type") == "playlist":
+                members = descriptor.get("entries") or []
+                return jsonify(ok=True, id=pid, prepared=True, existing=True, members=len(members))
+        except (OSError, ValueError):
+            pass
     members = _prepare_playlist_membership(pid)
     if members is None:
         return jsonify(ok=False, error="could not read playlist metadata"), 503
-    return jsonify(ok=True, id=pid, prepared=True, members=len(members))
+    return jsonify(ok=True, id=pid, prepared=True, existing=False, members=len(members))
 
 
 @app.get("/api/youtube/playlist/status/<string:playlist_id>")
-@limiter.limit("60 per minute")
 def api_youtube_playlist_status(playlist_id: str):
     """
     GET /api/youtube/playlist/status/<playlist_id>
@@ -2255,7 +2273,6 @@ def api_youtube_playlist_status(playlist_id: str):
 
 
 @app.get("/health")
-@limiter.limit("30 per minute")
 def health():
     return jsonify(
         ok=True,

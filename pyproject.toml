@@ -13,7 +13,6 @@ dependencies = [
     "mutagen",
     "flask",
     "flask-cors",
-    "flask-limiter",
     "gunicorn",
     "curl_cffi",
     "requests",

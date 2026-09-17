@@ -14,6 +14,7 @@ TODO (HTTP / integration tests to add in future):
 """
 import time
 import io
+import json
 import zipfile
 from pathlib import Path
 
@@ -31,6 +32,7 @@ from app3 import (
     _resolve_media_by_video_id,
     _download_status_snapshot,
     _log_queue_state_locked,
+    _recover_running_queue_items,
     _RESULT_TTL,
     _progress_hook,
 )
@@ -96,6 +98,73 @@ def test_extension_zip_download_contains_manifest():
     assert response.mimetype == "application/zip"
     with zipfile.ZipFile(io.BytesIO(response.data)) as bundle:
         assert "manifest.json" in bundle.namelist()
+
+
+def test_queue_prefers_playlist_id_when_watch_url_has_both(monkeypatch):
+    queued = []
+
+    def fake_enqueue(target, kind, scheduled_at=None, cookies_browser=None, status="pending"):
+        queued.append((target, kind, status))
+        return 17, False
+
+    monkeypatch.setattr(app3, "_enqueue_target", fake_enqueue)
+    monkeypatch.setattr(app3.catalog, "setting", lambda *args: "queue")
+
+    response = app3.app.test_client().post(
+        "/api/queue",
+        json={
+            "target": (
+                '"D2020_2020-04","Unlisted",'
+                '"https://www.youtube.com/watch?v=nYfTPVsnH14&list='
+                'PLR9DU4SPdPFiHtop6ajZN_PVuq9NaZZcV","N/A","N/A"'
+            ),
+            "start_now": False,
+        },
+    )
+
+    assert response.status_code == 200
+    assert queued == [("PLR9DU4SPdPFiHtop6ajZN_PVuq9NaZZcV", "playlist", "paused")]
+
+
+def test_restart_recovery_pauses_running_queue_items(monkeypatch):
+    items = [
+        {"id": 11, "status": "running"},
+        {"id": 12, "status": "paused"},
+        {"id": 13, "status": "completed"},
+    ]
+    updates = []
+    monkeypatch.setattr(app3.catalog, "queue_items", lambda *args: items)
+    monkeypatch.setattr(
+        app3.catalog,
+        "queue_set_status",
+        lambda *args, **kwargs: updates.append((args[1], args[2], kwargs)),
+    )
+
+    assert _recover_running_queue_items() == 1
+    assert updates == [(11, "paused", {"error": "paused after server restart"})]
+
+
+def test_playlist_prepare_skips_existing_descriptor(monkeypatch, tmp_path):
+    playlist_id = "PLexisting123"
+    descriptor_path = tmp_path / f"{playlist_id}.info.json"
+    descriptor_path.write_text(json.dumps({
+        "_type": "playlist",
+        "id": playlist_id,
+        "entries": [{"video_id": "dQw4w9WgXcQ"}],
+    }))
+    monkeypatch.setattr(app3, "PLAYLIST_METADATA_DIR", tmp_path)
+    monkeypatch.setattr(app3, "_prepare_playlist_membership", lambda *_args: pytest.fail("should not preflight"))
+
+    response = app3.app.test_client().post(f"/api/youtube/playlist/prepare/{playlist_id}")
+
+    assert response.status_code == 200
+    assert response.get_json() == {
+        "ok": True,
+        "id": playlist_id,
+        "prepared": True,
+        "existing": True,
+        "members": 1,
+    }
 
 
 def test_progress_hook_tracks_each_file_and_overall_bytes():

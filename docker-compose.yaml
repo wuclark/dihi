@@ -18,6 +18,7 @@ services:
       # Legacy downloads made before the primary merged/ mount was aligned.
       - ./data/merged:/app/data/merged
       - ./data/bestfallback:/app/data/bestfallback
+      - ./data/playlists:/app/data/playlists
       - ./data/media-catalog.db:/app/data/media-catalog.db
     environment:
       - PORT=5000

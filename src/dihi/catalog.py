@@ -121,7 +121,8 @@ def _files(path: Path, channel_id: str, video_id: str, source_root: str) -> dict
     return result
 
 
-def refresh(merged_dir: Path | list[Path], database: Path, archive: Path | None = None) -> int:
+def refresh(merged_dir: Path | list[Path], database: Path, archive: Path | None = None,
+            playlist_metadata_dir: Path | None = None) -> int:
     """Scan all local video directories and return the indexed video count."""
     roots = [Path(merged_dir)] if isinstance(merged_dir, (str, Path)) else [Path(p) for p in merged_dir]
     database.parent.mkdir(parents=True, exist_ok=True)
@@ -221,6 +222,52 @@ def refresh(merged_dir: Path | list[Path], database: Path, archive: Path | None 
                 has_partial = any(name.endswith((".part", ".ytdl")) for name in files)
                 status = "complete" if has_primary else "interrupted" if has_partial else "missing"
                 db.execute("INSERT OR REPLACE INTO archive_entries VALUES (?, ?, strftime('%s','now'))", (video_id, status))
+        if playlist_metadata_dir and Path(playlist_metadata_dir).is_dir():
+            for descriptor_path in sorted(Path(playlist_metadata_dir).glob("*.info.json")):
+                try:
+                    descriptor = json.loads(descriptor_path.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    continue
+                if not isinstance(descriptor, dict) or descriptor.get("_type") != "playlist":
+                    continue
+                playlist_id = str(descriptor.get("id") or "").strip()
+                if not playlist_id:
+                    continue
+                members = descriptor.get("entries") or []
+                db.execute(
+                    """INSERT INTO playlists(playlist_id,title,webpage_url,updated_at)
+                       VALUES(?,?,?,?) ON CONFLICT(playlist_id) DO UPDATE SET
+                       title=excluded.title, webpage_url=excluded.webpage_url,
+                       updated_at=excluded.updated_at""",
+                    (playlist_id, str(descriptor.get("title") or playlist_id),
+                     descriptor.get("webpage_url"), descriptor.get("saved_at") or time.time()),
+                )
+                member_ids = [str(member.get("video_id") or member.get("id") or "").strip()
+                              for member in members if isinstance(member, dict)]
+                member_ids = [member_id for member_id in member_ids if member_id]
+                if member_ids:
+                    placeholders = ",".join("?" for _ in member_ids)
+                    db.execute(
+                        f"DELETE FROM playlist_videos WHERE playlist_id = ? AND video_id NOT IN ({placeholders})",
+                        (playlist_id, *member_ids),
+                    )
+                else:
+                    db.execute("DELETE FROM playlist_videos WHERE playlist_id = ?", (playlist_id,))
+                for index, member in enumerate(members, 1):
+                    if not isinstance(member, dict):
+                        continue
+                    video_id = str(member.get("video_id") or member.get("id") or "").strip()
+                    if not video_id:
+                        continue
+                    db.execute(
+                        """INSERT INTO playlist_videos
+                           (playlist_id,video_id,playlist_index,title,video_url)
+                           VALUES(?,?,?,?,?) ON CONFLICT(playlist_id,video_id) DO UPDATE SET
+                           playlist_index=excluded.playlist_index, title=excluded.title,
+                           video_url=excluded.video_url""",
+                        (playlist_id, video_id, member.get("playlist_index") or index,
+                         member.get("title") or video_id, member.get("video_url")),
+                    )
         db.commit()
     return count
 
@@ -276,7 +323,10 @@ def playlist_video_ids(database: Path, playlist_id: str) -> list[dict[str, Any]]
 def record_playlist_membership(database: Path, playlist_id: str, title: str,
                                webpage_url: str | None, members: list[dict[str, Any]]) -> None:
     """Persist a playlist and its entries independently of video downloads."""
-    with sqlite3.connect(database) as db:
+    # Startup catalog refreshes can hold SQLite's writer lock while scanning
+    # a large library. Wait for that scan rather than reporting a misleading
+    # playlist metadata failure after the network extraction succeeded.
+    with sqlite3.connect(database, timeout=120) as db:
         db.executescript(SCHEMA)
         db.execute(
             """INSERT INTO playlists(playlist_id,title,webpage_url,updated_at)

@@ -85,7 +85,7 @@ Core UI/media routes:
 - `GET /extension.zip` downloads the browser extension bundle for local installation
 - `GET /tags` renders the tag browser UI
 - `GET /downloads` renders the active/recent download status UI
-- `GET /queue` renders the persistent manual/scheduled download queue
+- `GET /queue` renders the persistent manual/scheduled download queue, including one-per-line playlist batch input. Batch rows may be bare playlist IDs, `playlist <ID>` lines, or CSV-style YouTube watch URLs; `list=` takes precedence over `v=`.
 - `GET /downloaded` renders completed and failed download history
 - `GET /catalog` renders the paginated metadata/file catalog table
 - `GET /library-export` renders links for all indexed library files and a text export
@@ -126,6 +126,7 @@ Core UI/media routes:
 - The Tools page includes a confirmation-free filesystem rescan button that refreshes catalog paths and links without deleting media.
 - `POST /api/media/cleanup/verify` starts a full media verification pass cached by file MD5
 - `POST /api/media/cleanup/retry-missing` queues incomplete media while skipping permanent failures and complete files
+- Catalog rows with missing metadata, formats, thumbnails, descriptions, or subtitles/lyrics expose a “Retry missing files” action; sidecar retries bypass the download archive when needed.
 - `GET /api/media/wordcloud` returns description word frequencies, filterable by tag or playlist
 - `GET /api/media/failures` lists recorded failed download attempts and reasons
 - `GET /api/media/download-history` lists persistent completed and failed download attempts
@@ -145,7 +146,7 @@ Core UI/media routes:
 
 The rebuildable SQLite catalog now scans both `merged/` and
 `data/bestfallback/`, retaining source-root and per-file format/subtitle
-details. It also stores playlist names and video memberships from each `.info.json`; a video can belong to multiple playlists. Download failures are classified and persisted as retry information. The catalog endpoint initializes its schema before reading so the UI can continue serving while the background filesystem scan is running.
+details. It also stores playlist names and video memberships from each `.info.json`; a video can belong to multiple playlists. Download failures are classified and persisted as retry information. The catalog endpoint initializes its schema before reading so the UI can continue serving while the background filesystem scan is running. Playlist preflight waits for that startup scan's SQLite write lock when persisting playlist membership.
 The planned indexed artist/album pages and safe rollback are documented in
 [`plan.media-catalog.md`](plan.media-catalog.md). It is not required by the
 current filesystem-backed library; it remains a rebuildable runtime index while
@@ -197,7 +198,7 @@ merged/
         └── <channel_id>.<video_id>.<date>.<title> [<video_id>].out.en.vtt
 ```
 
-The exact set varies by source video and available formats. The `<channel_id>/<video_id>/` directory structure is intentional because those IDs are stable across title/channel renames. The catalog also stores playlist membership independently, so preflighted playlist entries link existing media without downloading it again.
+The exact set varies by source video and available formats. The `<channel_id>/<video_id>/` directory structure is intentional because those IDs are stable across title/channel renames. The catalog also stores playlist membership independently, so preflighted playlist entries link existing media without downloading it again. Preflight-only playlists are saved as rebuildable `data/playlists/<playlist_id>.info.json` descriptors and imported when the SQLite catalog is rebuilt.
 
 The default `.out.m4a` is the separately requested AAC audio download. `--audio-meta` can make additional clean, tagged copies from kept raw audio sidecars, such as `.out.f251.webm` to `.out.webm`.
 
@@ -238,7 +239,7 @@ Meaning:
 
 ## UI Notes
 
-The web UI is part of `app3.py`, not a separate server yet. It lists the archive, batches thumbnail rendering, supports video/audio playback, exposes VLC URLs, loads per-video details lazily, and includes `/queue` for persistent manual/scheduled downloads. The default add behavior is immediate; changing the queue setting holds new items until manually started. `/playlists` provides named playlist membership, ordered video links, per-video download buttons, browser play-all, and separate VLC video/audio-only M3U files. `/downloads` shows active/recent download status, persistent attempt history, failed-download retry actions, and a remaining queue output. Playlist progress groups each item's video, audio, and metadata files beneath that item's title. `/downloaded` shows the same persistent completed/failed attempt history in a scrollable panel. `/video/<video_id>` shows the saved description collapsed by default, full metadata, every indexed file with size/type, playable video/audio links, and the VLC media URL. The main library restores active/recent queue entries from the server after refresh. Playlist rows expose child video links and `playlist_index/total` progress as yt-dlp encounters each entry. Queue state changes are also written to the server log, including `Queue Empty` when all active downloads finish.
+The web UI is part of `app3.py`, not a separate server yet. It lists the archive, batches thumbnail rendering, supports video/audio playback, exposes VLC URLs, loads per-video details lazily, and includes `/queue` for persistent manual/scheduled downloads. The default add behavior is immediate; changing the queue setting holds new items until manually started. Jobs interrupted by a server restart are recovered as paused queue items and do not auto-resume. The queue page's playlist batch tool accepts bare IDs, `playlist <ID>` lines, URLs, and CSV-style watch rows; its preparation button creates missing playlist descriptor JSON files, skips valid existing descriptors, and reports each playlist's progress in the output box. `/playlists` provides named playlist membership, ordered video links, per-video download buttons, browser play-all, and separate VLC video/audio-only M3U files; its Refresh playlist action explicitly re-fetches membership. `/downloads` shows active/recent download status, persistent attempt history, failed-download retry actions, and a remaining queue output. Playlist progress groups each item's video, audio, and metadata files beneath that item's title. `/downloaded` shows the same persistent completed/failed attempt history in a scrollable panel. `/video/<video_id>` shows the saved description collapsed by default, full metadata, every indexed file with size/type, playable video/audio links, and the VLC media URL. The main library restores active/recent queue entries from the server after refresh. Playlist rows expose child video links and `playlist_index/total` progress as yt-dlp encounters each entry. Queue state changes are also written to the server log, including `Queue Empty` when all active downloads finish.
 All non-library pages use the shared `templates/_header.html` navigation. The library header keeps primary library/download links; `/tools` is the hub for the catalog, tags, word cloud, tag cloud, Edge extension, status, and downloaded-history tools.
 
 The browser extension tracks per-video YouTube visit counts in `chrome.storage.local`. When enabled, it auto-downloads missing videos after the configured visit threshold and notifies when the automatic request starts. It calls `/api/media/resolve/<video_id>` before posting a download request and skips the request if local media already exists. Counts reset only once the video is found in the archive, so still-missing videos at or above the threshold are requested again on later visits. Archived playback can use a preflight redirect, an in-page local player replacement, or an ask prompt. In-page replacement keeps YouTube around the player but still loads YouTube page resources; local autoplay starts muted because audible autoplay requires browser permission or a user gesture. The dihi downloads UI exposes source YouTube URLs as copy-only controls instead of direct links.
