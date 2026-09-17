@@ -254,11 +254,12 @@ Run:
 venv/bin/pytest
 ```
 
-The current suite is pure unit tests: no network, no real yt-dlp download, no ffmpeg integration, and no browser automation.
+The current suite is pure unit tests: no network, no real yt-dlp download, no ffmpeg integration, and no browser automation. `make test-docker` additionally runs opt-in smoke tests against the live Compose HTTP service; its library-endpoint budget is generous because `/api/media/library` is an unpaginated full-filesystem scan (see Roadmap).
 
 ## Roadmap / TODO
 
 - Keep the browser extension mirrored with the active site flows and API endpoints. When queue, playlist, playback, settings, or response-shape behavior changes, update the extension code, extension README, and extension version together, then test the extension against the documented endpoints.
+- Serve `/api/media/library` (and its `/files`, `*.txt`, playlist-detail, and resolve callers) from the SQLite catalog, paginate it, or otherwise stop the per-request full `merged/` rescan that inlines descriptions and `info.json` per video. Check the web UI and extension against any response-shape change in the same update.
 
 ## Coding Caveats
 
