@@ -1788,9 +1788,26 @@ def api_media_catalog():
     return jsonify(items=items, page=page, per_page=per_page, total=total, pages=(total + per_page - 1) // per_page)
 
 
+def _slim_video(video: dict) -> dict:
+    """Card fields for list responses: everything the grid, search/sort, and
+    playlist views need, without the heavy per-video details.
+
+    Descriptions and full info.json stay available per video via
+    /api/media/details/<channel>/<video> (used lazily by the UI) and via
+    /api/media/resolve/<video> (used by the /video/ page and extension).
+    """
+    return {
+        "video_id": video.get("video_id"),
+        "channel_id": video.get("channel_id"),
+        "title": video.get("title"),
+        "date": video.get("date"),
+        "files": video.get("files") or {},
+    }
+
+
 @app.get("/api/media/library")
 def api_media_library():
-    return jsonify(videos=_scan_library_cached())
+    return jsonify(videos=[_slim_video(video) for video in _scan_library_cached()])
 
 
 @app.get("/api/media/library/files")
@@ -1867,7 +1884,7 @@ def api_media_playlist(playlist_id: str):
     members = []
     for member in catalog.playlist_video_ids(CATALOG_DB, playlist_id):
         video = videos_by_id.get(member["video_id"])
-        members.append({**member, "video": video})
+        members.append({**member, "video": _slim_video(video) if video else None})
     return jsonify(playlist=playlist, videos=members)
 
 
