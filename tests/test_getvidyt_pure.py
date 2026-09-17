@@ -499,7 +499,8 @@ class TestBuildYdlOpts:
         assert "js_runtimes" not in opts
         assert "remote_components" not in opts
 
-    def test_cookies_browser_sets_cookiesfrombrowser(self, tmp_path):
+    def test_cookies_browser_sets_cookiesfrombrowser(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
         opts = build_ydl_opts(
             merged_dir=tmp_path / "merged",
             archive=tmp_path / "archive.txt",
@@ -508,7 +509,8 @@ class TestBuildYdlOpts:
         )
         assert opts["cookiesfrombrowser"] == ("firefox",)
 
-    def test_cookies_file_present_sets_cookiefile(self, tmp_path):
+    def test_cookies_file_present_sets_cookiefile(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
         (tmp_path / "cookies.txt").write_text("# Netscape HTTP Cookie File\n")
         opts = build_ydl_opts(
             merged_dir=tmp_path / "merged",
@@ -517,7 +519,8 @@ class TestBuildYdlOpts:
         )
         assert opts.get("cookiefile") == str(tmp_path / "cookies.txt")
 
-    def test_empty_cookie_placeholder_is_ignored(self, tmp_path):
+    def test_empty_cookie_placeholder_is_ignored(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
         (tmp_path / "cookies.txt").touch()
         opts = build_ydl_opts(
             merged_dir=tmp_path / "merged",
@@ -526,7 +529,8 @@ class TestBuildYdlOpts:
         )
         assert "cookiefile" not in opts
 
-    def test_cookies_file_absent_no_cookiefile_key(self, tmp_path):
+    def test_cookies_file_absent_no_cookiefile_key(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
         opts = build_ydl_opts(
             merged_dir=tmp_path / "merged",
             archive=tmp_path / "archive.txt",
