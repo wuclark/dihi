@@ -1,4 +1,4 @@
-# YouTube ID Server Checker (Edge Extension, MV3)
+# YouTube ID Server Checker (Edge Extension, MV3, version 1.8.3)
 
 Checks the current YouTube video ID against:
 
@@ -64,6 +64,11 @@ block audible autoplay without a user gesture or prior site permission; click
 the player's unmute control to enable sound.
 
 ## Folder Layout
+
+On YouTube channel/profile pages and `youtube.com/feed/playlists`, the popup scrolls the page to load lazy
+playlist cards, then shows a deduplicated checklist. Selected playlists can be exported,
+saved to DIHI without downloading, or added as paused playlist jobs through
+the queue.
 
 ```
 extension/

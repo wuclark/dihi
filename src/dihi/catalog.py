@@ -285,6 +285,13 @@ def record_playlist_membership(database: Path, playlist_id: str, title: str,
                updated_at=excluded.updated_at""",
             (playlist_id, title or playlist_id, webpage_url, time.time()),
         )
+        member_ids = [str(member.get("video_id") or "").strip() for member in members]
+        if member_ids:
+            placeholders = ",".join("?" for _ in member_ids)
+            db.execute(f"DELETE FROM playlist_videos WHERE playlist_id = ? AND video_id NOT IN ({placeholders})",
+                       (playlist_id, *member_ids))
+        else:
+            db.execute("DELETE FROM playlist_videos WHERE playlist_id = ?", (playlist_id,))
         for member in members:
             video_id = str(member.get("video_id") or "").strip()
             if not video_id:
@@ -340,6 +347,16 @@ def queue_set_status(database: Path, item_id: int, status: str, **fields: Any) -
         db.executescript(SCHEMA)
         _ensure_queue_columns(db)
         db.execute(f"UPDATE download_queue SET {assignments} WHERE id = ?", (*updates.values(), item_id))
+        db.commit()
+
+
+def queue_set_kind(database: Path, item_id: int, kind: str) -> None:
+    """Repair a queued target whose kind was inferred incorrectly."""
+    if kind not in {"video", "playlist"}:
+        raise ValueError("invalid queue kind")
+    with sqlite3.connect(database) as db:
+        db.executescript(SCHEMA)
+        db.execute("UPDATE download_queue SET kind = ? WHERE id = ?", (kind, item_id))
         db.commit()
 
 

@@ -2,14 +2,17 @@
 from __future__ import annotations
 
 import io
+import hashlib
 import mimetypes
 import json
 import os
 import re
 import sqlite3
 import shutil
+import subprocess
 import threading
 import time
+import uuid
 import zipfile
 from pathlib import Path
 from typing import Optional, Set
@@ -48,6 +51,14 @@ PLAYLIST_ID_RE = re.compile(r"^[A-Za-z0-9_-]{2,128}$")
 # Max concurrent downloads to prevent resource exhaustion
 MAX_CONCURRENT_DOWNLOADS = 5
 MAX_CONCURRENT_PLAYLIST_DOWNLOADS = 2
+
+
+def _queue_limit(kind: str) -> int:
+    key, default, maximum = ("max_concurrent_playlists", MAX_CONCURRENT_PLAYLIST_DOWNLOADS, 5) if kind == "playlist" else ("max_concurrent_downloads", MAX_CONCURRENT_DOWNLOADS, 10)
+    try:
+        return max(1, min(maximum, int(catalog.setting(CATALOG_DB, key, str(default)))))
+    except (ValueError, TypeError, sqlite3.Error):
+        return default
 
 # Archive lines look like: "youtube <id>"
 CHECK_FILE = Path("./archive.txt").expanduser().resolve()
@@ -94,6 +105,9 @@ _playlist_history: dict[str, str] = {}
 _playlist_history_timestamps: dict[str, float] = {}
 _last_queue_log_message: Optional[str] = None
 _queue_wakeup = threading.Event()
+_cleanup_tasks: dict[str, dict] = {}
+_cleanup_report_cache: tuple[float, dict] | None = None
+_VERIFY_CACHE = Path(os.environ.get("DIHI_VERIFY_CACHE", "./data/media-verification.json")).expanduser().resolve()
 
 
 def _refresh_catalog() -> None:
@@ -303,13 +317,25 @@ def _classify_download_error(message: str) -> tuple[str, bool]:
         ("private", "private", False), ("age", "age_restricted", True),
         ("members only", "members_only", False), ("not available in your country", "region_blocked", False),
         ("format is not available", "format_unavailable", True), ("403", "http_403", True),
-        ("video unavailable", "not_found", False), ("sign in", "login_required", True),
+        ("video unavailable", "not_found", False), ("this video is not available", "not_found", False),
+        ("removed by the uploader", "not_found", False), ("sign in", "login_required", True),
         ("did not produce both", "incomplete", True),
     ]
     for needle, reason, retryable in patterns:
         if needle in text:
             return reason, retryable
     return "unknown", True
+
+
+def _permanent_failure(video_id: str) -> tuple[str, str] | None:
+    try:
+        with sqlite3.connect(CATALOG_DB) as db:
+            row = db.execute("SELECT reason, raw_error FROM download_attempts WHERE video_id=? ORDER BY finished_at DESC LIMIT 1", (video_id,)).fetchone()
+        if row and row[0] in {"not_found", "private", "members_only", "region_blocked"}:
+            return str(row[0]), str(row[1] or row[0])
+    except sqlite3.Error:
+        pass
+    return None
 
 
 def _queue_summary_from_active(active_videos: int, active_playlists: int) -> dict:
@@ -388,8 +414,8 @@ def _download_status_snapshot() -> dict:
             "recent": len(recent),
             "active_videos": remaining_videos,
             "active_playlists": len(active_playlists),
-            "max_videos": MAX_CONCURRENT_DOWNLOADS,
-            "max_playlists": MAX_CONCURRENT_PLAYLIST_DOWNLOADS,
+            "max_videos": _queue_limit("video"),
+            "max_playlists": _queue_limit("playlist"),
         },
         "result_ttl_seconds": _RESULT_TTL,
     }
@@ -590,7 +616,7 @@ def _start_queue_item(item: dict) -> bool:
     target, kind, item_id = item["target"], item["kind"], int(item["id"])
     with _lock:
         active = _active_downloads if kind == "video" else _active_playlist_downloads
-        limit = MAX_CONCURRENT_DOWNLOADS if kind == "video" else MAX_CONCURRENT_PLAYLIST_DOWNLOADS
+        limit = _queue_limit(kind)
         if target in active or len(active) >= limit:
             return False
         active.add(target)
@@ -606,9 +632,16 @@ def _start_queue_item(item: dict) -> bool:
 
 
 def _queue_scheduler() -> None:
+    recovered = False
     while True:
         try:
             now = time.time()
+            if not recovered:
+                for stale in catalog.queue_items(CATALOG_DB, 100):
+                    if stale["status"] == "running":
+                        catalog.queue_set_status(CATALOG_DB, int(stale["id"]), "pending", error="recovered after server restart")
+                _repair_queue_kinds(catalog.queue_items(CATALOG_DB, 100))
+                recovered = True
             for item in catalog.queue_items(CATALOG_DB, 100):
                 if item["status"] != "pending":
                     continue
@@ -636,6 +669,17 @@ def _enqueue_target(target: str, kind: str, scheduled_at: float | None = None,
             if item["target"] == target and item["kind"] == kind and item["status"] in {"pending", "paused"}:
                 return int(item["id"]), True
         raise
+
+
+def _repair_queue_kinds(items: list[dict]) -> list[dict]:
+    """Correct old queue rows created before playlist IDs were detected."""
+    for item in items:
+        target = str(item.get("target") or "")
+        expected = "video" if YOUTUBE_ID_RE.match(target) else "playlist"
+        if item.get("kind") == "video" and expected == "playlist" and item.get("status") != "running":
+            catalog.queue_set_kind(CATALOG_DB, int(item["id"]), expected)
+            item["kind"] = expected
+    return items
 
 
 def _classify_file(fname: str, url: str, files: dict) -> None:
@@ -734,6 +778,12 @@ def _load_info_json(video_dir: Path) -> tuple[Optional[dict], Optional[str]]:
     return None, None
 
 
+def _is_playlist_dir(directory: Path) -> bool:
+    """Playlist metadata is not a media item and must not get media checks."""
+    info, _error = _load_info_json(directory)
+    return bool(info and info.get("_type") == "playlist")
+
+
 def _scan_library() -> list[dict]:
     """Walk primary and legacy merged trees, preferring the primary copy."""
     videos = []
@@ -806,6 +856,191 @@ def _resolve_media_by_video_id(video_id: str) -> Optional[dict]:
             "player_kind": "video" if files.get("video") else "audio" if files.get("audio") else None,
         }
     return None
+
+
+def _cleanup_report() -> dict:
+    """Return removable media candidates without changing any files."""
+    entries: list[dict] = []
+    audio_checks: list[dict] = []
+    location_checks: list[dict] = []
+    recoverability_cache: dict[tuple[str, str, str], dict] = {}
+
+    def media_url(path: Path) -> str | None:
+        for root, prefix in ((MERGED_DIR, "/media"), (LEGACY_MERGED_DIR, "/media-legacy"), (FALLBACK_DIR, "/media-fallback")):
+            try:
+                relative = path.relative_to(root)
+            except ValueError:
+                continue
+            return prefix + "/" + "/".join(quote(part, safe="") for part in relative.parts)
+        return None
+
+    def media_state(directory: Path) -> tuple[bool, bool]:
+        video = audio = False
+        for path in directory.iterdir() if directory.is_dir() else []:
+            if not path.is_file() or _SIDECAR_RE.search(path.name):
+                continue
+            if path.suffix.lower() in {".mkv", ".mp4", ".webm"}:
+                video = True
+            if path.suffix.lower() in {".m4a", ".opus", ".mp3"}:
+                audio = True
+        return video, audio
+
+    primary: dict[str, Path] = {}
+    for channel_dir in MERGED_DIR.iterdir() if MERGED_DIR.is_dir() else []:
+        for video_dir in channel_dir.iterdir() if channel_dir.is_dir() else []:
+            if video_dir.is_dir() and not _is_playlist_dir(video_dir) and all(media_state(video_dir)):
+                primary[video_dir.name] = video_dir
+
+    location_checks.extend(_legacy_move_checks())
+
+    def add(path: Path, category: str, reason: str) -> None:
+        try:
+            size = path.stat().st_size
+        except OSError:
+            return
+        replacement_dir = primary.get(path.parent.name) or path.parent
+        replacements = []
+        for pattern in ("*.out.mkv", "*.out.m4a"):
+            for replacement in sorted(replacement_dir.glob(pattern)):
+                replacements.append({"name": replacement.name, "path": str(replacement), "url": media_url(replacement), "bytes": replacement.stat().st_size, "location": "primary merged/" if replacement.is_relative_to(MERGED_DIR) else "legacy data/merged/"})
+        entries.append({"video_id": path.parent.name, "path": str(path), "url": media_url(path), "category": category, "reason": reason, "bytes": size, "primary_files": replacements})
+
+    def check_audio(path: Path) -> None:
+        ffprobe = shutil.which("ffprobe")
+        result = {"video_id": path.parent.name, "path": str(path), "url": media_url(path), "status": "unknown", "reason": "ffprobe is unavailable"}
+        if ffprobe:
+            try:
+                probe = subprocess.run(
+                    [ffprobe, "-v", "error", "-select_streams", "a:0",
+                     "-show_entries", "stream=codec_name,duration", "-of", "json", str(path)],
+                    capture_output=True, text=True, timeout=15, check=False,
+                )
+                streams = json.loads(probe.stdout or "{}").get("streams") or []
+                if probe.returncode == 0 and streams:
+                    result = {"video_id": path.parent.name, "path": str(path), "url": media_url(path), "status": "yes",
+                              "reason": f"{streams[0].get('codec_name', 'audio')} stream is readable"}
+                else:
+                    result = {"video_id": path.parent.name, "path": str(path), "url": media_url(path), "status": "no",
+                              "reason": (probe.stderr or "no readable audio stream").strip().splitlines()[-1][:240]}
+            except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+                result["reason"] = str(exc)[:240]
+        audio_checks.append(result)
+
+    def recoverability(path: Path, video_dir: Path) -> dict:
+        """Check whether a raw stream can be remuxed from the final MKV."""
+        ffprobe, ffmpeg = shutil.which("ffprobe"), shutil.which("ffmpeg")
+        mkv = next(iter(sorted(video_dir.glob("*.out.mkv"))), None)
+        if not ffprobe or not ffmpeg or not mkv:
+            return {"status": "unknown", "reason": "ffprobe/ffmpeg or final MKV is unavailable"}
+        match = re.search(r"\.out\.f(\d+)\.", path.name)
+        format_id = match.group(1) if match else ""
+        stream_type = "audio" if path.suffix.lower() == ".m4a" or format_id in {"140", "251"} else "video"
+        cache_key = (str(video_dir), stream_type, path.suffix.lower())
+        if cache_key in recoverability_cache:
+            return recoverability_cache[cache_key]
+        try:
+            selector = "a:0" if stream_type == "audio" else "v:0"
+            probe = subprocess.run(
+                [ffprobe, "-v", "error", "-select_streams", selector,
+                 "-show_entries", "stream=codec_name", "-of", "json", str(mkv)],
+                capture_output=True, text=True, timeout=15, check=False,
+            )
+            streams = json.loads(probe.stdout or "{}").get("streams") or []
+            if probe.returncode or not streams:
+                result = {"status": "no", "reason": f"final MKV has no {stream_type} stream"}
+                recoverability_cache[cache_key] = result
+                return result
+            output_format = {".mp4": "mp4", ".webm": "webm", ".m4a": "ipod"}.get(path.suffix.lower())
+            if not output_format:
+                result = {"status": "unknown", "reason": "unsupported target container"}
+                recoverability_cache[cache_key] = result
+                return result
+            mux = subprocess.run(
+                [ffmpeg, "-v", "error", "-t", "0.1", "-i", str(mkv), "-map", f"0:{'a' if stream_type == 'audio' else 'v'}:0",
+                 "-c", "copy", "-f", output_format, "-y", "/dev/null"],
+                capture_output=True, text=True, timeout=30, check=False,
+            )
+            if mux.returncode:
+                detail = (mux.stderr or "container remux rejected").strip().splitlines()[-1]
+                result = {"status": "no", "reason": detail[:240]}
+                recoverability_cache[cache_key] = result
+                return result
+            result = {"status": "yes", "reason": f"{streams[0].get('codec_name', 'matching')} stream can be remuxed"}
+            recoverability_cache[cache_key] = result
+            return result
+        except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+            result = {"status": "unknown", "reason": str(exc)[:240]}
+            recoverability_cache[cache_key] = result
+            return result
+
+    for channel_dir in FALLBACK_DIR.iterdir() if FALLBACK_DIR.is_dir() else []:
+        for video_dir in channel_dir.iterdir() if channel_dir.is_dir() else []:
+            if video_dir.is_dir() and not _is_playlist_dir(video_dir) and video_dir.name in primary:
+                for path in video_dir.rglob("*"):
+                    if path.is_file():
+                        add(path, "fallback duplicate", "complete primary copy exists under merged/")
+
+    for root in (MERGED_DIR, LEGACY_MERGED_DIR):
+        for path in root.rglob("*") if root.is_dir() else []:
+            if not path.is_file() or not path.parent.is_dir():
+                continue
+            video_dir = path.parent
+            if _is_playlist_dir(video_dir):
+                continue
+            video, audio = media_state(video_dir)
+            if path.suffix.lower() in {".m4a", ".opus", ".mp3", ".webm"} and not _SIDECAR_RE.search(path.name):
+                check_audio(path)
+            if not (video and audio):
+                continue
+            if _SIDECAR_RE.search(path.name):
+                add(path, "raw format sidecar", "final playable video and audio files exist")
+                entries[-1]["recoverability"] = recoverability(path, video_dir)
+            elif re.search(r"\.out\.webm$", path.name, re.IGNORECASE):
+                add(path, "optional clean duplicate", "final MKV and M4A files exist")
+
+    entries.sort(key=lambda item: (-item["bytes"], item["path"]))
+    audio_checks.sort(key=lambda item: item["path"])
+    safe_paths = {item["path"] for item in entries}
+    inventory: dict[str, list[dict]] = {}
+    for root in (MERGED_DIR, LEGACY_MERGED_DIR, FALLBACK_DIR):
+        for path in root.rglob("*") if root.is_dir() else []:
+            if not path.is_file():
+                continue
+            if _is_playlist_dir(path.parent):
+                continue
+            item = {"path": str(path), "url": media_url(path),
+                    "status": "delete" if str(path) in safe_paths else "keep",
+                    "bytes": path.stat().st_size}
+            inventory.setdefault(path.parent.name, []).append(item)
+    for files in inventory.values():
+        files.sort(key=lambda item: item["path"])
+    expected_state: dict[str, dict[str, bool]] = {}
+    for root in (MERGED_DIR, LEGACY_MERGED_DIR, FALLBACK_DIR):
+        for channel_dir in root.iterdir() if root.is_dir() else []:
+            for video_dir in channel_dir.iterdir() if channel_dir.is_dir() else []:
+                if not video_dir.is_dir() or _is_playlist_dir(video_dir):
+                    continue
+                checks = {
+                    "playable video (.out.mkv)": bool(list(video_dir.glob("*.out.mkv"))),
+                    "playable audio (.out.m4a)": bool(list(video_dir.glob("*.out.m4a"))),
+                    "metadata (.out.info.json)": bool(list(video_dir.glob("*.out.info.json"))),
+                    "formats (.out.formats.json)": bool(list(video_dir.glob("*.out.formats.json"))),
+                    "description (.out.description)": bool(list(video_dir.glob("*.out.description"))),
+                    "thumbnail (.out.webp/.png/.jpg)": bool(list(video_dir.glob("*.out.webp")) or list(video_dir.glob("*.out.png")) or list(video_dir.glob("*.out.jpg"))),
+                }
+                state = expected_state.setdefault(video_dir.name, {label: False for label in checks})
+                for label, present in checks.items():
+                    state[label] = state.get(label, False) or present
+    expected = {video_id: sorted(label for label, present in state.items() if not present)
+                for video_id, state in expected_state.items()}
+    try:
+        full_checks = json.loads(_VERIFY_CACHE.read_text()) if _VERIFY_CACHE.is_file() else {}
+    except (OSError, ValueError):
+        full_checks = {}
+    return {"dry_run": True, "entries": entries, "count": len(entries),
+            "bytes": sum(item["bytes"] for item in entries), "audio_checks": audio_checks,
+            "location_checks": location_checks, "inventory": inventory, "missing_expected": expected,
+            "full_checks": full_checks}
 
 
 def _scan_tags() -> dict:
@@ -888,6 +1123,11 @@ def catalog_page():
     return render_template("catalog.html")
 
 
+@app.get("/library-export")
+def library_export_page():
+    return render_template("library_export.html")
+
+
 @app.post("/api/media/catalog/refresh")
 @limiter.limit("6 per minute")
 def api_media_catalog_refresh():
@@ -898,6 +1138,359 @@ def api_media_catalog_refresh():
         app.logger.exception("Catalog refresh failed")
         return jsonify(ok=False, error="catalog refresh failed"), 503
     return jsonify(ok=True, count=count)
+
+
+@app.get("/cleanup")
+def cleanup_page():
+    return render_template("cleanup.html")
+
+
+@app.get("/api/media/cleanup-report")
+@limiter.limit("12 per minute")
+def api_media_cleanup_report():
+    return jsonify(_get_cleanup_report())
+
+
+def _get_cleanup_report() -> dict:
+    global _cleanup_report_cache
+    now = time.time()
+    if _cleanup_report_cache and now - _cleanup_report_cache[0] < 15:
+        return _cleanup_report_cache[1]
+    report = _cleanup_report()
+    _cleanup_report_cache = (now, report)
+    return report
+
+
+def _cleanup_candidate_paths() -> set[Path]:
+    return {Path(item["path"]).resolve() for item in _get_cleanup_report()["entries"]}
+
+
+def _legacy_move_checks() -> list[dict]:
+    checks = []
+    for channel_dir in LEGACY_MERGED_DIR.iterdir() if LEGACY_MERGED_DIR.is_dir() else []:
+        for video_dir in channel_dir.iterdir() if channel_dir.is_dir() else []:
+            if not video_dir.is_dir() or _is_playlist_dir(video_dir):
+                continue
+            target = MERGED_DIR / channel_dir.name / video_dir.name
+            item = {"video_id": video_dir.name, "status": "conflict" if target.exists() else "movable",
+                    "source": str(video_dir), "target": str(target)}
+            if target.exists():
+                matches, different, unique = [], [], []
+                for source_file in video_dir.rglob("*"):
+                    if not source_file.is_file():
+                        continue
+                    target_file = target / source_file.relative_to(video_dir)
+                    if not target_file.is_file():
+                        unique.append(str(source_file)); continue
+                    try:
+                        source_hash = hashlib.md5(source_file.read_bytes()).hexdigest()
+                        target_hash = hashlib.md5(target_file.read_bytes()).hexdigest()
+                    except OSError:
+                        different.append(str(source_file)); continue
+                    if source_hash == target_hash:
+                        matches.append(str(source_file))
+                    else:
+                        different.append({"source": str(source_file), "target": str(target_file), "name": source_file.name})
+                item["comparison"] = {"matches": matches, "different": different, "legacy_only": unique,
+                                       "empty": not any(path.is_file() for path in video_dir.rglob("*"))}
+            else:
+                item["empty"] = not any(path.is_file() for path in video_dir.rglob("*"))
+            checks.append(item)
+    return checks
+
+
+def _start_cleanup_task(worker) -> str:
+    task_id = uuid.uuid4().hex[:12]
+    with _lock:
+        _cleanup_tasks[task_id] = {"id": task_id, "status": "running", "phase": "starting", "processed": 0, "total": 0}
+
+    def run():
+        try:
+            result = worker(task_id) or {}
+            with _lock:
+                _cleanup_tasks[task_id].update(result, status="completed", phase="done")
+            global _cleanup_report_cache
+            _cleanup_report_cache = None
+        except Exception as exc:
+            app.logger.exception("Cleanup task failed: %s", task_id)
+            with _lock:
+                _cleanup_tasks[task_id].update(status="failed", phase="error", error=str(exc))
+    threading.Thread(target=run, name=f"cleanup-{task_id}", daemon=True).start()
+    return task_id
+
+
+@app.get("/api/media/cleanup/tasks/<string:task_id>")
+def api_media_cleanup_task(task_id: str):
+    with _lock:
+        task = dict(_cleanup_tasks.get(task_id) or {})
+    return jsonify(task) if task else (jsonify(ok=False, error="cleanup task not found"), 404)
+
+
+@app.post("/api/media/cleanup/verify")
+@limiter.limit("3 per minute")
+def api_media_cleanup_verify():
+    def worker(task_id):
+        report = _get_cleanup_report()
+        paths = [Path(x["path"]) for files in report.get("inventory", {}).values() for x in files
+                 if Path(x["path"]).suffix.lower() in {".mkv", ".mp4", ".webm", ".m4a", ".opus", ".mp3"}]
+        try:
+            cache = json.loads(_VERIFY_CACHE.read_text()) if _VERIFY_CACHE.is_file() else {}
+        except (OSError, ValueError):
+            cache = {}
+        results = {}
+        with _lock: _cleanup_tasks[task_id].update(phase="full verification", total=len(paths))
+        for index, path in enumerate(paths, 1):
+            digest = hashlib.md5()
+            with path.open("rb") as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""): digest.update(chunk)
+            key = str(path)
+            old = cache.get(key)
+            if old and old.get("md5") == digest.hexdigest():
+                result = old
+            else:
+                probe = shutil.which("ffmpeg")
+                if not probe: result = {"md5": digest.hexdigest(), "status": "unknown", "reason": "ffmpeg unavailable"}
+                else:
+                    check = subprocess.run([probe, "-v", "error", "-i", str(path), "-f", "null", "-"], capture_output=True, text=True, timeout=3600, check=False)
+                    result = {"md5": digest.hexdigest(), "status": "yes" if check.returncode == 0 else "no", "reason": "full decode passed" if check.returncode == 0 else (check.stderr or "full decode failed").strip().splitlines()[-1][:240]}
+                cache[key] = result
+            results[key] = {**result, "video_id": path.parent.name, "path": key, "url": media_url(path)}
+            with _lock: _cleanup_tasks[task_id]["processed"] = index
+        _VERIFY_CACHE.parent.mkdir(parents=True, exist_ok=True); _VERIFY_CACHE.write_text(json.dumps(cache, indent=2))
+        return {"checks": list(results.values()), "processed": len(paths), "total": len(paths)}
+    return jsonify(ok=True, task_id=_start_cleanup_task(worker)), 202
+
+
+@app.post("/api/media/cleanup/retry-missing")
+@limiter.limit("6 per minute")
+def api_media_cleanup_retry_missing():
+    report = _get_cleanup_report()
+    video_ids = set(report.get("inventory", {}))
+    missing = []
+    skipped = []
+    for video_id in video_ids:
+        video = _resolve_media_by_video_id(video_id) or {}
+        files = video.get("files") or {}
+        if files.get("video") and files.get("audio"):
+            continue
+        if _permanent_failure(video_id):
+            skipped.append(video_id)
+        else:
+            missing.append(video_id)
+    queue_status = "pending" if catalog.setting(CATALOG_DB, "default_download_mode", "immediate") == "immediate" else "paused"
+    queued = []
+    for video_id in sorted(missing):
+        item_id, already = _enqueue_target(video_id, "video", status=queue_status)
+        if not already:
+            queued.append(item_id)
+    if queued:
+        _queue_wakeup.set()
+    return jsonify(ok=True, found=len(missing), queued=len(queued), skipped_permanent=len(skipped))
+
+
+@app.post("/api/media/cleanup/delete")
+@limiter.limit("30 per minute")
+def api_media_cleanup_delete():
+    path = Path(str((request.get_json(silent=True) or {}).get("path") or "")).resolve()
+    if path not in _cleanup_candidate_paths():
+        return jsonify(ok=False, error="file is not a current cleanup candidate"), 400
+    def worker(task_id):
+        with _lock: _cleanup_tasks[task_id].update(phase="deleting", total=1)
+        path.unlink()
+        return {"deleted": 1, "processed": 1, "total": 1, "path": str(path)}
+    return jsonify(ok=True, task_id=_start_cleanup_task(worker)), 202
+
+
+@app.post("/api/media/cleanup/delete-all")
+@limiter.limit("3 per minute")
+def api_media_cleanup_delete_all():
+    def worker(task_id):
+        paths = list(_cleanup_candidate_paths())
+        with _lock: _cleanup_tasks[task_id].update(phase="deleting", total=len(paths))
+        removed = bytes_removed = 0
+        for index, path in enumerate(paths, 1):
+            try:
+                size = path.stat().st_size; path.unlink(); removed += 1; bytes_removed += size
+            except OSError: pass
+            with _lock: _cleanup_tasks[task_id]["processed"] = index
+        return {"removed": removed, "bytes": bytes_removed, "total": len(paths), "processed": len(paths)}
+    return jsonify(ok=True, task_id=_start_cleanup_task(worker)), 202
+
+
+@app.post("/api/media/cleanup/move-legacy")
+@limiter.limit("10 per minute")
+def api_media_cleanup_move_legacy():
+    video_id = str((request.get_json(silent=True) or {}).get("video_id") or "").strip()
+    check = next((item for item in _legacy_move_checks() if item["video_id"] == video_id), None)
+    if not check or check["status"] != "movable":
+        return jsonify(ok=False, error="legacy folder is not safely movable"), 400
+    source, target = Path(check["source"]).resolve(), Path(check["target"]).resolve()
+    if not source.is_relative_to(LEGACY_MERGED_DIR) or target.exists():
+        return jsonify(ok=False, error="invalid or conflicting move target"), 400
+    def worker(task_id):
+        total = sum(1 for item in source.rglob("*") if item.is_file())
+        with _lock: _cleanup_tasks[task_id].update(phase="moving", total=total)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(source), str(target))
+        with _lock: _cleanup_tasks[task_id]["processed"] = total
+        return {"moved": 1, "video_id": video_id, "source": str(source), "target": str(target), "total": total, "processed": total}
+    return jsonify(ok=True, task_id=_start_cleanup_task(worker)), 202
+
+
+@app.post("/api/media/cleanup/move-legacy-all")
+@limiter.limit("2 per minute")
+def api_media_cleanup_move_legacy_all():
+    movable = [item for item in _legacy_move_checks() if item["status"] == "movable"]
+    def worker(task_id):
+        with _lock: _cleanup_tasks[task_id].update(phase="moving legacy folders", total=len(movable))
+        moved = 0
+        for index, item in enumerate(movable, 1):
+            source, target = Path(item["source"]).resolve(), Path(item["target"]).resolve()
+            with _lock: _cleanup_tasks[task_id]["phase"] = f"moving {item['video_id']}"
+            if source.is_relative_to(LEGACY_MERGED_DIR) and not target.exists():
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(source), str(target)); moved += 1
+            with _lock: _cleanup_tasks[task_id]["processed"] = index
+        return {"moved": moved, "skipped": len(movable) - moved, "total": len(movable), "processed": len(movable)}
+    return jsonify(ok=True, task_id=_start_cleanup_task(worker)), 202
+
+
+@app.post("/api/media/cleanup/delete-legacy-matches")
+@limiter.limit("10 per minute")
+def api_media_cleanup_delete_legacy_matches():
+    video_id = str((request.get_json(silent=True) or {}).get("video_id") or "").strip()
+    check = next((item for item in _legacy_move_checks() if item["video_id"] == video_id), None)
+    if not check or check["status"] != "conflict":
+        return jsonify(ok=False, error="no legacy conflict found"), 400
+    paths = [Path(path).resolve() for path in check.get("comparison", {}).get("matches", [])]
+    def worker(task_id):
+        with _lock: _cleanup_tasks[task_id].update(phase="deleting matching legacy files", total=len(paths))
+        removed = 0
+        for index, path in enumerate(paths, 1):
+            if path.is_relative_to(LEGACY_MERGED_DIR) and path.is_file():
+                path.unlink(); removed += 1
+            with _lock: _cleanup_tasks[task_id]["processed"] = index
+        return {"deleted": removed, "processed": len(paths), "total": len(paths)}
+    return jsonify(ok=True, task_id=_start_cleanup_task(worker)), 202
+
+
+@app.post("/api/media/cleanup/delete-legacy-different")
+@limiter.limit("10 per minute")
+def api_media_cleanup_delete_legacy_different():
+    video_id = str((request.get_json(silent=True) or {}).get("video_id") or "").strip()
+    check = next((item for item in _legacy_move_checks() if item["video_id"] == video_id), None)
+    if not check or check["status"] != "conflict":
+        return jsonify(ok=False, error="no legacy conflict found"), 400
+    paths = [Path(item["source"]).resolve() for item in check.get("comparison", {}).get("different", [])]
+    def worker(task_id):
+        with _lock: _cleanup_tasks[task_id].update(phase="deleting different legacy files", total=len(paths))
+        removed = 0
+        for index, path in enumerate(paths, 1):
+            if path.is_relative_to(LEGACY_MERGED_DIR) and path.is_file(): path.unlink(); removed += 1
+            with _lock: _cleanup_tasks[task_id]["processed"] = index
+        return {"deleted": removed, "processed": len(paths), "total": len(paths)}
+    return jsonify(ok=True, task_id=_start_cleanup_task(worker)), 202
+
+
+@app.post("/api/media/cleanup/move-legacy-only")
+@limiter.limit("10 per minute")
+def api_media_cleanup_move_legacy_only():
+    video_id = str((request.get_json(silent=True) or {}).get("video_id") or "").strip()
+    check = next((item for item in _legacy_move_checks() if item["video_id"] == video_id), None)
+    if not check or check["status"] != "conflict":
+        return jsonify(ok=False, error="no legacy conflict found"), 400
+    source_root, target_root = Path(check["source"]).resolve(), Path(check["target"]).resolve()
+    paths = [Path(path).resolve() for path in check.get("comparison", {}).get("legacy_only", [])]
+    def worker(task_id):
+        with _lock: _cleanup_tasks[task_id].update(phase="moving legacy-only files", total=len(paths))
+        moved = 0
+        for index, path in enumerate(paths, 1):
+            target = target_root / path.relative_to(source_root)
+            if path.is_relative_to(LEGACY_MERGED_DIR) and not target.exists():
+                target.parent.mkdir(parents=True, exist_ok=True); shutil.move(str(path), str(target)); moved += 1
+            with _lock: _cleanup_tasks[task_id]["processed"] = index
+        return {"moved": moved, "processed": len(paths), "total": len(paths)}
+    return jsonify(ok=True, task_id=_start_cleanup_task(worker)), 202
+
+
+def _empty_legacy_dirs(source: Path) -> int:
+    """Remove only empty directories in the legacy tree, never files."""
+    removed = 0
+    directories = sorted((path for path in source.rglob("*") if path.is_dir()),
+                         key=lambda path: len(path.parts), reverse=True)
+    directories.append(source)
+    for directory in directories:
+        try:
+            directory.rmdir()
+        except OSError:
+            continue
+        removed += 1
+    parent = source.parent
+    if parent.is_relative_to(LEGACY_MERGED_DIR):
+        try:
+            parent.rmdir()
+        except OSError:
+            pass
+        else:
+            removed += 1
+    return removed
+
+
+@app.post("/api/media/cleanup/delete-empty-legacy")
+@limiter.limit("10 per minute")
+def api_media_cleanup_delete_empty_legacy():
+    video_id = str((request.get_json(silent=True) or {}).get("video_id") or "").strip()
+    check = next((item for item in _legacy_move_checks() if item["video_id"] == video_id), None)
+    source = Path(check["source"]).resolve() if check else None
+    if not source or not source.is_relative_to(LEGACY_MERGED_DIR) or not source.is_dir():
+        return jsonify(ok=False, error="legacy folder not found"), 400
+    if any(path.is_file() for path in source.rglob("*")):
+        return jsonify(ok=False, error="legacy folder is not empty"), 400
+
+    def worker(task_id):
+        with _lock: _cleanup_tasks[task_id].update(phase="deleting empty legacy directories", total=1)
+        removed = _empty_legacy_dirs(source)
+        with _lock: _cleanup_tasks[task_id]["processed"] = 1
+        return {"deleted_dirs": removed, "processed": 1, "total": 1}
+    return jsonify(ok=True, task_id=_start_cleanup_task(worker)), 202
+
+
+@app.post("/api/media/cleanup/delete-empty-legacy-all")
+@limiter.limit("3 per minute")
+def api_media_cleanup_delete_empty_legacy_all():
+    sources = []
+    for check in _legacy_move_checks():
+        source = Path(check["source"]).resolve()
+        if source.is_relative_to(LEGACY_MERGED_DIR) and source.is_dir() and not any(path.is_file() for path in source.rglob("*")):
+            sources.append(source)
+
+    def worker(task_id):
+        with _lock: _cleanup_tasks[task_id].update(phase="deleting empty legacy directories", total=len(sources))
+        removed = 0
+        for index, source in enumerate(sources, 1):
+            if source.is_dir() and not any(path.is_file() for path in source.rglob("*")):
+                removed += _empty_legacy_dirs(source)
+            with _lock: _cleanup_tasks[task_id]["processed"] = index
+        return {"deleted_dirs": removed, "processed": len(sources), "total": len(sources)}
+    return jsonify(ok=True, task_id=_start_cleanup_task(worker)), 202
+
+
+@app.post("/api/media/cleanup/delete-legacy-different-all")
+@limiter.limit("3 per minute")
+def api_media_cleanup_delete_legacy_different_all():
+    paths = [Path(item["source"]).resolve()
+             for check in _legacy_move_checks() if check["status"] == "conflict"
+             for item in check.get("comparison", {}).get("different", [])]
+
+    def worker(task_id):
+        with _lock: _cleanup_tasks[task_id].update(phase="deleting different legacy files", total=len(paths))
+        removed = 0
+        for index, path in enumerate(paths, 1):
+            if path.is_relative_to(LEGACY_MERGED_DIR) and path.is_file():
+                path.unlink(); removed += 1
+            with _lock: _cleanup_tasks[task_id]["processed"] = index
+        return {"deleted": removed, "processed": len(paths), "total": len(paths)}
+    return jsonify(ok=True, task_id=_start_cleanup_task(worker)), 202
 
 
 @app.get("/wordcloud")
@@ -929,6 +1522,7 @@ def api_docs_page():
         ("POST", "/api/youtube/retry/<video_id>", "Retry a failed video"),
         ("GET", "/api/youtube/status/<video_id>", "Video download progress"),
         ("POST", "/api/youtube/playlist/get/<playlist_id>", "Add or start a playlist download"),
+        ("POST", "/api/youtube/playlist/prepare/<playlist_id>", "Save playlist name and members without downloading"),
         ("GET", "/api/youtube/playlist/status/<playlist_id>", "Playlist download progress"),
         ("GET", "/api/downloads/status", "Active and recent download status"),
         ("GET", "/api/queue", "Persistent queue items and default mode"),
@@ -937,12 +1531,17 @@ def api_docs_page():
         ("POST", "/api/queue/<item_id>/cancel", "Cancel a pending queue item"),
         ("GET/POST", "/api/settings", "Read or update queue defaults"),
         ("GET", "/api/media/library", "List local media"),
+        ("GET", "/api/media/library/files", "List links for every local library file"),
+        ("GET", "/api/media/library/files.txt", "Export every local library file link as text"),
+        ("GET", "/api/media/library/youtube.txt", "Export all video and playlist YouTube links"),
+        ("GET", "/api/media/library/ids.txt", "Export all video and playlist IDs"),
         ("GET", "/api/media/resolve/<video_id>", "Resolve playable local media"),
         ("GET", "/api/media/details/<channel_id>/<video_id>", "Return files and metadata"),
         ("GET", "/api/media/playlists", "List indexed playlists"),
         ("GET", "/api/media/playlists/<playlist_id>", "Return playlist members"),
         ("GET", "/api/media/playlists/<playlist_id>.m3u?mode=video|audio", "Export a VLC playlist"),
         ("GET", "/api/media/catalog", "Paginated catalog data"),
+        ("GET", "/api/media/cleanup-report", "Dry-run cleanup candidates and disk savings"),
         ("GET", "/api/media/tags", "Tag counts and grouped videos"),
         ("GET", "/api/media/failures", "Latest unresolved failures"),
         ("GET", "/api/media/download-history", "Persistent download history"),
@@ -955,7 +1554,7 @@ def api_docs_page():
 @app.get("/sitemap")
 def sitemap_page():
     groups = [
-        ("Library", [("Media library", "/"), ("Playlists", "/playlists"), ("Video detail", "/video/dQw4w9WgXcQ"), ("Catalog", "/catalog")]),
+        ("Library", [("Media library", "/"), ("Playlists", "/playlists"), ("Video detail", "/video/dQw4w9WgXcQ"), ("Catalog", "/catalog"), ("Export files", "/library-export")]),
         ("Downloads", [("Downloads status", "/downloads"), ("Persistent queue", "/queue"), ("Downloaded history", "/downloaded")]),
         ("Tools", [("Tools hub", "/tools"), ("API documentation", "/api-docs"), ("System status", "/status"), ("Tags", "/tags"), ("Word cloud", "/wordcloud"), ("Tag cloud", "/tagcloud")]),
         ("Integration", [("Health API", "/health"), ("Extension download", "/extension.zip")]),
@@ -1051,14 +1650,98 @@ def api_media_catalog():
         return jsonify(error="catalog is still being built"), 503
     items = []
     for row in rows:
+        video_id, source_root, channel_id = row[0], row[1], row[2]
         files = json.loads(row[9] or "{}")
-        items.append({"video_id": row[0], "source_root": row[1], "channel_id": row[2], "title": row[3], "artist": row[4], "album": row[5], "uploader": row[6], "upload_date": row[7], "duration": row[8], "files": files, "formats": json.loads(row[10] or "[]"), "failure_reason": row[11] or ""})
+        formats = json.loads(row[10] or "[]")
+        # A download may finish in merged/ after the catalog's last scan. In
+        # that case, rebuild this row from the live directory so thumbnail and
+        # media links do not remain pointed at a stale legacy location.
+        live_roots = [
+            (MERGED_DIR, "merged"),
+            (LEGACY_MERGED_DIR, "legacy"),
+            (FALLBACK_DIR, "bestfallback"),
+        ]
+        live_dir = next((root / channel_id / video_id for root, name in live_roots
+                         if (root / channel_id / video_id).is_dir() and not _is_playlist_dir(root / channel_id / video_id)), None)
+        if live_dir:
+            live_source = next(name for root, name in live_roots if live_dir.is_relative_to(root))
+            live_info = catalog._info(live_dir)
+            source_root, files, formats = live_source, catalog._files(live_dir, channel_id, video_id, live_source), catalog._formats(live_dir)
+            if live_info:
+                title = live_info.get("title") or row[3]
+                artist = live_info.get("artist") or live_info.get("uploader") or row[4]
+                album = live_info.get("album") or live_info.get("playlist_title") or row[5]
+                uploader = live_info.get("uploader") or live_info.get("channel") or row[6]
+                upload_date = live_info.get("upload_date") or row[7]
+                duration = live_info.get("duration") or row[8]
+            else:
+                title, artist, album, uploader, upload_date, duration = row[3:9]
+        else:
+            title, artist, album, uploader, upload_date, duration = row[3:9]
+        items.append({"video_id": video_id, "source_root": source_root, "channel_id": channel_id, "title": title, "artist": artist, "album": album, "uploader": uploader, "upload_date": upload_date, "duration": duration, "files": files, "formats": formats, "failure_reason": row[11] or ""})
     return jsonify(items=items, page=page, per_page=per_page, total=total, pages=(total + per_page - 1) // per_page)
 
 
 @app.get("/api/media/library")
 def api_media_library():
     return jsonify(videos=_scan_library())
+
+
+@app.get("/api/media/library/files")
+def api_media_library_files():
+    files = []
+    for video in _scan_library():
+        for item in video.get("details", {}).get("files", []):
+            files.append({"video_id": video["video_id"], "title": video["title"], **item})
+    return jsonify(files=files, count=len(files))
+
+
+@app.get("/api/media/library/files.txt")
+def api_media_library_files_text():
+    lines = []
+    for video in _scan_library():
+        for item in video.get("details", {}).get("files", []):
+            lines.append(f"{video['video_id']}\t{video['title']}\t{item['name']}\t{request.host_url.rstrip('/')}{item['url']}")
+    return Response("\n".join(lines) + ("\n" if lines else ""), mimetype="text/plain",
+                    headers={"Content-Disposition": "attachment; filename=dihi-library-files.txt"})
+
+
+def _library_youtube_exports() -> tuple[list[str], list[str]]:
+    videos, playlists, video_ids, playlist_ids = [], [], [], []
+    seen_videos, seen_playlists = set(), set()
+    for video in _scan_library():
+        video_id = str(video.get("video_id") or "").strip()
+        info = video.get("details", {}).get("metadata", {}).get("info_json", {})
+        if video_id and video_id not in seen_videos:
+            seen_videos.add(video_id); video_ids.append(video_id)
+            videos.append(str(info.get("webpage_url") or f"https://www.youtube.com/watch?v={video_id}"))
+        playlist_id = str(info.get("playlist_id") or "").strip()
+        if playlist_id and playlist_id not in seen_playlists:
+            seen_playlists.add(playlist_id); playlist_ids.append(playlist_id)
+            playlists.append(str(info.get("playlist_webpage_url") or f"https://www.youtube.com/playlist?list={playlist_id}"))
+    try:
+        for playlist in catalog.playlists(CATALOG_DB):
+            playlist_id = str(playlist.get("playlist_id") or "").strip()
+            if playlist_id and playlist_id not in seen_playlists:
+                seen_playlists.add(playlist_id); playlist_ids.append(playlist_id)
+                playlists.append(str(playlist.get("webpage_url") or f"https://www.youtube.com/playlist?list={playlist_id}"))
+    except sqlite3.Error:
+        pass
+    return videos + playlists, [*(f"video {value}" for value in video_ids), *(f"playlist {value}" for value in playlist_ids)]
+
+
+@app.get("/api/media/library/youtube.txt")
+def api_media_library_youtube_text():
+    links, _ids = _library_youtube_exports()
+    return Response("\n".join(links) + ("\n" if links else ""), mimetype="text/plain",
+                    headers={"Content-Disposition": "attachment; filename=dihi-youtube-links.txt"})
+
+
+@app.get("/api/media/library/ids.txt")
+def api_media_library_ids_text():
+    _links, ids = _library_youtube_exports()
+    return Response("\n".join(ids) + ("\n" if ids else ""), mimetype="text/plain",
+                    headers={"Content-Disposition": "attachment; filename=dihi-youtube-and-playlist-ids.txt"})
 
 
 @app.get("/api/media/playlists")
@@ -1080,6 +1763,32 @@ def api_media_playlist(playlist_id: str):
         video = videos_by_id.get(member["video_id"])
         members.append({**member, "video": video})
     return jsonify(playlist=playlist, videos=members)
+
+
+@app.post("/api/media/playlists/<string:playlist_id>/refresh")
+@limiter.limit("5 per minute")
+def api_media_playlist_refresh(playlist_id: str):
+    """Refresh membership only; never removes local media files."""
+    if not PLAYLIST_ID_RE.match(playlist_id):
+        return jsonify(error="invalid playlist id"), 400
+    members = _prepare_playlist_membership(playlist_id)
+    if members is None:
+        return jsonify(ok=False, error="could not refresh playlist metadata"), 503
+    return jsonify(ok=True, playlist_id=playlist_id, members=len(members))
+
+
+@app.post("/api/media/playlists/<string:playlist_id>/finish")
+@limiter.limit("10 per minute")
+def api_media_playlist_finish(playlist_id: str):
+    """Start the playlist worker; it downloads incomplete members sequentially."""
+    if not PLAYLIST_ID_RE.match(playlist_id):
+        return jsonify(error="invalid playlist id"), 400
+    if not any(item["playlist_id"] == playlist_id for item in catalog.playlists(CATALOG_DB)):
+        return jsonify(error="playlist not found"), 404
+    item_id, already = _enqueue_target(playlist_id, "playlist", status="pending")
+    _queue_wakeup.set()
+    return jsonify(ok=True, playlist_id=playlist_id, queued=0 if already else 1,
+                   already_queued=already, queue_id=item_id)
 
 
 @app.get("/api/media/playlists/<string:playlist_id>.m3u")
@@ -1134,7 +1843,7 @@ def api_downloads_status():
 
 @app.get("/api/queue")
 def api_queue_list():
-    return jsonify(items=catalog.queue_items(CATALOG_DB),
+    return jsonify(items=_repair_queue_kinds(catalog.queue_items(CATALOG_DB)),
                    default_mode=catalog.setting(CATALOG_DB, "default_download_mode", "immediate"))
 
 
@@ -1192,6 +1901,27 @@ def api_queue_cancel(item_id: int):
     return jsonify(ok=False, error="pending queue item not found"), 404
 
 
+@app.post("/api/queue/start-all")
+def api_queue_start_all():
+    changed = 0
+    for item in catalog.queue_items(CATALOG_DB, 2000):
+        if item["status"] == "paused":
+            catalog.queue_set_status(CATALOG_DB, int(item["id"]), "pending", scheduled_at=time.time())
+            changed += 1
+    _queue_wakeup.set()
+    return jsonify(ok=True, started=changed)
+
+
+@app.post("/api/queue/cancel-all")
+def api_queue_cancel_all():
+    cancelled = 0
+    for item in catalog.queue_items(CATALOG_DB, 2000):
+        if item["status"] in {"pending", "paused"}:
+            catalog.queue_set_status(CATALOG_DB, int(item["id"]), "cancelled", finished_at=time.time(), error="cancelled by user")
+            cancelled += 1
+    return jsonify(ok=True, cancelled=cancelled)
+
+
 @app.route("/api/settings", methods=["GET", "POST"])
 def api_settings():
     if request.method == "POST":
@@ -1200,7 +1930,18 @@ def api_settings():
         if mode not in {"immediate", "queue"}:
             return jsonify(ok=False, error="default_download_mode must be immediate or queue"), 400
         catalog.set_setting(CATALOG_DB, "default_download_mode", mode)
-    return jsonify(default_download_mode=catalog.setting(CATALOG_DB, "default_download_mode", "immediate"))
+        for key, maximum in (("max_concurrent_downloads", 10), ("max_concurrent_playlists", 5)):
+            if key in payload:
+                try:
+                    value = int(payload[key])
+                except (TypeError, ValueError):
+                    return jsonify(ok=False, error=f"{key} must be an integer"), 400
+                if not 1 <= value <= maximum:
+                    return jsonify(ok=False, error=f"{key} must be between 1 and {maximum}"), 400
+                catalog.set_setting(CATALOG_DB, key, str(value))
+    return jsonify(default_download_mode=catalog.setting(CATALOG_DB, "default_download_mode", "immediate"),
+                   max_concurrent_downloads=_queue_limit("video"),
+                   max_concurrent_playlists=_queue_limit("playlist"))
 
 
 @app.get("/api/media/details/<string:channel_id>/<string:video_id>")
@@ -1324,6 +2065,9 @@ def api_youtube_get(video_id: str):
     vid = _normalize_id(video_id)
     if not vid:
         return jsonify(ok=False, error="invalid video id"), 400
+    permanent = _permanent_failure(vid)
+    if permanent:
+        return jsonify(ok=False, error=f"not retryable: {permanent[0]} — {permanent[1]}"), 409
 
     queue_status = "pending" if catalog.setting(CATALOG_DB, "default_download_mode", "immediate") == "immediate" else "paused"
     item_id, already_queued = _enqueue_target(vid, "video", status=queue_status)
@@ -1467,6 +2211,19 @@ def api_youtube_playlist_get(playlist_id: str):
         started=not already_queued,
         already_running=already_queued,
     )
+
+
+@app.post("/api/youtube/playlist/prepare/<string:playlist_id>")
+@limiter.limit("5 per minute")
+def api_youtube_playlist_prepare(playlist_id: str):
+    """Read and save playlist membership without starting downloads."""
+    pid = _normalize_playlist_id(playlist_id)
+    if not pid:
+        return jsonify(ok=False, error="invalid playlist id"), 400
+    members = _prepare_playlist_membership(pid)
+    if members is None:
+        return jsonify(ok=False, error="could not read playlist metadata"), 503
+    return jsonify(ok=True, id=pid, prepared=True, members=len(members))
 
 
 @app.get("/api/youtube/playlist/status/<string:playlist_id>")

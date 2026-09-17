@@ -88,6 +88,7 @@ Core UI/media routes:
 - `GET /queue` renders the persistent manual/scheduled download queue
 - `GET /downloaded` renders completed and failed download history
 - `GET /catalog` renders the paginated metadata/file catalog table
+- `GET /library-export` renders links for all indexed library files and a text export
 - `GET /wordcloud` renders a local description/lyrics word cloud
 - `GET /tagcloud` renders a tag frequency cloud
 - `GET /playlists` renders downloaded playlists with local play-all and VLC playlist actions
@@ -95,17 +96,36 @@ Core UI/media routes:
 - `GET /tools` renders the analysis/tools hub
 - `GET /api-docs` renders the available API endpoint reference
 - `GET /sitemap` renders the site map
+- `GET /cleanup` renders the dry-run cleanup report
 - `GET /status` renders disk and cookie diagnostics
 - `GET /api/media/library` lists library cards
+- `GET /api/media/library/files` lists every indexed library file with a link
+- `GET /api/media/library/files.txt` exports every indexed library file link as text
+- `GET /api/media/library/youtube.txt` exports all video and playlist YouTube links
+- `GET /api/media/library/ids.txt` exports all video and playlist IDs
 - `GET /api/media/details/<channel_id>/<video_id>` returns per-video files and metadata
 - `GET /api/media/resolve/<video_id>` returns the archived media record and preferred playable URL for one YouTube ID
 - `GET /api/media/tags` returns tag counts and tag-grouped videos
 - `GET /api/media/playlists` lists downloaded playlists and member counts
 - `GET /api/media/playlists/<playlist_id>` returns a named playlist and its ordered local video members
+- `POST /api/media/playlists/<playlist_id>/refresh` refreshes membership without deleting local media
+- `POST /api/media/playlists/<playlist_id>/finish` starts the playlist worker for incomplete members
 - `GET /api/media/playlists/<playlist_id>.m3u?mode=video|audio` downloads a VLC-compatible local video or audio-only playlist file
 - `GET /api/media/wordcloud/videos?word=<word>` returns archived video IDs containing a word in saved descriptions
 - `GET /api/media/catalog` returns paginated catalog rows with metadata, local file/format details, and the latest failure reason for incomplete downloads
 - `POST /api/media/catalog/refresh` rebuilds the filesystem-backed catalog and removes stale rows
+- `GET /api/media/cleanup-report` lists cleanup candidates, estimated disk savings, FFmpeg remux recoverability checks, final-audio integrity checks, dry-run legacy relocation checks, complete folder inventories, and missing expected outputs without deleting files
+- `POST /api/media/cleanup/delete`, `/api/media/cleanup/delete-all`, and `/api/media/cleanup/move-legacy` perform confirmation-gated cleanup actions only for report-approved targets
+- `POST /api/media/cleanup/delete-legacy-matches` deletes only legacy conflict files whose MD5 matches the primary copy
+- `POST /api/media/cleanup/delete-legacy-different-all` deletes all differing legacy conflict files
+- `POST /api/media/cleanup/delete-empty-legacy` and `/api/media/cleanup/delete-empty-legacy-all` remove empty legacy video folders and empty channel parents
+- Playlist descriptor directories (`.info.json` with `_type: playlist`) are excluded from cleanup media inventory, expected-file checks, and legacy relocation checks.
+- Catalog responses re-read the live media directory when an indexed row points to a stale source, keeping thumbnail and media URLs usable before the persistent catalog is rebuilt.
+- `GET /api/media/cleanup/tasks/<task_id>` reports cleanup action phase, progress, completion, or error
+- Cleanup UI actions show live progress and a completion notification; bulk move/delete operations remain confirmation-gated.
+- The Tools page includes a confirmation-free filesystem rescan button that refreshes catalog paths and links without deleting media.
+- `POST /api/media/cleanup/verify` starts a full media verification pass cached by file MD5
+- `POST /api/media/cleanup/retry-missing` queues incomplete media while skipping permanent failures and complete files
 - `GET /api/media/wordcloud` returns description word frequencies, filterable by tag or playlist
 - `GET /api/media/failures` lists recorded failed download attempts and reasons
 - `GET /api/media/download-history` lists persistent completed and failed download attempts
@@ -115,7 +135,10 @@ Core UI/media routes:
 - `POST /api/queue` adds a video or playlist to the queue; the default is immediate start, configurable through `/api/settings`
 - `POST /api/queue/<item_id>/start` starts a paused/scheduled queue item immediately
 - `POST /api/queue/<item_id>/cancel` cancels a pending queue item
-- `GET/POST /api/settings` reads or updates the default add behavior (`immediate` or `queue`)
+- Queue listing and scheduling repair old rows that stored playlist IDs as video jobs.
+- `POST /api/queue/start-all` starts all paused queue items
+- `POST /api/queue/cancel-all` cancels all pending and paused queue items
+- `GET/POST /api/settings` reads or updates the default add behavior (`immediate` or `queue`) and concurrent video/playlist limits
 - `GET /media/<path>` serves downloaded files with conditional/range-capable responses
 - `GET /media-legacy/<path>` serves files from the legacy `data/merged` tree
 - `GET /media-fallback/<path>` serves fallback-library files with conditional responses
@@ -136,6 +159,7 @@ Archive/download API routes:
 - `POST /api/youtube/retry/<video_id>` resumes or retries a failed/partial download; add `?authenticated=1&browser=chrome` for browser-cookie authentication or omit `browser` to use `data/cookies.txt`
 - `GET /api/youtube/status/<video_id>`
 - `POST /api/youtube/playlist/get/<playlist_id>`
+- `POST /api/youtube/playlist/prepare/<playlist_id>` reads and stores playlist membership without starting downloads
 - `GET /api/youtube/playlist/status/<playlist_id>`
 
 The extension depends on the `/api/youtube/*` endpoints and `/api/media/resolve/<video_id>`. Keep their response shapes stable unless updating the extension in the same change.
@@ -204,6 +228,7 @@ Meaning:
 - Metadata, chapters, thumbnails, subtitles, descriptions, info JSON, and format manifests are written when available.
 - `AudioMetadataPostProcessor` can create clean audio copies with embedded metadata.
 - A video is marked complete only when its archive entry and both playable video and audio files exist. Incomplete attempts are persisted as failures with a reason and remain retryable from the catalog, including browser-cookie authentication.
+- The cleanup report uses `ffprobe` and FFmpeg stream-copy remux checks; the Docker image installs both as part of the `ffmpeg` package. Results are cached per source folder/container during each report.
 - The word cloud keeps lyric vocabulary but filters common URL terms and description credit/promotion boilerplate (such as video, lyrics, director, producer, and subscribe). `/wordcloud` generates only when its Generate button is pressed and shows a spinner/progress state while descriptions are scanned and the layout is arranged.
 - Server-triggered video and playlist downloads call `download_youtube(..., audio_meta=True)`. Playlist downloads preflight entries and invoke the downloader per child video, so fallback is isolated to failed children and successful strict children are not re-downloaded into `data/bestfallback/`.
 - Deno/`yt-dlp-ejs` is used for YouTube JS challenge solving unless `no_js=True`.
@@ -213,7 +238,7 @@ Meaning:
 
 ## UI Notes
 
-The web UI is part of `app3.py`, not a separate server yet. It lists the archive, batches thumbnail rendering, supports video/audio playback, exposes VLC URLs, loads per-video details lazily, and includes `/queue` for persistent manual/scheduled downloads. The default add behavior is immediate; changing the queue setting holds new items until manually started. `/playlists` provides named playlist membership, ordered video links, browser play-all, and separate VLC video/audio-only M3U files. `/downloads` shows active/recent download status, persistent attempt history, failed-download retry actions, and a remaining queue output. Playlist progress groups each item's video, audio, and metadata files beneath that item's title. `/downloaded` shows the same persistent completed/failed attempt history in a scrollable panel. `/video/<video_id>` shows the saved description collapsed by default, full metadata, every indexed file with size/type, playable video/audio links, and the VLC media URL. The main library restores active/recent queue entries from the server after refresh. Playlist rows expose child video links and `playlist_index/total` progress as yt-dlp encounters each entry. Queue state changes are also written to the server log, including `Queue Empty` when all active downloads finish.
+The web UI is part of `app3.py`, not a separate server yet. It lists the archive, batches thumbnail rendering, supports video/audio playback, exposes VLC URLs, loads per-video details lazily, and includes `/queue` for persistent manual/scheduled downloads. The default add behavior is immediate; changing the queue setting holds new items until manually started. `/playlists` provides named playlist membership, ordered video links, per-video download buttons, browser play-all, and separate VLC video/audio-only M3U files. `/downloads` shows active/recent download status, persistent attempt history, failed-download retry actions, and a remaining queue output. Playlist progress groups each item's video, audio, and metadata files beneath that item's title. `/downloaded` shows the same persistent completed/failed attempt history in a scrollable panel. `/video/<video_id>` shows the saved description collapsed by default, full metadata, every indexed file with size/type, playable video/audio links, and the VLC media URL. The main library restores active/recent queue entries from the server after refresh. Playlist rows expose child video links and `playlist_index/total` progress as yt-dlp encounters each entry. Queue state changes are also written to the server log, including `Queue Empty` when all active downloads finish.
 All non-library pages use the shared `templates/_header.html` navigation. The library header keeps primary library/download links; `/tools` is the hub for the catalog, tags, word cloud, tag cloud, Edge extension, status, and downloaded-history tools.
 
 The browser extension tracks per-video YouTube visit counts in `chrome.storage.local`. When enabled, it auto-downloads missing videos after the configured visit threshold and notifies when the automatic request starts. It calls `/api/media/resolve/<video_id>` before posting a download request and skips the request if local media already exists. Counts reset only once the video is found in the archive, so still-missing videos at or above the threshold are requested again on later visits. Archived playback can use a preflight redirect, an in-page local player replacement, or an ask prompt. In-page replacement keeps YouTube around the player but still loads YouTube page resources; local autoplay starts muted because audible autoplay requires browser permission or a user gesture. The dihi downloads UI exposes source YouTube URLs as copy-only controls instead of direct links.

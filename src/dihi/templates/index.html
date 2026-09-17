@@ -819,9 +819,9 @@ function parseYouTubeInput(raw) {
   return null;
 }
 
-const DL_ICONS  = {pending:'⏳', queued:'⏳', running:'', done:'✓', failed:'✗', error:'⚠'};
+const DL_ICONS  = {pending:'⏳', queued:'⏳', saved:'✓', running:'', done:'✓', failed:'✗', error:'⚠'};
 const DL_LABELS = {
-  pending: 'submitting…', queued: 'queued',
+  pending: 'submitting…', queued: 'queued', saved: 'playlist saved',
   running: 'downloading…', done: 'done', failed: 'failed', error: 'error',
 };
 
@@ -914,7 +914,7 @@ async function submitDownload() {
 
   try {
     const url = parsed.type === 'playlist'
-      ? `/api/youtube/playlist/get/${encodeURIComponent(parsed.id)}`
+      ? `/api/youtube/playlist/prepare/${encodeURIComponent(parsed.id)}`
       : `/api/youtube/get/${encodeURIComponent(parsed.id)}`;
     const r    = await fetch(url, {method: 'POST'});
     const data = await r.json();
@@ -925,7 +925,8 @@ async function submitDownload() {
       upsertDlItem(entry);
       return;
     }
-    entry.state = 'queued';
+    entry.state = parsed.type === 'playlist' ? 'saved' : 'queued';
+    if (parsed.type === 'playlist') entry.label = `Playlist saved — ${parsed.id}`;
     upsertDlItem(entry);
     if (data.started) {
       parsed.type === 'playlist' ? startPollPlaylist(entry) : startPollVideo(entry);

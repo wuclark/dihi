@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>YouTube ID Check</title>
   <style>
-    body { font-family: system-ui, Arial, sans-serif; width: 320px; margin: 0; padding: 12px; }
+    body { font-family: system-ui, Arial, sans-serif; width: 420px; margin: 0; padding: 12px; }
     .row { margin-bottom: 10px; }
     .label { font-size: 12px; opacity: 0.7; margin-bottom: 4px; }
     .value { font-size: 13px; word-break: break-word; }
@@ -21,6 +21,12 @@
     .btns { display: flex; gap: 8px; }
     a { color: #1a73e8; text-decoration: none; }
     .footer { margin-top: 10px; font-size: 12px; }
+    .playlist-tools { border-top: 1px solid #ddd; margin-top: 12px; padding-top: 10px; }
+    .playlist-list { max-height: 220px; overflow: auto; border: 1px solid #ddd; border-radius: 8px; padding: 6px; }
+    .playlist-row { display: flex; gap: 6px; align-items: flex-start; padding: 5px 2px; font-size: 12px; }
+    .playlist-row span { word-break: break-word; }
+    .playlist-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+    #playlistMessage { font-size: 12px; margin-top: 6px; }
   </style>
 </head>
 <body>
@@ -42,6 +48,17 @@
   <div class="row btns">
     <button id="recheckBtn">Recheck</button>
     <button id="downloadBtn">Download</button>
+  </div>
+
+  <div class="playlist-tools">
+    <div class="label">Playlists on this YouTube profile/channel</div>
+    <div id="playlistMessage" class="muted">Open a YouTube channel page to scan playlists.</div>
+    <div id="playlistList" class="playlist-list" hidden></div>
+    <div id="playlistActions" class="playlist-actions" hidden>
+      <button id="exportPlaylists">Export links</button>
+      <button id="savePlaylists">Save playlists</button>
+      <button id="queuePlaylists">Queue downloads paused</button>
+    </div>
   </div>
 
   <div class="footer">

@@ -85,28 +85,46 @@ Compose starts the PO Token provider with the app and publishes its service port
 | `POST` | `/api/youtube/retry/<id>` | 10/min | Resume or retry a failed/partial video download |
 | `GET` | `/api/youtube/status/<id>` | 60/min | Poll video download progress |
 | `POST` | `/api/youtube/playlist/get/<playlist_id>` | 5/min | Trigger a full playlist download |
+| `POST` | `/api/youtube/playlist/prepare/<playlist_id>` | 5/min | Save playlist name and members without downloading |
 | `GET` | `/api/youtube/playlist/status/<playlist_id>` | 60/min | Poll playlist download progress |
 | `GET` | `/api/media/library` | 30/min | List archived media cards for the web UI |
+| `GET` | `/api/media/library/files` | — | List every local library file and link |
+| `GET` | `/api/media/library/files.txt` | — | Export every local library file link as text |
+| `GET` | `/api/media/library/youtube.txt` | — | Export all video and playlist YouTube links |
+| `GET` | `/api/media/library/ids.txt` | — | Export all video and playlist IDs |
 | `GET` | `/playlists` | — | Browse downloaded playlists, play all locally, or load a playlist in VLC |
+| `GET` | `/library-export` | — | Browse and export links for all indexed library files |
 | `GET` | `/api/media/resolve/<id>` | 60/min | Resolve one archived YouTube ID to its media record and preferred playback URL |
 | `GET` | `/api/media/details/<channel_id>/<id>` | 60/min | Return files and metadata for one archived video |
 | `GET` | `/api/media/tags` | 30/min | Return tag counts and tag-grouped videos |
 | `GET` | `/api/media/catalog` | 60/min | Paginated text catalog of videos, dates, sources, files, formats, subtitles, and latest failure reasons |
 | `POST` | `/api/media/catalog/refresh` | 6/min | Rebuild the catalog and remove stale playlist/video rows |
+| `GET` | `/api/media/cleanup-report` | 12/min | List cleanup candidates, estimated savings, and FFmpeg remux recoverability without deleting files |
+| `GET` | `/api/media/cleanup/tasks/<task_id>` | — | Poll cleanup move/delete task progress and final result |
+| `POST` | `/api/media/cleanup/verify` | 3/min | Full-decode media verification, skipped when the file MD5 is unchanged |
+| `POST` | `/api/media/cleanup/retry-missing` | 6/min | Queue incomplete media while skipping permanent failures and complete files |
+| `POST` | `/api/media/cleanup/delete-legacy-matches` | 10/min | Delete only legacy conflict files proven identical to primary files |
+| `POST` | `/api/media/cleanup/delete-legacy-different-all` | 3/min | Delete all differing legacy conflict files |
+| `POST` | `/api/media/cleanup/delete-empty-legacy` and `/api/media/cleanup/delete-empty-legacy-all` | 10/3 min | Remove empty legacy video folders and empty channel parents |
 | `GET` | `/wordcloud` / `/tagcloud` | — | Browse local description words and metadata tag frequencies |
 | `GET` | `/api/downloads/status` | 60/min | Return active video/playlist downloads, recent results, and yt-dlp progress details |
 | `GET` | `/queue` | — | Manage persistent pending, scheduled, and completed queue items |
 | `GET` | `/api-docs` | — | Browse the available API endpoint reference |
 | `GET` | `/sitemap` | — | Browse the site map |
+| `GET` | `/cleanup` | — | Show a dry-run cleanup report and possible disk savings |
 | `GET` | `/api/queue` | — | List persistent download queue items and default add behavior |
 | `POST` | `/api/queue` | — | Add a video or playlist immediately, manually, or at a scheduled time |
 | `POST` | `/api/queue/<item_id>/start` | — | Start a paused queue item immediately |
 | `POST` | `/api/queue/<item_id>/cancel` | — | Cancel a pending queue item |
-| `GET/POST` | `/api/settings` | — | Read or set the default add mode: immediate or queue-only |
+| `POST` | `/api/queue/start-all` | — | Start all paused queue items |
+| `POST` | `/api/queue/cancel-all` | — | Cancel all pending and paused queue items |
+| `GET/POST` | `/api/settings` | — | Read or set default add mode and concurrent video/playlist limits |
 | `GET` | `/api/media/failures` | — | List failed download attempts with reasons and retryability |
 | `GET` | `/api/media/download-history` | — | List persistent completed and failed download attempts |
 | `GET` | `/api/media/playlists` | — | List downloaded playlists and member counts |
 | `GET` | `/api/media/playlists/<id>` | — | Return playlist metadata and ordered video members |
+| `POST` | `/api/media/playlists/<id>/refresh` | 5/min | Refresh membership without deleting local media |
+| `POST` | `/api/media/playlists/<id>/finish` | 10/min | Start downloading the playlist's incomplete members sequentially |
 | `GET` | `/api/media/playlists/<id>.m3u?mode=video\|audio` | — | Download a VLC-compatible video or audio-only playlist of local media URLs |
 
 Video IDs are exactly 11 characters (`[A-Za-z0-9_-]{11}`). Playlist IDs are 2–128 characters from the same alphabet.
@@ -233,7 +251,12 @@ curl http://localhost:5000/api/downloads/status
 
 The `/downloads` page polls this endpoint and shows active video/playlist downloads, recent completed or failed results, persistent completed/failed attempt history, and a queue output. Playlist progress groups each item's video, audio, and metadata files beneath that item's title. The `/downloaded` page shows the persistent history in a scrollable panel. The `/playlists` page groups indexed videos by their saved YouTube playlist metadata, with ordered links, browser play-all, and separate video and audio-only M3U files for VLC. Playlist preflight records all members, including videos already in the archive. The `/video/<id>` page provides dedicated local playback, a collapsed full description, complete saved metadata and file inventory, and a direct VLC media URL. The `/status` page reports total disk capacity and usage for each media directory. The `/wordcloud` page generates on request and displays a spinner/progress state while descriptions are scanned and the cloud is arranged. A download is complete only when the archive entry and playable video/audio files are present; the catalog shows the missing-media reason and retry actions, including retry with browser cookies. When there are no active downloads it shows `Queue Empty`. Queue state changes are also logged by the server.
 
-The `/queue` page manages a persistent download queue. New downloads start immediately by default, but the setting can be changed to queue-only. Items can also be assigned a future start time; the scheduler starts eligible items automatically after a restart as well. Playlist jobs preflight their entries and download children sequentially, isolating fallback retries to failed videos instead of retrying successful playlist items.
+The `/queue` page manages a persistent download queue. New downloads start immediately by default, but the setting can be changed to queue-only. Items can also be assigned a future start time; the scheduler starts eligible items automatically after a restart as well. Adding a playlist first saves its name and ordered members without downloading; `/playlists` provides the explicit Download playlist action plus per-video Download buttons. Playlist jobs preflight their entries and download children sequentially, isolating fallback retries to failed videos instead of retrying successful playlist items.
+Older queue rows that stored a playlist ID as a video job are automatically reclassified as playlist jobs when the queue is listed or scheduled.
+Catalog responses also prefer the current live media directory when an older indexed row points at a stale legacy path, so thumbnails and media links remain usable while the catalog is repaired.
+The Tools page provides a “Rescan and repair links” button for refreshing catalog paths and metadata from the filesystem without deleting media.
+
+The `/cleanup` Tools report is a dry run. It lists fallback duplicates and removable sidecars by YouTube ID, estimates total savings, checks raw sidecar recoverability by validating stream-copy remuxing from the final MKV with FFmpeg, checks final audio files—including WebM audio—with FFprobe, checks whether legacy folders can move to the default `merged/<channel>/<video_id>/` location without a target conflict, lists missing expected outputs, and links each reported file for inspection. Playlist descriptor directories (`_type: playlist`) are excluded from media inventory, missing-file checks, and legacy relocation checks. The report also provides confirmation-gated per-file delete, bulk delete, differing-legacy cleanup, empty-directory cleanup, and legacy-move actions for report-approved targets, with live task progress and completion notifications.
 
 ### Extension/API compatibility roadmap
 

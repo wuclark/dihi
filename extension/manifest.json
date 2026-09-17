@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "YouTube ID Server Checker",
-  "version": "1.7.0",
+  "version": "1.8.3",
   "description": "Tracks YouTube video visits, can auto-download missing videos after a configurable visit count, and opens archived videos from the server.",
   "action": {
     "default_title": "YouTube ID Check",
@@ -10,6 +10,7 @@
   "options_page": "options.html",
   "permissions": [
     "tabs",
+    "activeTab",
     "storage",
     "webNavigation",
     "alarms",
@@ -28,6 +29,10 @@
   "content_scripts": [{
     "matches": ["*://*.youtube.com/watch*", "*://*.youtube.com/shorts/*"],
     "js": ["content_player.js"],
+    "run_at": "document_idle"
+  }, {
+    "matches": ["*://*.youtube.com/@*/*", "*://*.youtube.com/channel/*", "*://*.youtube.com/c/*", "*://*.youtube.com/user/*", "*://*.youtube.com/feed/playlists*"],
+    "js": ["content_playlists.js"],
     "run_at": "document_idle"
   }],
   "icons": {

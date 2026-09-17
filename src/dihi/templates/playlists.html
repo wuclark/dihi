@@ -11,11 +11,11 @@
   h2 { margin:0; font-size:1.05rem; } a { color:var(--accent); } .muted { color:var(--muted); }
   .actions { display:flex; gap:8px; flex-wrap:wrap; } button, .button { background:#272727; border:1px solid var(--border); border-radius:6px; color:#eee; padding:7px 10px; text-decoration:none; cursor:pointer; }
   .button.primary { color:#000; background:#7cf; border-color:#7cf; } .videos { margin-top:12px; display:grid; gap:5px; max-height:300px; overflow:auto; border-top:1px solid var(--border); padding-top:10px; }
-  .video { display:grid; grid-template-columns:44px minmax(0,1fr) 95px; gap:8px; } .video a { overflow-wrap:anywhere; }
+  .video { display:grid; grid-template-columns:44px minmax(0,1fr) 95px auto; gap:8px; align-items:center; } .video a { overflow-wrap:anywhere; }
   .empty { color:var(--muted); padding:20px 0; }
 </style>
 {% include "_header.html" %}
-<main><h1>Downloaded playlists</h1><p class="muted">Playlists are built from playlist metadata saved with each downloaded video.</p><div id="list"><div class="empty">Loading playlists…</div></div></main>
+<main><h1>Saved playlists</h1><p class="muted">Playlists are saved with their names and ordered video members. Downloads start only when you click Download playlist.</p><div id="list"><div class="empty">Loading playlists…</div></div></main>
 <script>
 'use strict';
 const esc = x => String(x ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -26,8 +26,7 @@ async function load() {
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const playlists = (await response.json()).playlists || [];
     if (!playlists.length) { list.innerHTML = '<div class="empty">No downloaded playlist metadata found yet.</div>'; return; }
-    list.innerHTML = playlists.map(p => `<article class="playlist" data-id="${esc(p.playlist_id)}"><div class="playlist-head"><div><h2>${esc(p.title)}</h2><div class="muted">${p.video_count} video${p.video_count === 1 ? '' : 's'}</div></div><div class="actions"><a class="button primary" href="/?playlist=${encodeURIComponent(p.playlist_id)}&playall=1&autoplay=1">▶ Play all</a><a class="button" href="/api/media/playlists/${encodeURIComponent(p.playlist_id)}.m3u?mode=video">VLC video</a><a class="button" href="/api/media/playlists/${encodeURIComponent(p.playlist_id)}.m3u?mode=audio">VLC audio only</a><a class="button" href="${esc(p.webpage_url)}" target="_blank" rel="noopener">YouTube</a></div></div><div class="videos"><div class="muted">Loading videos…</div></div></article>`).join('');
-    await Promise.all([...document.querySelectorAll('.playlist')].map(loadVideos));
+    list.innerHTML = playlists.map(p => `<article class="playlist" data-id="${esc(p.playlist_id)}"><div class="playlist-head"><div><h2>${esc(p.title)}</h2><div class="muted">${p.video_count} video${p.video_count === 1 ? '' : 's'}</div></div><div class="actions"><button class="button toggle" type="button">Show videos</button><button class="button refresh" type="button">Refresh playlist</button><button class="button primary finish" type="button">Download playlist</button><a class="button primary" href="/?playlist=${encodeURIComponent(p.playlist_id)}&playall=1&autoplay=1">▶ Play all</a><a class="button" href="/api/media/playlists/${encodeURIComponent(p.playlist_id)}.m3u?mode=video">VLC video</a><a class="button" href="/api/media/playlists/${encodeURIComponent(p.playlist_id)}.m3u?mode=audio">VLC audio only</a><a class="button" href="${esc(p.webpage_url)}" target="_blank" rel="noopener">YouTube</a></div></div><div class="videos" hidden><div class="muted">Loading videos…</div></div></article>`).join('');
   } catch (error) { list.innerHTML = `<div class="empty">Could not load playlists: ${esc(error.message)}</div>`; }
 }
 async function loadVideos(article) {
@@ -36,8 +35,49 @@ async function loadVideos(article) {
   try {
     const data = await (await fetch(`/api/media/playlists/${encodeURIComponent(id)}`, {cache:'no-store'})).json();
     const videos = data.videos || [];
-    box.innerHTML = videos.length ? videos.map((item, i) => `<div class="video"><span class="muted">${item.playlist_index || i + 1}</span><a href="/video/${encodeURIComponent(item.video_id)}">${esc(item.title || item.video?.title || item.video_id)}</a><span class="muted">${item.video ? (item.video.files.video ? 'video' : item.video.files.audio ? 'audio' : 'no media') : 'not local'}</span></div>`).join('') : '<div class="muted">No indexed videos in this playlist.</div>';
+    box.innerHTML = videos.length ? videos.map((item, i) => { const complete = item.video?.files?.video && item.video?.files?.audio; const state = item.video ? (complete ? 'downloaded' : 'incomplete') : 'not local'; return `<div class="video"><span class="muted">${item.playlist_index || i + 1}</span><a href="/video/${encodeURIComponent(item.video_id)}">${esc(item.title || item.video?.title || item.video_id)}</a><span class="muted">${state}</span>${complete ? '<span class="muted">✓</span>' : `<button class="download-video" data-download-video="${esc(item.video_id)}" type="button">Download</button>`}</div>`; }).join('') : '<div class="muted">No indexed videos in this playlist.</div>';
   } catch (error) { box.innerHTML = `<div class="muted">Could not load videos: ${esc(error.message)}</div>`; }
 }
+list.addEventListener('click', async event => {
+  const refresh = event.target.closest('.refresh');
+  if (refresh) {
+    const article = refresh.closest('.playlist'); refresh.disabled = true; refresh.textContent = 'Refreshing…';
+    try { const response = await fetch(`/api/media/playlists/${encodeURIComponent(article.dataset.id)}/refresh`, {method:'POST'}); const data = await response.json(); if (!response.ok || !data.ok) throw new Error(data.error || `HTTP ${response.status}`); refresh.textContent = `Updated ${data.members}`; setTimeout(() => location.reload(), 800); }
+    catch (error) { refresh.textContent = `Failed: ${error.message}`; refresh.disabled = false; }
+    return;
+  }
+  const toggle = event.target.closest('.toggle');
+  if (toggle) {
+    const article = toggle.closest('.playlist');
+    const box = article.querySelector('.videos');
+    box.hidden = !box.hidden;
+    toggle.textContent = box.hidden ? 'Show videos' : 'Hide videos';
+    if (!box.hidden && !article.dataset.loaded) { article.dataset.loaded = '1'; await loadVideos(article); }
+    return;
+  }
+  const videoButton = event.target.closest('.download-video');
+  if (videoButton) {
+    videoButton.disabled = true;
+    videoButton.textContent = 'Queuing…';
+    try {
+      const response = await fetch(`/api/youtube/get/${encodeURIComponent(videoButton.dataset.downloadVideo)}`, {method:'POST'});
+      const data = await response.json();
+      if (!response.ok || !data.ok) throw new Error(data.error || `HTTP ${response.status}`);
+      videoButton.textContent = data.already_running ? 'Already queued' : 'Queued';
+    } catch (error) { videoButton.textContent = `Failed: ${error.message}`; videoButton.disabled = false; }
+    return;
+  }
+  const button = event.target.closest('.finish');
+  if (!button) return;
+  const article = button.closest('.playlist');
+  button.disabled = true;
+  button.textContent = 'Checking…';
+  try {
+    const response = await fetch(`/api/media/playlists/${encodeURIComponent(article.dataset.id)}/finish`, {method:'POST'});
+    const data = await response.json();
+    if (!response.ok || !data.ok) throw new Error(data.error || `HTTP ${response.status}`);
+    button.textContent = data.already_queued ? 'Already queued' : 'Download started';
+  } catch (error) { button.textContent = `Failed: ${error.message}`; button.disabled = false; }
+});
 load();
 </script>
