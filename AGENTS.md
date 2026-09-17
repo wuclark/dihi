@@ -260,6 +260,7 @@ The current suite is pure unit tests: no network, no real yt-dlp download, no ff
 
 - Keep the browser extension mirrored with the active site flows and API endpoints. When queue, playlist, playback, settings, or response-shape behavior changes, update the extension code, extension README, and extension version together, then test the extension against the documented endpoints.
 - Serve `/api/media/library` (and its `/files`, `*.txt`, playlist-detail, and resolve callers) from the SQLite catalog, paginate it, or otherwise stop the per-request full `merged/` rescan that inlines descriptions and `info.json` per video. Check the web UI and extension against any response-shape change in the same update.
+- Optional media layout migration: strict output lives at root `merged/` while legacy, fallback, playlists, and runtime files live under `data/`. A future change could unify everything under `data/` (e.g. `data/media-strict`, `data/media-legacy`, `data/media-fallback`) with a one-time move script. Requires updating Docker bind mounts and container paths, `MERGED_DIR`/`LEGACY_MERGED_DIR`/`FALLBACK_DIR` constants, the `make data` target, docs, and a full re-verification while no downloads are running. Cosmetic only — do not bundle with functional changes.
 
 ## Coding Caveats
 
