@@ -975,6 +975,23 @@ def _resolve_media_by_video_id(video_id: str) -> Optional[dict]:
     }
 
 
+def _slim_video(video: dict) -> dict:
+    """Card fields for list responses: everything the grid, search/sort, and
+    playlist views need, without the heavy per-video details.
+
+    Descriptions and full info.json stay available per video via
+    /api/media/details/<channel>/<video> (used lazily by the UI) and via
+    /api/media/resolve/<video> (used by the /video/ page and extension).
+    """
+    return {
+        "video_id": video.get("video_id"),
+        "channel_id": video.get("channel_id"),
+        "title": video.get("title"),
+        "date": video.get("date"),
+        "files": video.get("files") or {},
+    }
+
+
 def _media_needs_sidecar_retry(video_id: str) -> bool:
     """Return whether an existing media item is missing downloadable sidecars."""
     for root in (MERGED_DIR, LEGACY_MERGED_DIR, FALLBACK_DIR):
@@ -1185,7 +1202,7 @@ def _scan_tags() -> dict:
             tag = str(tag).strip()
             if not tag:
                 continue
-            tags.setdefault(tag, []).append(video)
+            tags.setdefault(tag, []).append(_slim_video(video))
 
     return {
         "tags": [
@@ -1797,23 +1814,6 @@ def api_media_catalog():
             title, artist, album, uploader, upload_date, duration = row[3:9]
         items.append({"video_id": video_id, "source_root": source_root, "channel_id": channel_id, "title": title, "artist": artist, "album": album, "uploader": uploader, "upload_date": upload_date, "duration": duration, "files": files, "formats": formats, "failure_reason": row[11] or ""})
     return jsonify(items=items, page=page, per_page=per_page, total=total, pages=(total + per_page - 1) // per_page)
-
-
-def _slim_video(video: dict) -> dict:
-    """Card fields for list responses: everything the grid, search/sort, and
-    playlist views need, without the heavy per-video details.
-
-    Descriptions and full info.json stay available per video via
-    /api/media/details/<channel>/<video> (used lazily by the UI) and via
-    /api/media/resolve/<video> (used by the /video/ page and extension).
-    """
-    return {
-        "video_id": video.get("video_id"),
-        "channel_id": video.get("channel_id"),
-        "title": video.get("title"),
-        "date": video.get("date"),
-        "files": video.get("files") or {},
-    }
 
 
 @app.get("/api/media/library")

@@ -31,6 +31,7 @@ from app3 import (
     _cleanup_old_playlist_results,
     _resolve_media_by_video_id,
     _scan_library_cached,
+    _scan_tags,
     _download_status_snapshot,
     _log_queue_state_locked,
     _recover_running_queue_items,
@@ -427,6 +428,30 @@ class TestScanLibraryCached:
 
         _scan_library_cached()
         assert len(calls) == 2
+
+
+# ---------------------------------------------------------------------------
+# _scan_tags (videos_by_tag must stay slim — full entries OOM the worker)
+# ---------------------------------------------------------------------------
+
+class TestScanTags:
+    def test_videos_by_tag_has_no_details(self, monkeypatch, tmp_path):
+        merged = tmp_path / "merged"
+        video_dir = merged / "UCchannel01" / "dQw4w9WgXcQ"
+        video_dir.mkdir(parents=True)
+        (video_dir / "UCchannel01.dQw4w9WgXcQ.20240101.Title [dQw4w9WgXcQ].out.mkv").write_text("video")
+        (video_dir / "UCchannel01.dQw4w9WgXcQ.20240101.Title [dQw4w9WgXcQ].out.info.json").write_text(
+            '{"id": "dQw4w9WgXcQ", "title": "Title", "tags": ["rock", "live"]}')
+        monkeypatch.setattr(app3, "MERGED_DIR", merged.resolve())
+        monkeypatch.setattr(app3, "LEGACY_MERGED_DIR", (tmp_path / "nolegacy").resolve())
+
+        result = _scan_tags()
+
+        assert [t["tag"] for t in result["tags"]] == ["live", "rock"]
+        for entries in result["videos_by_tag"].values():
+            for entry in entries:
+                assert "details" not in entry
+                assert set(entry) == {"video_id", "channel_id", "title", "date", "files"}
 
 
 # ---------------------------------------------------------------------------
