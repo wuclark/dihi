@@ -456,7 +456,7 @@ class TestScanTags:
         for entries in result["videos_by_tag"].values():
             for entry in entries:
                 assert "details" not in entry
-                assert set(entry) == {"video_id", "channel_id", "title", "date", "files"}
+                assert set(entry) == {"video_id", "channel_id", "source_root", "title", "date", "files"}
 
 
 # ---------------------------------------------------------------------------

@@ -159,6 +159,7 @@ select {
 }
 .bv { background: rgba(62,166,255,.85); }
 .ba { background: rgba(0,200,110,.85); }
+.bt { background: rgba(170,110,250,.85); }
 .card-body { padding: 10px 12px 12px; }
 .card-title {
   font-size: 0.83rem; font-weight: 500; line-height: 1.4;
@@ -440,11 +441,13 @@ function renderGrid() {
       : `<div class="thumb-ph">▶</div>`;
     const bv = v.files.video   ? '<span class="badge bv">MKV</span>' : '';
     const ba = v.files.audio   ? '<span class="badge ba">M4A</span>' : '';
+    const bt = v.source_root && v.source_root !== 'merged'
+      ? `<span class="badge bt">${esc(v.source_root === 'bestfallback' ? 'FALLBACK' : v.source_root.toUpperCase())}</span>` : '';
 
     return `<div class="card${active}" data-id="${esc(v.video_id)}" role="button" tabindex="0"
               onclick="openVideo('${esc(v.video_id)}')"
               aria-label="${esc(v.title)}">
-      <div class="card-thumb">${thumb}<div class="badges">${bv}${ba}</div></div>
+      <div class="card-thumb">${thumb}<div class="badges">${bv}${ba}${bt}</div></div>
       <div class="card-body">
         <div class="card-title">${esc(v.title)}</div>
         <div class="card-meta">${fmtDate(v.date)} · ${esc(v.channel_id)}</div>

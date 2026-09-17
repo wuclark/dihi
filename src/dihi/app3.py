@@ -803,7 +803,7 @@ def _is_playlist_dir(directory: Path) -> bool:
     return bool(info and info.get("_type") == "playlist")
 
 
-def _scan_video_dir(channel_id: str, video_dir: Path, media_prefix: str) -> Optional[dict]:
+def _scan_video_dir(channel_id: str, video_dir: Path, media_prefix: str, source_root: str) -> Optional[dict]:
     """Build the library dict for one ``<channel_id>/<video_id>/`` directory.
 
     Returns None for playlist descriptor directories. Extracted from
@@ -837,6 +837,7 @@ def _scan_video_dir(channel_id: str, video_dir: Path, media_prefix: str) -> Opti
     return {
         "video_id": video_id,
         "channel_id": channel_id,
+        "source_root": source_root,
         "title": title or video_id,
         "date": date,
         "files": files,
@@ -912,8 +913,9 @@ def _scan_library() -> list[dict]:
     """
     videos = []
     seen: Set[str] = set()
-    for root, media_prefix in ((MERGED_DIR, "/media"), (LEGACY_MERGED_DIR, "/media-legacy"),
-                               (FALLBACK_DIR, "/media-fallback")):
+    for root, source_root, media_prefix in ((MERGED_DIR, "merged", "/media"),
+                                            (LEGACY_MERGED_DIR, "legacy", "/media-legacy"),
+                                            (FALLBACK_DIR, "bestfallback", "/media-fallback")):
       if not root.exists():
         continue
       for channel_dir in sorted(root.iterdir()):
@@ -926,7 +928,7 @@ def _scan_library() -> list[dict]:
             video_id = video_dir.name
             if video_id in seen:
                 continue
-            video = _scan_video_dir(channel_id, video_dir, media_prefix)
+            video = _scan_video_dir(channel_id, video_dir, media_prefix, source_root)
             if video is None:
                 continue
             seen.add(video_id)
@@ -946,7 +948,8 @@ def _scan_single_video(video_id: str) -> Optional[dict]:
     """
     if not YOUTUBE_ID_RE.match(video_id):
         return None
-    for root, media_prefix in ((MERGED_DIR, "/media"), (LEGACY_MERGED_DIR, "/media-legacy")):
+    for root, source_root, media_prefix in ((MERGED_DIR, "merged", "/media"),
+                                            (LEGACY_MERGED_DIR, "legacy", "/media-legacy")):
         if not root.is_dir():
             continue
         for channel_dir in sorted(root.iterdir()):
@@ -955,7 +958,7 @@ def _scan_single_video(video_id: str) -> Optional[dict]:
             video_dir = channel_dir / video_id
             if not video_dir.is_dir():
                 continue
-            video = _scan_video_dir(channel_dir.name, video_dir, media_prefix)
+            video = _scan_video_dir(channel_dir.name, video_dir, media_prefix, source_root)
             if video is not None:
                 return video
     return None
@@ -976,6 +979,7 @@ def _resolve_media_by_video_id(video_id: str) -> Optional[dict]:
     return {
         "video_id": video.get("video_id"),
         "channel_id": video.get("channel_id"),
+        "source_root": video.get("source_root"),
         "title": video.get("title"),
         "date": video.get("date"),
         "files": files,
@@ -996,6 +1000,7 @@ def _slim_video(video: dict) -> dict:
     return {
         "video_id": video.get("video_id"),
         "channel_id": video.get("channel_id"),
+        "source_root": video.get("source_root"),
         "title": video.get("title"),
         "date": video.get("date"),
         "files": video.get("files") or {},
