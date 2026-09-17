@@ -52,3 +52,30 @@ def test_refresh_restores_playlist_from_descriptor(tmp_path):
         member = conn.execute("SELECT video_id, playlist_index FROM playlist_videos").fetchone()
     assert playlist == ("PLexample", "Saved playlist")
     assert member == ("dQw4w9WgXcQ", 1)
+
+
+def test_refresh_keeps_renamed_media_roots_on_same_catalog_row(tmp_path):
+    import sqlite3
+
+    for old_name, new_name, expected_root in (
+        ("merged", "media-strict", "merged"),
+        ("legacy", "media-legacy", "legacy"),
+        ("bestfallback", "media-fallback", "bestfallback"),
+    ):
+        old_video = tmp_path / old_name / "channel" / "video-id"
+        new_video = tmp_path / new_name / "channel" / "video-id"
+        old_video.mkdir(parents=True)
+        new_video.mkdir(parents=True)
+        info = json.dumps({"title": "Title", "uploader": "Artist"})
+        for video_dir in (old_video, new_video):
+            (video_dir / "video-id.out.info.json").write_text(info, encoding="utf-8")
+
+        db = tmp_path / f"{new_name}.db"
+        assert refresh(old_video.parents[1], db) == 1
+        assert refresh(new_video.parents[1], db) == 1
+
+        with sqlite3.connect(db) as conn:
+            rows = conn.execute(
+                "SELECT video_id, source_root FROM videos"
+            ).fetchall()
+        assert rows == [("video-id", expected_root)]

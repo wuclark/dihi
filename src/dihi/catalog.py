@@ -61,6 +61,16 @@ CREATE TABLE IF NOT EXISTS app_settings (
 """
 
 
+# Directory names change over time (e.g. the data/ unification renamed
+# ``merged/`` to ``media-strict/``); the API-facing source_root values stay
+# stable so rows upsert instead of duplicating after a move.
+_SOURCE_ROOT_ALIASES = {
+    "media-strict": "merged",
+    "media-legacy": "legacy",
+    "media-fallback": "bestfallback",
+}
+
+
 def _info(path: Path) -> dict[str, Any]:
     for candidate in sorted(path.glob("*.info.json")):
         try:
@@ -98,8 +108,8 @@ def _files(path: Path, channel_id: str, video_id: str, source_root: str) -> dict
             )
             match_format = re.search(r"\.out\.f(\d+)\.[^.]+$", item.name)
             media_prefix = (
-                "/media-fallback" if source_root == "bestfallback" else
-                "/media-legacy" if source_root == "legacy" else "/media"
+                "/media-fallback" if source_root in ("bestfallback", "media-fallback") else
+                "/media-legacy" if source_root in ("legacy", "media-legacy") else "/media"
             )
             entry: dict[str, Any] = {
                 "url": (
@@ -127,6 +137,7 @@ def refresh(merged_dir: Path | list[Path], database: Path, archive: Path | None 
     roots = [Path(merged_dir)] if isinstance(merged_dir, (str, Path)) else [Path(p) for p in merged_dir]
     database.parent.mkdir(parents=True, exist_ok=True)
     count = 0
+    known_roots: set[str] = set()
     with sqlite3.connect(database) as db:
         db.executescript(SCHEMA)
         if "source_root" not in {row[1] for row in db.execute("PRAGMA table_info(videos)")}:  # rebuild old schema
@@ -136,7 +147,8 @@ def refresh(merged_dir: Path | list[Path], database: Path, archive: Path | None 
             db.execute("ALTER TABLE videos ADD COLUMN formats_json TEXT NOT NULL DEFAULT '[]'")
         for root in roots:
           # ``merged/`` and legacy ``data/merged/`` share a basename.
-          source_root = "legacy" if root.as_posix().rstrip("/").endswith("data/merged") else root.name
+          source_root = "legacy" if root.as_posix().rstrip("/").endswith("data/merged") else _SOURCE_ROOT_ALIASES.get(root.name, root.name)
+          known_roots.add(source_root)
           seen_video_ids: set[str] = set()
           for channel_dir in sorted(root.iterdir()) if root.is_dir() else []:
             if not channel_dir.is_dir():
