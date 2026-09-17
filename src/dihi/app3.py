@@ -957,8 +957,19 @@ def _resolve_media_by_video_id(video_id: str) -> Optional[dict]:
         return None
     files = video.get("files") or {}
     player_url = files.get("video") or files.get("audio")
+    details = video.get("details") or {}
+    detail_files = details.get("files") or []
+    description = (details.get("metadata") or {}).get("description", "")
+    # The full info.json (often hundreds of KB of formats) stays behind
+    # /api/media/details/<channel>/<video>; the /video/ page loads it
+    # on click, and the extension only needs the player URL.
     return {
-        **video,
+        "video_id": video.get("video_id"),
+        "channel_id": video.get("channel_id"),
+        "title": video.get("title"),
+        "date": video.get("date"),
+        "files": files,
+        "details": {"files": detail_files, "metadata": {"description": description}},
         "player_url": player_url,
         "player_kind": "video" if files.get("video") else "audio" if files.get("audio") else None,
     }

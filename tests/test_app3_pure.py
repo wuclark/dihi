@@ -354,6 +354,24 @@ class TestResolveMediaByVideoId:
 
         assert _resolve_media_by_video_id("dQw4w9WgXcQ") is None
 
+    def test_info_json_is_stripped_but_description_kept(self, monkeypatch, tmp_path):
+        video_dir = tmp_path / "UCchannel01" / "dQw4w9WgXcQ"
+        video_dir.mkdir(parents=True)
+        (video_dir / "UCchannel01.dQw4w9WgXcQ.20240101.Title [dQw4w9WgXcQ].out.mkv").write_text("video")
+        (video_dir / "UCchannel01.dQw4w9WgXcQ.20240101.Title [dQw4w9WgXcQ].out.info.json").write_text(
+            '{"id": "dQw4w9WgXcQ", "title": "Title", "formats": [{"format_id": "399"}]}')
+        (video_dir / "UCchannel01.dQw4w9WgXcQ.20240101.Title [dQw4w9WgXcQ].out.description").write_text("lyrics here")
+        monkeypatch.setattr(app3, "MERGED_DIR", tmp_path.resolve())
+        monkeypatch.setattr(app3, "LEGACY_MERGED_DIR", (tmp_path / "nolegacy").resolve())
+
+        result = _resolve_media_by_video_id("dQw4w9WgXcQ")
+
+        assert result["player_kind"] == "video"
+        assert "info_json" not in result["details"]["metadata"]
+        assert result["details"]["metadata"]["description"] == "lyrics here"
+        assert result["details"]["files"]
+        assert result["files"]["video"].endswith(".out.mkv")
+
 
 # ---------------------------------------------------------------------------
 # _scan_library_cached
