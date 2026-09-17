@@ -803,6 +803,53 @@ def _is_playlist_dir(directory: Path) -> bool:
     return bool(info and info.get("_type") == "playlist")
 
 
+def _scan_video_dir(channel_id: str, video_dir: Path, media_prefix: str) -> Optional[dict]:
+    """Build the library dict for one ``<channel_id>/<video_id>/`` directory.
+
+    Returns None for playlist descriptor directories. Extracted from
+    _scan_library so single-video lookups can reuse the exact same shape
+    without walking the whole merged tree.
+    """
+    video_id = video_dir.name
+    info, _info_error = _load_info_json(video_dir)
+    if info and info.get("_type") == "playlist":
+        return None
+    files: dict = {}
+    detail_files: list[dict] = []
+    description = ""
+    title: Optional[str] = None
+    date: Optional[str] = None
+    for f in sorted(video_dir.iterdir()):
+        if not f.is_file():
+            continue
+        m = _FNAME_META_RE.match(f.name)
+        if m and title is None:
+            title = m.group("title")
+            date = m.group("date")
+        url = f"{media_prefix}/{quote(channel_id, safe='')}/{quote(video_id, safe='')}/{quote(f.name, safe='')}"
+        _classify_file(f.name, url, files)
+        detail_files.append(_media_file_entry(f, channel_id, video_id, media_prefix))
+        if f.suffix.lower() == ".description" and not description:
+            try:
+                description = f.read_text(encoding="utf-8", errors="replace")[:2_000_000]
+            except OSError:
+                pass
+    return {
+        "video_id": video_id,
+        "channel_id": channel_id,
+        "title": title or video_id,
+        "date": date,
+        "files": files,
+        "details": {
+            "files": detail_files,
+            "metadata": {
+                "description": description,
+                "info_json": {k: _safe_metadata_value(v) for k, v in (info or {}).items()},
+            },
+        },
+    }
+
+
 def _scan_library() -> list[dict]:
     """Walk primary and legacy merged trees, preferring the primary copy."""
     videos = []
@@ -817,64 +864,52 @@ def _scan_library() -> list[dict]:
         for video_dir in sorted(channel_dir.iterdir()):
             if not video_dir.is_dir():
                 continue
-            info, _info_error = _load_info_json(video_dir)
-            if info and info.get("_type") == "playlist":
-                continue
             video_id = video_dir.name
             if video_id in seen:
                 continue
+            video = _scan_video_dir(channel_id, video_dir, media_prefix)
+            if video is None:
+                continue
             seen.add(video_id)
-            files: dict = {}
-            detail_files: list[dict] = []
-            description = ""
-            title: Optional[str] = None
-            date: Optional[str] = None
-            for f in sorted(video_dir.iterdir()):
-                if not f.is_file():
-                    continue
-                m = _FNAME_META_RE.match(f.name)
-                if m and title is None:
-                    title = m.group("title")
-                    date = m.group("date")
-                url = f"{media_prefix}/{quote(channel_id, safe='')}/{quote(video_id, safe='')}/{quote(f.name, safe='')}"
-                _classify_file(f.name, url, files)
-                detail_files.append(_media_file_entry(f, channel_id, video_id, media_prefix))
-                if f.suffix.lower() == ".description" and not description:
-                    try:
-                        description = f.read_text(encoding="utf-8", errors="replace")[:2_000_000]
-                    except OSError:
-                        pass
-            videos.append(
-                {
-                    "video_id": video_id,
-                    "channel_id": channel_id,
-                    "title": title or video_id,
-                    "date": date,
-                    "files": files,
-                    "details": {
-                        "files": detail_files,
-                        "metadata": {
-                            "description": description,
-                            "info_json": {k: _safe_metadata_value(v) for k, v in (info or {}).items()},
-                        },
-                    },
-                }
-            )
+            videos.append(video)
     return videos
 
 
-def _resolve_media_by_video_id(video_id: str) -> Optional[dict]:
-    for video in _scan_library():
-        if video.get("video_id") != video_id:
+def _scan_single_video(video_id: str) -> Optional[dict]:
+    """Look up one video's directory directly, preferring the primary copy.
+
+    Same shape and precedence as _scan_library, but stats channel folders
+    instead of reading every video on disk. Used by the resolve endpoint
+    (hit on every extension page visit) and the cleanup retry loop.
+    """
+    if not YOUTUBE_ID_RE.match(video_id):
+        return None
+    for root, media_prefix in ((MERGED_DIR, "/media"), (LEGACY_MERGED_DIR, "/media-legacy")):
+        if not root.is_dir():
             continue
-        files = video.get("files") or {}
-        player_url = files.get("video") or files.get("audio")
-        return {
-            **video,
-            "player_url": player_url,
-            "player_kind": "video" if files.get("video") else "audio" if files.get("audio") else None,
-        }
+        for channel_dir in sorted(root.iterdir()):
+            if not channel_dir.is_dir():
+                continue
+            video_dir = channel_dir / video_id
+            if not video_dir.is_dir():
+                continue
+            video = _scan_video_dir(channel_dir.name, video_dir, media_prefix)
+            if video is not None:
+                return video
     return None
+
+
+def _resolve_media_by_video_id(video_id: str) -> Optional[dict]:
+    video = _scan_single_video(video_id)
+    if video is None:
+        return None
+    files = video.get("files") or {}
+    player_url = files.get("video") or files.get("audio")
+    return {
+        **video,
+        "player_url": player_url,
+        "player_kind": "video" if files.get("video") else "audio" if files.get("audio") else None,
+    }
 
 
 def _media_needs_sidecar_retry(video_id: str) -> bool:
