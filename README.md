@@ -31,7 +31,7 @@ venv/bin/dihi download PLbpi6ZahtOH6Ar_3GPy3gD_U6v-DWxvXm
 venv/bin/dihi download dQw4w9WgXcQ --audio-meta  # tag copies of kept audio streams
 venv/bin/dihi check dQw4w9WgXcQ                  # check local archive (no server needed)
 venv/bin/dihi check dQw4w9WgXcQ --archive ./data/archive.txt
-venv/bin/dihi audio-meta ./merged/                # post-process host CLI downloads
+venv/bin/dihi audio-meta ./data/media-strict/  # post-process host CLI downloads
 ```
 
 Docker must be running for the local PO Token service used by `make <video ID or URL>`. A direct CLI download needs `make pot-provider` first; the full Docker stack starts the service automatically.
@@ -41,8 +41,8 @@ Docker must be running for the local PO Token service used by `make <video ID or
 ```
 dihi download <target> [options]
   target                YouTube video ID, playlist ID, or URL
-  --archive PATH        yt-dlp archive file (default: archive.txt)
-  --merged-dir PATH     output base directory (default: merged)
+  --archive PATH        yt-dlp archive file (default: data/archive.txt)
+  --merged-dir PATH     output base directory (default: data/media-strict)
   --cookies-browser X   load cookies from browser profile, e.g. "firefox"
   --no-js               disable Deno/JS runtime
   --quiet               suppress yt-dlp output
@@ -222,7 +222,7 @@ curl http://localhost:5000/api/media/resolve/dQw4w9WgXcQ
 }
 ```
 
-Returns HTTP 404 with `{"result": false, "video_id": "<id>"}` when the ID is not present in `merged/`.
+Returns HTTP 404 with `{"result": false, "video_id": "<id>"}` when the ID has no strict copy in `data/media-strict/`.
 
 ### `GET /api/downloads/status` — download status
 
@@ -256,7 +256,7 @@ Older queue rows that stored a playlist ID as a video job are automatically recl
 Catalog responses also prefer the current live media directory when an older indexed row points at a stale legacy path, so thumbnails and media links remain usable while the catalog is repaired. Playlist preflight waits for the startup catalog scan to release its SQLite write lock before saving playlist membership.
 The Tools page provides a “Rescan and repair links” button for refreshing catalog paths and metadata from the filesystem without deleting media.
 
-The `/cleanup` Tools report is a dry run. It lists fallback duplicates and removable sidecars by YouTube ID, estimates total savings, checks raw sidecar recoverability by validating stream-copy remuxing from the final MKV with FFmpeg, checks final audio files—including WebM audio—with FFprobe, checks whether legacy folders can move to the default `merged/<channel>/<video_id>/` location without a target conflict, lists missing expected outputs, and links each reported file for inspection. Playlist descriptor directories (`_type: playlist`) are excluded from media inventory, missing-file checks, and legacy relocation checks. The report also provides confirmation-gated per-file delete, bulk delete, differing-legacy cleanup, empty-directory cleanup, and legacy-move actions for report-approved targets, with live task progress and completion notifications.
+The `/cleanup` Tools report is a dry run. It lists fallback duplicates and removable sidecars by YouTube ID, estimates total savings, checks raw sidecar recoverability by validating stream-copy remuxing from the final MKV with FFmpeg, checks final audio files—including WebM audio—with FFprobe, checks whether legacy folders can move to the default `data/media-strict/<channel>/<video_id>/` location without a target conflict, lists missing expected outputs, and links each reported file for inspection. Playlist descriptor directories (`_type: playlist`) are excluded from media inventory, missing-file checks, and legacy relocation checks. The report also provides confirmation-gated per-file delete, bulk delete, differing-legacy cleanup, empty-directory cleanup, and legacy-move actions for report-approved targets, with live task progress and completion notifications.
 
 ### Extension/API compatibility roadmap
 
@@ -360,10 +360,10 @@ Make uses the venv executables directly. To use `dihi` in your own shell, run `s
 
 ## Download Output
 
-Videos are saved under `merged/` with a permanent two-level folder structure:
+Videos are saved under `data/media-strict/` with a permanent two-level folder structure:
 
 ```
-merged/
+data/media-strict/
 └── <channel_id>/                                                              # YouTube channel ID (never changes)
     ├── .channel_name                                                          # Channel display name history
     ├── .uploader_id                                                           # @handle history
@@ -406,13 +406,13 @@ The server intentionally requests separate video and audio streams so yt-dlp kee
 
 Do not add a `/best` progressive fallback if you need `.out.f<id>.*` sidecars and `.out.mkv`. A progressive fallback can select format `18`, which saves only `.out.mp4` and leaves no raw audio sidecar for `--audio-meta`.
 
-If the strict format download fails, the downloader retries once into `data/bestfallback/` using a broader fallback chain:
+If the strict format download fails, the downloader retries once into `data/media-fallback/` using a broader fallback chain:
 
 ```text
 bestvideo+bestaudio/bv*+ba/best,140/bestaudio[ext=m4a]/bestaudio
 ```
 
-The fallback retry is not capped at 1080p, uses best available audio instead of pinning Opus `251`, and forces yt-dlp's fallback sort toward highest resolution first (`res`, then `fps`, then bitrate). It uses its own archive file at `data/bestfallback/archive.txt`. That keeps the main archive clean: a fallback `.out.mp4` or other less-ideal result will not prevent a later strict-format download from succeeding into `merged/`.
+The fallback retry is not capped at 1080p, uses best available audio instead of pinning Opus `251`, and forces yt-dlp's fallback sort toward highest resolution first (`res`, then `fps`, then bitrate). It uses its own archive file at `data/media-fallback/archive.txt`. That keeps the main archive clean: a fallback `.out.mp4` or other less-ideal result will not prevent a later strict-format download from succeeding into `data/media-strict/`.
 
 If both strict and fallback downloads return HTTP 403, refresh dependencies and retry. The Make download target starts the PO Token provider automatically:
 
@@ -453,7 +453,7 @@ venv/bin/yt-dlp \
   dQw4w9WgXcQ
 ```
 
-When re-testing a video that already downloaded as `.out.mp4`, remove its `youtube <video_id>` line from `data/archive.txt` and delete the existing `data/merged/<channel_id>/<video_id>/` directory before downloading again. `download_archive` and `nooverwrites` are designed to preserve prior downloads.
+When re-testing a video that already downloaded as `.out.mp4`, remove its `youtube <video_id>` line from `data/archive.txt` and delete the existing `data/media-strict/<channel_id>/<video_id>/` directory before downloading again. `download_archive` and `nooverwrites` are designed to preserve prior downloads.
 
 Human-readable names are tracked in the dot-files alongside the content instead.
 
@@ -496,10 +496,10 @@ The merged `.mkv` contains embedded subtitle streams, cover art, and metadata ta
 
 | Host Path | Container Path | Description |
 |-----------|---------------|-------------|
-| `./data/archive.txt` | `/app/archive.txt` | Download archive |
-| `./data/cookies.txt` | `/app/cookies.txt` | YouTube cookies (optional) |
-| `./merged` | `/app/merged` | Downloaded files |
-| `./data/bestfallback` | `/app/data/bestfallback` | Fallback downloads and fallback archive |
+| `./data/archive.txt` | `/app/data/archive.txt` | Download archive |
+| `./data/cookies.txt` | `/app/data/cookies.txt` | YouTube cookies (optional) |
+| `./data/media-strict` | `/app/data/media-strict` | Downloaded files |
+| `./data/media-fallback` | `/app/data/media-fallback` | Fallback downloads and fallback archive |
 
 ### Environment Variables
 

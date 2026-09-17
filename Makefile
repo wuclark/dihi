@@ -93,10 +93,7 @@ test: $(VENV)/.setup-complete
 git-add:
 	git add -u
 	@git restore --staged -- data 2>/dev/null || true
-	@git restore --staged -- archive.txt 2>/dev/null || true
-	@git restore --staged -- cookies.txt 2>/dev/null || true
-	@git restore --staged -- audio 2>/dev/null || true
-	@git ls-files --others --exclude-standard | grep -Ev '^(data/|archive\.txt$$|cookies\.txt$$|audio/)' | xargs -r git add --
+	@git ls-files --others --exclude-standard | grep -Ev '^(data/)' | xargs -r git add --
 	git status --short
 
 # Stage all changes, commit them, and push the current branch.
@@ -111,8 +108,8 @@ git-commit-push: git-add
 # Docker creates missing mount targets as directories; running this first
 # ensures they are plain files so yt-dlp can read/write them correctly.
 data:
-	mkdir -p merged data/bestfallback data/playlists
-	touch data/archive.txt data/cookies.txt data/bestfallback/archive.txt data/media-catalog.db
+	mkdir -p data/media-strict data/media-legacy data/media-fallback data/playlists data/audio
+	touch data/archive.txt data/cookies.txt data/media-fallback/archive.txt data/media-catalog.db
 
 # Export YouTube cookies from your Windows browser into data/cookies.txt (WSL2 only).
 # Tries Chrome → Edge → Firefox in order; stops at the first one found.

@@ -11,13 +11,14 @@ services:
       # Persistent data
       # Note: host files must exist before `docker compose up` or Docker will
       # create them as directories. Run `make data` to initialise them.
-      - ./data/archive.txt:/app/archive.txt
-      - ./data/cookies.txt:/app/cookies.txt
-      # The downloader's default output is the repository-level merged/ tree.
-      - ./merged:/app/merged
-      # Legacy downloads made before the primary merged/ mount was aligned.
-      - ./data/merged:/app/data/merged
-      - ./data/bestfallback:/app/data/bestfallback
+      - ./data/archive.txt:/app/data/archive.txt
+      - ./data/cookies.txt:/app/data/cookies.txt
+      # Strict downloads land in data/media-strict/; legacy and fallback
+      # trees stay readable under data/ as well.
+      - ./data/media-strict:/app/data/media-strict
+      # Legacy downloads made before the primary strict mount was aligned.
+      - ./data/media-legacy:/app/data/media-legacy
+      - ./data/media-fallback:/app/data/media-fallback
       - ./data/playlists:/app/data/playlists
       - ./data/media-catalog.db:/app/data/media-catalog.db
     environment:

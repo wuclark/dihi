@@ -72,7 +72,7 @@ make git-commit-push MSG="Describe the change"
 
 `make help` works before setup and is the default Make target. `make setup` installs the pinned yt-dlp and PO Token plugin in the venv and writes `venv/.setup-complete` only after all installs succeed; a failed pip run remains retryable. `make dev-install` installs the CLI entry point. Both use venv executables directly. To activate the venv in your shell, run `source venv/bin/activate` yourself (or use `make startup` to display that command). `make <video ID or URL>` starts the Docker PO Token service before downloading unless `DIHI_PO_TOKEN_PROVIDER_URL` points to another provider. `make pot-provider` starts it explicitly for direct CLI calls or server-triggered downloads. `make run` starts the active server in `src/dihi/app3.py`.
 
-`make docker-up` initializes bind-mount data files, then builds and starts the dihi server and PO Token provider. `make docker-down` stops the Compose services; `make docker-logs` follows their logs. `make git-add` intentionally excludes local runtime data paths: `data/**`, root `archive.txt`, root `cookies.txt`, and `audio/**`.
+`make docker-up` initializes bind-mount data files, then builds and starts the dihi server and PO Token provider. `make docker-down` stops the Compose services; `make docker-logs` follows their logs. `make git-add` intentionally excludes local runtime data: everything under `data/`.
 
 `make test-docker` starts the Compose stack and runs opt-in smoke tests against
 the live HTTP service. The normal `venv/bin/pytest` suite remains Docker-free.
@@ -141,11 +141,11 @@ Core UI/media routes:
 - `POST /api/queue/cancel-all` cancels all pending and paused queue items
 - `GET/POST /api/settings` reads or updates the default add behavior (`immediate` or `queue`) and concurrent video/playlist limits
 - `GET /media/<path>` serves downloaded files with conditional/range-capable responses
-- `GET /media-legacy/<path>` serves files from the legacy `data/merged` tree
+- `GET /media-legacy/<path>` serves files from the legacy `data/media-legacy` tree
 - `GET /media-fallback/<path>` serves fallback-library files with conditional responses
 
-The rebuildable SQLite catalog now scans both `merged/` and
-`data/bestfallback/`, retaining source-root and per-file format/subtitle
+The rebuildable SQLite catalog scans `data/media-strict/`,
+`data/media-legacy/`, and `data/media-fallback/`, retaining source-root and per-file format/subtitle
 details. It also stores playlist names and video memberships from each `.info.json`; a video can belong to multiple playlists. Download failures are classified and persisted as retry information. The catalog endpoint initializes its schema before reading so the UI can continue serving while the background filesystem scan is running. Playlist preflight waits for that startup scan's SQLite write lock when persisting playlist membership.
 The planned indexed artist/album pages and safe rollback are documented in
 [`plan.media-catalog.md`](plan.media-catalog.md). It is not required by the
@@ -173,18 +173,18 @@ Archive files use yt-dlp format:
 youtube <video_id>
 ```
 
-Docker bind mounts:
+Docker bind mounts (all runtime state lives under `data/`):
 
-- `./data/archive.txt` -> `/app/archive.txt`
-- `./data/cookies.txt` -> `/app/cookies.txt`
-- `./merged` -> `/app/merged`
-- `./data/merged` -> `/app/data/merged` (legacy media compatibility)
-- `./data/bestfallback` -> `/app/data/bestfallback`
+- `./data/archive.txt` -> `/app/data/archive.txt`
+- `./data/cookies.txt` -> `/app/data/cookies.txt`
+- `./data/media-strict` -> `/app/data/media-strict`
+- `./data/media-legacy` -> `/app/data/media-legacy` (legacy media compatibility)
+- `./data/media-fallback` -> `/app/data/media-fallback`
 
 Downloads are stored under:
 
 ```text
-merged/
+data/media-strict/
 └── <channel_id>/
     └── <video_id>/
         ├── <channel_id>.<video_id>.<date>.<title> [<video_id>].out.mkv
@@ -202,7 +202,7 @@ The exact set varies by source video and available formats. The `<channel_id>/<v
 
 The default `.out.m4a` is the separately requested AAC audio download. `--audio-meta` can make additional clean, tagged copies from kept raw audio sidecars, such as `.out.f251.webm` to `.out.webm`.
 
-`merged/` is the strict output tree and uses root `archive.txt`. Failed strict downloads retry into `data/bestfallback/` with its own `archive.txt`; the fallback archive does not mark a strict download complete. `keepvideo: True` preserves raw `.f<id>.<ext>` streams alongside the merged MKV, so disk use includes duplicate media data.
+`data/media-strict/` is the strict output tree and uses `data/archive.txt`. Failed strict downloads retry into `data/media-fallback/` with its own `archive.txt`; the fallback archive does not mark a strict download complete. `keepvideo: True` preserves raw `.f<id>.<ext>` streams alongside the merged MKV, so disk use includes duplicate media data.
 
 ## Download Logic
 
@@ -231,7 +231,7 @@ Meaning:
 - A video is marked complete only when its archive entry and both playable video and audio files exist. Incomplete attempts are persisted as failures with a reason and remain retryable from the catalog, including browser-cookie authentication.
 - The cleanup report uses `ffprobe` and FFmpeg stream-copy remux checks; the Docker image installs both as part of the `ffmpeg` package. Results are cached per source folder/container during each report.
 - The word cloud keeps lyric vocabulary but filters common URL terms and description credit/promotion boilerplate (such as video, lyrics, director, producer, and subscribe). `/wordcloud` generates only when its Generate button is pressed and shows a spinner/progress state while descriptions are scanned and the layout is arranged.
-- Server-triggered video and playlist downloads call `download_youtube(..., audio_meta=True)`. Playlist downloads preflight entries and invoke the downloader per child video, so fallback is isolated to failed children and successful strict children are not re-downloaded into `data/bestfallback/`.
+- Server-triggered video and playlist downloads call `download_youtube(..., audio_meta=True)`. Playlist downloads preflight entries and invoke the downloader per child video, so fallback is isolated to failed children and successful strict children are not re-downloaded into `data/media-fallback/`.
 - Deno/`yt-dlp-ejs` is used for YouTube JS challenge solving unless `no_js=True`.
 - yt-dlp must be at least 2026.08.19; older releases can return HTTP 403 for `android_vr` video streams. `make setup` refreshes the pinned version after `requirements.txt` changes.
 - The `bgutil-ytdlp-pot-provider` plugin supplies per-video GVS PO Tokens for the `mweb` client. `make pot-provider` starts its Docker service, and `make <video ID or URL>` starts it automatically. Compose publishes its port only on `127.0.0.1:4416`; the app container uses `DIHI_PO_TOKEN_PROVIDER_URL=http://bgutil-provider:4416`. The host default is `http://127.0.0.1:4416`.
@@ -239,10 +239,10 @@ Meaning:
 
 ## UI Notes
 
-The web UI is part of `app3.py`, not a separate server yet. It lists the archive (strict `merged/` first, then legacy `data/merged/`, then `data/bestfallback/` playable entries last), batches thumbnail rendering, supports video/audio playback, exposes VLC URLs, loads per-video details lazily, and includes `/queue` for persistent manual/scheduled downloads. The default add behavior is immediate; changing the queue setting holds new items until manually started. Jobs interrupted by a server restart are recovered as paused queue items and do not auto-resume. The queue page's playlist batch tool accepts bare IDs, `playlist <ID>` lines, URLs, and CSV-style watch rows; its preparation button creates missing playlist descriptor JSON files, skips valid existing descriptors, and reports each playlist's progress in the output box. `/playlists` provides named playlist membership, ordered video links, per-video download buttons, browser play-all, and separate VLC video/audio-only M3U files; its Refresh playlist action explicitly re-fetches membership. `/downloads` shows active/recent download status, persistent attempt history, failed-download retry actions, and a remaining queue output. Playlist progress groups each item's video, audio, and metadata files beneath that item's title. `/downloaded` shows the same persistent completed/failed attempt history in a scrollable panel. `/video/<video_id>` shows the saved description collapsed by default, full metadata, every indexed file with size/type, playable video/audio links, and the VLC media URL. The main library restores active/recent queue entries from the server after refresh. Playlist rows expose child video links and `playlist_index/total` progress as yt-dlp encounters each entry. Queue state changes are also written to the server log, including `Queue Empty` when all active downloads finish.
+The web UI is part of `app3.py`, not a separate server yet. It lists the archive (strict `data/media-strict/` first, then legacy `data/media-legacy/`, then `data/media-fallback/` playable entries last), batches thumbnail rendering, supports video/audio playback, exposes VLC URLs, loads per-video details lazily, and includes `/queue` for persistent manual/scheduled downloads. The default add behavior is immediate; changing the queue setting holds new items until manually started. Jobs interrupted by a server restart are recovered as paused queue items and do not auto-resume. The queue page's playlist batch tool accepts bare IDs, `playlist <ID>` lines, URLs, and CSV-style watch rows; its preparation button creates missing playlist descriptor JSON files, skips valid existing descriptors, and reports each playlist's progress in the output box. `/playlists` provides named playlist membership, ordered video links, per-video download buttons, browser play-all, and separate VLC video/audio-only M3U files; its Refresh playlist action explicitly re-fetches membership. `/downloads` shows active/recent download status, persistent attempt history, failed-download retry actions, and a remaining queue output. Playlist progress groups each item's video, audio, and metadata files beneath that item's title. `/downloaded` shows the same persistent completed/failed attempt history in a scrollable panel. `/video/<video_id>` shows the saved description collapsed by default, full metadata, every indexed file with size/type, playable video/audio links, and the VLC media URL. The main library restores active/recent queue entries from the server after refresh. Playlist rows expose child video links and `playlist_index/total` progress as yt-dlp encounters each entry. Queue state changes are also written to the server log, including `Queue Empty` when all active downloads finish.
 All non-library pages use the shared `templates/_header.html` navigation. The library header keeps primary library/download links; `/tools` is the hub for the catalog, tags, word cloud, tag cloud, Edge extension, status, and downloaded-history tools.
 
-The browser extension tracks per-video YouTube visit counts in `chrome.storage.local`. When enabled, it auto-downloads missing videos after the configured visit threshold and notifies when the automatic request starts. It calls `/api/media/resolve/<video_id>` before posting a download request and skips the request if local media already exists. Resolve is strict-only (ignores `bestfallback/`), so fallback copies keep getting upgraded to strict downloads. Counts reset only once the video is found in the archive, so still-missing videos at or above the threshold are requested again on later visits. Archived playback can use a preflight redirect, an in-page local player replacement, or an ask prompt. In-page replacement keeps YouTube around the player but still loads YouTube page resources; local autoplay starts muted because audible autoplay requires browser permission or a user gesture. The dihi downloads UI exposes source YouTube URLs as copy-only controls instead of direct links.
+The browser extension tracks per-video YouTube visit counts in `chrome.storage.local`. When enabled, it auto-downloads missing videos after the configured visit threshold and notifies when the automatic request starts. It calls `/api/media/resolve/<video_id>` before posting a download request and skips the request if local media already exists. Resolve is strict-only (ignores `data/media-fallback/`), so fallback copies keep getting upgraded to strict downloads. Counts reset only once the video is found in the archive, so still-missing videos at or above the threshold are requested again on later visits. Archived playback can use a preflight redirect, an in-page local player replacement, or an ask prompt. In-page replacement keeps YouTube around the player but still loads YouTube page resources; local autoplay starts muted because audible autoplay requires browser permission or a user gesture. The dihi downloads UI exposes source YouTube URLs as copy-only controls instead of direct links.
 
 Browser playback of `.mkv` is inconsistent across browsers and codecs. Keep the VLC URL path available when changing playback behavior.
 
@@ -259,14 +259,13 @@ The current suite is pure unit tests: no network, no real yt-dlp download, no ff
 ## Roadmap / TODO
 
 - Keep the browser extension mirrored with the active site flows and API endpoints. When queue, playlist, playback, settings, or response-shape behavior changes, update the extension code, extension README, and extension version together, then test the extension against the documented endpoints.
-- Serve `/api/media/library` (and its `/files`, `*.txt`, playlist-detail, and resolve callers) from the SQLite catalog, paginate it, or otherwise stop the per-request full `merged/` rescan that inlines descriptions and `info.json` per video. Check the web UI and extension against any response-shape change in the same update.
-- Optional media layout migration: strict output lives at root `merged/` while legacy, fallback, playlists, and runtime files live under `data/`. A future change could unify everything under `data/` (e.g. `data/media-strict`, `data/media-legacy`, `data/media-fallback`) with a one-time move script. Requires updating Docker bind mounts and container paths, `MERGED_DIR`/`LEGACY_MERGED_DIR`/`FALLBACK_DIR` constants, the `make data` target, docs, and a full re-verification while no downloads are running. Cosmetic only — do not bundle with functional changes.
+- Serve `/api/media/library` (and its `/files`, `*.txt`, playlist-detail, and resolve callers) from the SQLite catalog, paginate it, or otherwise stop the per-request full media-tree rescan that inlines descriptions and `info.json` per video. Check the web UI and extension against any response-shape change in the same update.
 
 ## Coding Caveats
 
 - Keep `app3.py` as the active server unless explicitly asked to split the UI/API.
 - Do not commit cookies or downloaded media.
-- Do not stage or commit local archive/runtime data such as `data/archive.txt`, root `archive.txt`, or `audio/**`.
+- Do not stage or commit local runtime data: everything under `data/` is git-ignored.
 - Preserve `/api/youtube/*` compatibility for the extension.
 - Be careful with multi-worker Gunicorn changes: in-memory download state is per worker.
 - Prefer small, focused changes over broad refactors.

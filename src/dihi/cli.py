@@ -71,13 +71,13 @@ def _add_download_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("target", help="YouTube URL, video ID (11 chars), or playlist ID.")
     p.add_argument(
         "--archive",
-        default="archive.txt",
-        help="yt-dlp download archive file (default: archive.txt).",
+        default="data/archive.txt",
+        help="yt-dlp download archive file (default: data/archive.txt).",
     )
     p.add_argument(
         "--merged-dir",
-        default="merged",
-        help="Output base directory (default: merged).",
+        default="data/media-strict",
+        help="Output base directory (default: data/media-strict).",
     )
     p.add_argument(
         "--cookies-browser",
@@ -191,8 +191,8 @@ def main() -> int:
     ck.add_argument("target", help="Video ID, or full YouTube URL.")
     ck.add_argument(
         "--archive",
-        default="archive.txt",
-        help="yt-dlp archive file to search (default: archive.txt).",
+        default="data/archive.txt",
+        help="yt-dlp archive file to search (default: data/archive.txt).",
     )
 
     args = ap.parse_args()

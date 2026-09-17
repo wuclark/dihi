@@ -149,7 +149,7 @@ def _find_cookiefile(archive_path: Path) -> Optional[Path]:
     candidates = [
         archive_path.parent / "cookies.txt",
         Path("data/cookies.txt").expanduser(),
-        Path("cookies.txt").expanduser(),
+        Path("cookies.txt").expanduser(),  # legacy pre-data-layout location
     ]
     seen = set()
     for candidate in candidates:
@@ -685,8 +685,8 @@ def to_youtube_url(user_input: str) -> str:
 
 
 def build_ydl_opts(
-    merged_dir: Union[str, Path] = "merged",
-    archive: Union[str, Path] = "archive.txt",
+    merged_dir: Union[str, Path] = "data/media-strict",
+    archive: Union[str, Path] = "data/archive.txt",
     *,
     cookies_browser: Optional[str] = None,
     no_js: bool = False,
@@ -841,8 +841,8 @@ def build_ydl_opts(
 def _download_youtube_once(
     target: str,
     *,
-    merged_dir: Union[str, Path] = "merged",
-    archive: Union[str, Path] = "archive.txt",
+    merged_dir: Union[str, Path] = "data/media-strict",
+    archive: Union[str, Path] = "data/archive.txt",
     cookies_browser: Optional[str] = None,
     no_js: bool = False,
     extra_opts: Optional[Dict[str, Any]] = None,
@@ -891,8 +891,8 @@ def _download_youtube_once(
 def download_youtube(
     target: str,
     *,
-    merged_dir: Union[str, Path] = "merged",
-    archive: Union[str, Path] = "archive.txt",
+    merged_dir: Union[str, Path] = "data/media-strict",
+    archive: Union[str, Path] = "data/archive.txt",
     cookies_browser: Optional[str] = None,
     no_js: bool = False,
     extra_opts: Optional[Dict[str, Any]] = None,

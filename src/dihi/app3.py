@@ -51,10 +51,10 @@ def _queue_limit(kind: str) -> int:
         return default
 
 # Archive lines look like: "youtube <id>"
-CHECK_FILE = Path("./archive.txt").expanduser().resolve()
-MERGED_DIR = Path("./merged").expanduser().resolve()
-LEGACY_MERGED_DIR = Path("./data/merged").expanduser().resolve()
-FALLBACK_DIR = Path("./data/bestfallback").expanduser().resolve()
+CHECK_FILE = Path("./data/archive.txt").expanduser().resolve()
+MERGED_DIR = Path("./data/media-strict").expanduser().resolve()
+LEGACY_MERGED_DIR = Path("./data/media-legacy").expanduser().resolve()
+FALLBACK_DIR = Path("./data/media-fallback").expanduser().resolve()
 CATALOG_DB = Path(os.environ.get("DIHI_CATALOG_DB", "./data/media-catalog.db")).expanduser().resolve()
 PLAYLIST_METADATA_DIR = Path(os.environ.get("DIHI_PLAYLIST_METADATA_DIR", "./data/playlists")).expanduser().resolve()
 _APP_DIR = Path(__file__).resolve().parent
@@ -442,7 +442,7 @@ def _download_worker(video_id: str, cookies_browser: str | None = None, queue_it
             audio_meta=True,
             cookies_browser=cookies_browser,
             extra_opts={"progress_hooks": [_progress_hook(video_id)],
-                        "download_archive": None if _media_needs_sidecar_retry(video_id) else "archive.txt"},
+                        "download_archive": None if _media_needs_sidecar_retry(video_id) else str(CHECK_FILE)},
         )
         # Give filesystem time to sync archive.txt
         time.sleep(0.5)
@@ -579,7 +579,7 @@ def _playlist_download_worker(playlist_id: str, queue_item_id: int | None = None
                     member["video_id"],
                     audio_meta=True,
                     extra_opts={"progress_hooks": [_progress_hook(playlist_id)],
-                                "download_archive": None if _media_needs_sidecar_retry(member["video_id"]) else "archive.txt"},
+                                "download_archive": None if _media_needs_sidecar_retry(member["video_id"]) else str(CHECK_FILE)},
                 )
                 if child_rc:
                     rc = child_rc
@@ -1066,7 +1066,7 @@ def _cleanup_report() -> dict:
         replacements = []
         for pattern in ("*.out.mkv", "*.out.m4a"):
             for replacement in sorted(replacement_dir.glob(pattern)):
-                replacements.append({"name": replacement.name, "path": str(replacement), "url": media_url(replacement), "bytes": replacement.stat().st_size, "location": "primary merged/" if replacement.is_relative_to(MERGED_DIR) else "legacy data/merged/"})
+                replacements.append({"name": replacement.name, "path": str(replacement), "url": media_url(replacement), "bytes": replacement.stat().st_size, "location": "strict data/media-strict/" if replacement.is_relative_to(MERGED_DIR) else "legacy data/media-legacy/"})
         entries.append({"video_id": path.parent.name, "path": str(path), "url": media_url(path), "category": category, "reason": reason, "bytes": size, "primary_files": replacements})
 
     def check_audio(path: Path) -> None:
@@ -1142,7 +1142,7 @@ def _cleanup_report() -> dict:
             if video_dir.is_dir() and not _is_playlist_dir(video_dir) and video_dir.name in primary:
                 for path in video_dir.rglob("*"):
                     if path.is_file():
-                        add(path, "fallback duplicate", "complete primary copy exists under merged/")
+                        add(path, "fallback duplicate", "complete strict copy exists under data/media-strict/")
 
     for root in (MERGED_DIR, LEGACY_MERGED_DIR):
         for path in root.rglob("*") if root.is_dir() else []:
@@ -1807,7 +1807,7 @@ def api_media_catalog():
         video_id, source_root, channel_id = row[0], row[1], row[2]
         files = json.loads(row[9] or "{}")
         formats = json.loads(row[10] or "[]")
-        # A download may finish in merged/ after the catalog's last scan. In
+        # A download may finish in data/media-strict/ after the catalog's last scan. In
         # that case, rebuild this row from the live directory so thumbnail and
         # media links do not remain pointed at a stale legacy location.
         live_roots = [
@@ -2276,9 +2276,9 @@ def api_media_download_history():
 def api_system_status():
     """Return safe operational diagnostics without exposing cookie contents."""
     usage = shutil.disk_usage(Path.cwd())
-    # Docker mounts the host export at /app/cookies.txt; local runs commonly
-    # keep it at data/cookies.txt. Inspect whichever active path exists.
-    cookie_candidates = [Path("./cookies.txt"), Path("./data/cookies.txt")]
+    # Cookies live at data/cookies.txt in both host and container layouts.
+    # The old root ./cookies.txt is kept as a legacy fallback candidate.
+    cookie_candidates = [Path("./data/cookies.txt"), Path("./cookies.txt")]
     cookie = next((candidate for candidate in cookie_candidates if candidate.is_file()), cookie_candidates[0])
     def directory_size(path: Path) -> int:
         total = 0
@@ -2291,7 +2291,7 @@ def api_system_status():
                     except OSError: pass
         except OSError: pass
         return total
-    result = {"disk": {"free_bytes": usage.free, "total_bytes": usage.total, "free_percent": round(usage.free * 100 / usage.total, 1)}, "directories": {str(path): directory_size(path) for path in (MERGED_DIR, LEGACY_MERGED_DIR, FALLBACK_DIR, Path("./audio").resolve())}, "cookies": {"present": cookie.is_file(), "netscape_format": False, "youtube_domains": [], "count": 0, "expired": 0}}
+    result = {"disk": {"free_bytes": usage.free, "total_bytes": usage.total, "free_percent": round(usage.free * 100 / usage.total, 1)}, "directories": {str(path): directory_size(path) for path in (MERGED_DIR, LEGACY_MERGED_DIR, FALLBACK_DIR, Path("./data/audio").resolve())}, "cookies": {"present": cookie.is_file(), "netscape_format": False, "youtube_domains": [], "count": 0, "expired": 0}}
     if cookie.is_file():
         try:
             lines = cookie.read_text(encoding="utf-8", errors="ignore").splitlines()

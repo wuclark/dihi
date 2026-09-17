@@ -208,9 +208,11 @@ __marimo__/
 
 
 
-merged/
+# Local runtime data — everything lives under data/
 data/
 
-# Sensitive cookie files
+# Legacy pre-unification locations and sensitive files (never commit)
+merged/
+audio/
 cookies.txt
 archive.txt
