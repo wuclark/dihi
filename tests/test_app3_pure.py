@@ -30,6 +30,7 @@ from app3 import (
     _cleanup_old_results,
     _cleanup_old_playlist_results,
     _resolve_media_by_video_id,
+    _scan_library_cached,
     _download_status_snapshot,
     _log_queue_state_locked,
     _recover_running_queue_items,
@@ -57,6 +58,7 @@ def reset_app3_state(monkeypatch):
     monkeypatch.setattr(app3, "_playlist_history", {})
     monkeypatch.setattr(app3, "_playlist_history_timestamps", {})
     monkeypatch.setattr(app3, "_last_queue_log_message", None)
+    monkeypatch.setattr(app3, "_LIBRARY_CACHE", {"fingerprint": None, "videos": []})
 
 
 # ---------------------------------------------------------------------------
@@ -351,6 +353,62 @@ class TestResolveMediaByVideoId:
         monkeypatch.setattr(app3, "MERGED_DIR", tmp_path.resolve())
 
         assert _resolve_media_by_video_id("dQw4w9WgXcQ") is None
+
+
+# ---------------------------------------------------------------------------
+# _scan_library_cached
+# ---------------------------------------------------------------------------
+
+class TestScanLibraryCached:
+    def _isolate(self, monkeypatch, tmp_path):
+        merged = tmp_path / "merged"
+        legacy = tmp_path / "legacy"
+        merged.mkdir()
+        legacy.mkdir()
+        monkeypatch.setattr(app3, "MERGED_DIR", merged.resolve())
+        monkeypatch.setattr(app3, "LEGACY_MERGED_DIR", legacy.resolve())
+        return merged
+
+    def test_reuses_cache_when_nothing_changes(self, monkeypatch, tmp_path):
+        merged = self._isolate(monkeypatch, tmp_path)
+        (merged / "UCchannel01" / "dQw4w9WgXcQ").mkdir(parents=True)
+        calls = []
+        monkeypatch.setattr(app3, "_scan_library",
+                            lambda: calls.append(1) or [{"video_id": "dQw4w9WgXcQ"}])
+
+        first = _scan_library_cached()
+        second = _scan_library_cached()
+
+        assert first == [{"video_id": "dQw4w9WgXcQ"}]
+        assert second is first  # same cached object, no rescan
+        assert len(calls) == 1
+
+    def test_new_video_dir_invalidates_cache(self, monkeypatch, tmp_path):
+        merged = self._isolate(monkeypatch, tmp_path)
+        (merged / "UCchannel01" / "dQw4w9WgXcQ").mkdir(parents=True)
+        calls = []
+        monkeypatch.setattr(app3, "_scan_library",
+                            lambda: calls.append(1) or [{"video_id": "dQw4w9WgXcQ"}])
+        _scan_library_cached()
+
+        (merged / "UCchannel01" / "abc12345678").mkdir(parents=True)
+
+        _scan_library_cached()
+        assert len(calls) == 2
+
+    def test_deleted_video_dir_invalidates_cache(self, monkeypatch, tmp_path):
+        merged = self._isolate(monkeypatch, tmp_path)
+        doomed = merged / "UCchannel01" / "dQw4w9WgXcQ"
+        doomed.mkdir(parents=True)
+        calls = []
+        monkeypatch.setattr(app3, "_scan_library",
+                            lambda: calls.append(1) or [{"video_id": "dQw4w9WgXcQ"}])
+        _scan_library_cached()
+
+        doomed.rmdir()
+
+        _scan_library_cached()
+        assert len(calls) == 2
 
 
 # ---------------------------------------------------------------------------

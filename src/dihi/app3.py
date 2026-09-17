@@ -850,6 +850,58 @@ def _scan_video_dir(channel_id: str, video_dir: Path, media_prefix: str) -> Opti
     }
 
 
+def _library_fingerprint() -> tuple:
+    """Cheap stat-only snapshot of the channel/video directory structure.
+
+    New downloads add directories/files (bumping dir mtimes) and cleanup
+    deletes or moves them, so any add/delete changes this fingerprint without
+    reading a single file. In-place content modifications can be missed, but
+    those only happen mid-download while files are incomplete anyway.
+    """
+    parts = []
+    for root in (MERGED_DIR, LEGACY_MERGED_DIR):
+        try:
+            channels = sorted(root.iterdir()) if root.is_dir() else []
+        except OSError:
+            continue
+        for channel_dir in channels:
+            try:
+                is_dir = channel_dir.is_dir()
+            except OSError:
+                continue
+            if not is_dir:
+                continue
+            try:
+                videos = sorted(video_dir.name for video_dir in channel_dir.iterdir()
+                                if video_dir.is_dir())
+            except OSError:
+                videos = []
+            try:
+                mtime = channel_dir.stat().st_mtime_ns
+            except OSError:
+                mtime = 0
+            parts.append((channel_dir.name, tuple(videos), mtime))
+    return tuple(parts)
+
+
+_LIBRARY_CACHE: dict = {"fingerprint": None, "videos": []}
+
+
+def _scan_library_cached() -> list[dict]:
+    """Return the library scan, reusing the cached result when nothing was
+    added or deleted since the last scan. Thread-safe; each Gunicorn worker
+    holds its own cache (see Coding Caveats about multi-worker state)."""
+    fingerprint = _library_fingerprint()
+    with _lock:
+        if _LIBRARY_CACHE["fingerprint"] == fingerprint:
+            return _LIBRARY_CACHE["videos"]
+    videos = _scan_library()
+    with _lock:
+        _LIBRARY_CACHE["fingerprint"] = fingerprint
+        _LIBRARY_CACHE["videos"] = videos
+    return videos
+
+
 def _scan_library() -> list[dict]:
     """Walk primary and legacy merged trees, preferring the primary copy."""
     videos = []
@@ -1113,7 +1165,7 @@ def _cleanup_report() -> dict:
 
 
 def _scan_tags() -> dict:
-    videos = _scan_library()
+    videos = _scan_library_cached()
     tags: dict[str, list[dict]] = {}
     for video in videos:
         video_dir = MERGED_DIR / video["channel_id"] / video["video_id"]
@@ -1738,13 +1790,13 @@ def api_media_catalog():
 
 @app.get("/api/media/library")
 def api_media_library():
-    return jsonify(videos=_scan_library())
+    return jsonify(videos=_scan_library_cached())
 
 
 @app.get("/api/media/library/files")
 def api_media_library_files():
     files = []
-    for video in _scan_library():
+    for video in _scan_library_cached():
         for item in video.get("details", {}).get("files", []):
             files.append({"video_id": video["video_id"], "title": video["title"], **item})
     return jsonify(files=files, count=len(files))
@@ -1753,7 +1805,7 @@ def api_media_library_files():
 @app.get("/api/media/library/files.txt")
 def api_media_library_files_text():
     lines = []
-    for video in _scan_library():
+    for video in _scan_library_cached():
         for item in video.get("details", {}).get("files", []):
             lines.append(f"{video['video_id']}\t{video['title']}\t{item['name']}\t{request.host_url.rstrip('/')}{item['url']}")
     return Response("\n".join(lines) + ("\n" if lines else ""), mimetype="text/plain",
@@ -1763,7 +1815,7 @@ def api_media_library_files_text():
 def _library_youtube_exports() -> tuple[list[str], list[str]]:
     videos, playlists, video_ids, playlist_ids = [], [], [], []
     seen_videos, seen_playlists = set(), set()
-    for video in _scan_library():
+    for video in _scan_library_cached():
         video_id = str(video.get("video_id") or "").strip()
         info = video.get("details", {}).get("metadata", {}).get("info_json", {})
         if video_id and video_id not in seen_videos:
@@ -1811,7 +1863,7 @@ def api_media_playlist(playlist_id: str):
     playlist = next((item for item in playlist_rows if item["playlist_id"] == playlist_id), None)
     if not playlist:
         return jsonify(error="playlist not found"), 404
-    videos_by_id = {item["video_id"]: item for item in _scan_library()}
+    videos_by_id = {item["video_id"]: item for item in _scan_library_cached()}
     members = []
     for member in catalog.playlist_video_ids(CATALOG_DB, playlist_id):
         video = videos_by_id.get(member["video_id"])
@@ -1851,7 +1903,7 @@ def api_media_playlist_m3u(playlist_id: str):
     if mode not in {"video", "audio"}:
         return jsonify(error="mode must be video or audio"), 400
     members = catalog.playlist_video_ids(CATALOG_DB, playlist_id)
-    videos_by_id = {item["video_id"]: item for item in _scan_library()}
+    videos_by_id = {item["video_id"]: item for item in _scan_library_cached()}
     lines = ["#EXTM3U"]
     for member in members:
         video = videos_by_id.get(member["video_id"]) or {}
