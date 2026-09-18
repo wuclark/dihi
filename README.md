@@ -300,7 +300,7 @@ Options also control automatic behavior:
 
 Visit counts are stored locally in the browser and reset when a video is found in the archive. When auto-download starts after a threshold match, the extension shows a notification. Before posting a download request, it resolves local media again and skips the request if the video is already downloaded. If the video is still missing on a later visit and its count is still at or above the threshold, the extension requests the download again.
 
-The server UI accepts `/video/<video_id>` to open an archived video directly; the library remains available at `/`.
+The server UI accepts `/video/<video_id>` to open an archived video directly; the library remains available at `/`. Library search and sort requests are handled by the catalog server-side, so the browser does not need to load the entire archive before filtering it. The Tools page links to `/library-tests`, a dedicated library search/sort/playlist test page with playlist selection by name, generated links, expected-result guidance, and live API JSON output.
 
 ---
 

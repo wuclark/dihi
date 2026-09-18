@@ -83,6 +83,26 @@ def test_library_search_and_pagination(client, env):
     assert body["total"] == 1 and body["videos"][0]["video_id"] == "kIll0-AyMa0"
 
 
+def test_library_search_returns_all_matches_without_explicit_pagination(client, env):
+    for index in range(3):
+        _video(env["merged"], vid=f"a{index:010d}", channel="UCchannel01")
+
+    body = client.get("/api/media/library?q=UCchannel01").get_json()
+    assert body["total"] == 3
+    assert len(body["videos"]) == 3
+
+
+def test_library_supports_descending_title_and_channel_sort(client, env):
+    _video(env["merged"], vid="dQw4w9WgXcQ", channel="UCchannel02")
+    _video(env["merged"], vid="kIll0-AyMa0", channel="UCchannel01")
+
+    titles = client.get("/api/media/library?sort=title-desc").get_json()["videos"]
+    assert [video["video_id"] for video in titles] == ["kIll0-AyMa0", "dQw4w9WgXcQ"]
+
+    channels = client.get("/api/media/library?sort=channel").get_json()["videos"]
+    assert [video["video_id"] for video in channels] == ["kIll0-AyMa0", "dQw4w9WgXcQ"]
+
+
 def test_library_prefers_strict_and_shows_fallback(client, env):
     _video(env["merged"])
     _video(env["fallback"], vid="kIll0-AyMa0")

@@ -1675,6 +1675,11 @@ def tools_page():
     return render_template("tools.html")
 
 
+@app.get("/library-tests")
+def library_tests_page():
+    return render_template("library_tests.html")
+
+
 @app.get("/api-docs")
 def api_docs_page():
     endpoints = [
@@ -1718,7 +1723,7 @@ def sitemap_page():
     groups = [
         ("Library", [("Media library", "/"), ("Playlists", "/playlists"), ("Video detail", "/video/dQw4w9WgXcQ"), ("Catalog", "/catalog"), ("Export files", "/library-export")]),
         ("Downloads", [("Downloads status", "/downloads"), ("Persistent queue", "/queue"), ("Downloaded history", "/downloaded")]),
-        ("Tools", [("Tools hub", "/tools"), ("API documentation", "/api-docs"), ("System status", "/status"), ("Tags", "/tags"), ("Word cloud", "/wordcloud"), ("Tag cloud", "/tagcloud")]),
+        ("Tools", [("Tools hub", "/tools"), ("Library search/sort tests", "/library-tests"), ("API documentation", "/api-docs"), ("System status", "/status"), ("Tags", "/tags"), ("Word cloud", "/wordcloud"), ("Tag cloud", "/tagcloud")]),
         ("Integration", [("Health API", "/health"), ("Extension download", "/extension.zip")]),
     ]
     return render_template("sitemap.html", groups=groups)
@@ -1875,7 +1880,10 @@ def api_media_library():
         per_page = min(200, max(1, int(request.args.get("per_page", 50))))
     except ValueError:
         return jsonify(error="page and per_page must be integers"), 400
-    paginated = request.args.get("page") is not None or query is not None
+    # The library UI has no separate pagination control: a search or sort
+    # request must return the complete matching card set. Explicit ``page``
+    # requests remain available for API consumers.
+    paginated = request.args.get("page") is not None
     try:
         if paginated:
             items, total = catalog.library_cards(
@@ -1898,7 +1906,7 @@ def api_media_library():
         start = (page - 1) * per_page
         return jsonify(videos=cards[start:start + per_page], page=page, per_page=per_page,
                        total=total, pages=(total + per_page - 1) // per_page)
-    return jsonify(videos=cards)
+    return jsonify(videos=cards, total=len(cards))
 
 
 @app.get("/api/media/library/files")

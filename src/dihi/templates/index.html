@@ -353,13 +353,34 @@ const $ = id => document.getElementById(id);
 
 // ── Library fetch ──────────────────────────────────────────────────────────
 
+// Server-side search/sort: the library endpoint filters (q) and sorts before
+// sending cards, so huge archives never load every card into the page.
+// Playlist mode keeps client-side filtering (playlist endpoint has no q).
+const SERVER_SORT_PARAM = {
+  'date-desc': 'date-desc', 'date-asc': 'date-asc', 'title-asc': 'title',
+  'title-desc': 'title-desc', 'channel': 'channel',
+};
+let searchTimer = null;
+
 async function fetchLibrary() {
   try {
     const params = new URLSearchParams(location.search);
     const playlistId = params.get('playlist');
-    const r = await fetch(playlistId
-      ? `/api/media/playlists/${encodeURIComponent(playlistId)}`
-      : '/api/media/library');
+    S.serverMode = !playlistId;
+    let url;
+    if (playlistId) {
+      url = `/api/media/playlists/${encodeURIComponent(playlistId)}`;
+      S.serverQuery = null;
+      S.serverSort = null;
+    } else {
+      S.serverQuery = $('search').value.trim();
+      S.serverSort = $('sort').value;
+      const sp = new URLSearchParams();
+      if (S.serverQuery) sp.set('q', S.serverQuery);
+      sp.set('sort', SERVER_SORT_PARAM[S.serverSort] || 'date-desc');
+      url = '/api/media/library?' + sp.toString();
+    }
+    const r = await fetch(url);
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const data = await r.json();
     S.videos = playlistId
@@ -376,6 +397,8 @@ async function fetchLibrary() {
   }
   applyFilters();
   openInitialVideoFromUrl();
+  const params = new URLSearchParams(location.search);
+  const playlistId = params.get('playlist');
   if (playlistId && params.get('playall') === '1') playAll();
 }
 
@@ -387,7 +410,10 @@ function applyFilters() {
 
   let list = S.videos;
   if (S.wordVideoIds) list = list.filter(v => S.wordVideoIds.has(v.video_id));
-  if (q) {
+  // The normal library is already filtered and sorted by the API. Playlist
+  // pages still need the local implementation because their endpoint returns
+  // playlist membership rather than library-query results.
+  if (q && !S.serverMode) {
     list = list.filter(v =>
       v.title.toLowerCase().includes(q) ||
       v.channel_id.toLowerCase().includes(q) ||
@@ -395,7 +421,7 @@ function applyFilters() {
     );
   }
 
-  list = [...list].sort((a, b) => {
+  if (!S.serverMode) list = [...list].sort((a, b) => {
     switch (sort) {
       case 'date-desc': return (b.date || '').localeCompare(a.date || '');
       case 'date-asc':  return (a.date || '').localeCompare(b.date || '');
@@ -1015,8 +1041,14 @@ $('apanel').addEventListener('error', () => {
   $('playback-msg').textContent = 'This audio file could not be played in the browser.';
 });
 
-$('search').addEventListener('input', applyFilters);
-$('sort').addEventListener('change', applyFilters);
+function scheduleLibraryFetch() {
+  if (!S.serverMode) { applyFilters(); return; }
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(fetchLibrary, 250);
+}
+
+$('search').addEventListener('input', scheduleLibraryFetch);
+$('sort').addEventListener('change', scheduleLibraryFetch);
 $('dl-input').addEventListener('keydown', e => { if (e.key === 'Enter') submitDownload(); });
 
 fetchLibrary();

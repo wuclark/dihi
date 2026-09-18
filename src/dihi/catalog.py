@@ -76,6 +76,8 @@ _LIBRARY_SORTS = {
     "date-asc": "upload_date ASC, video_id ASC",
     "date-desc": "upload_date DESC, video_id ASC",
     "title": "title COLLATE NOCASE ASC, video_id ASC",
+    "title-desc": "title COLLATE NOCASE DESC, video_id ASC",
+    "channel": "channel_id COLLATE NOCASE ASC, upload_date DESC, video_id ASC",
     "artist": "artist COLLATE NOCASE ASC, title COLLATE NOCASE ASC, video_id ASC",
 }
 
