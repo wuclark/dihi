@@ -98,7 +98,7 @@ Core UI/media routes:
 - `GET /sitemap` renders the site map
 - `GET /cleanup` renders the dry-run cleanup report
 - `GET /status` renders disk and cookie diagnostics
-- `GET /api/media/library` lists library cards from the SQLite catalog (supports `?page=&per_page=&sort=`; default returns all cards with `total`)
+- `GET /api/media/library` lists library cards from the SQLite catalog (supports `?page=&per_page=&sort=&q=`; default returns all cards with `total`; `q` matches title, video ID, and channel ID)
 - `GET /api/media/library/files` lists every indexed library file with a link from the catalog
 - `GET /api/media/library/files.txt` exports every indexed library file link as text from the catalog
 - `GET /api/media/library/youtube.txt` exports all video and playlist YouTube links from the catalog
@@ -267,7 +267,7 @@ The current suite is pure unit tests: no network, no real yt-dlp download, no ff
 ## Roadmap / TODO
 
 - Keep the browser extension mirrored with the active site flows and API endpoints. When queue, playlist, playback, settings, or response-shape behavior changes, update the extension code, extension README, and extension version together, then test the extension against the documented endpoints.
-- Serve the remaining scan-backed callers (`/api/media/tags` fallback already catalog-first; `/api/media/resolve` still uses a cheap single-video scan) from the SQLite catalog if they show up in profiling, and add server-side search/sort to `/api/media/library` so the web UI can stop client-side filtering on huge archives.
+- Serve the remaining scan-backed callers (`/api/media/tags` fallback already catalog-first; `/api/media/resolve` still uses a cheap single-video scan) from the SQLite catalog if they show up in profiling, and switch the web UI from client-side filtering to `/api/media/library?q=` on huge archives.
 
 ## Coding Caveats
 

@@ -65,6 +65,24 @@ def test_library_returns_slim_cards(client, env):
     assert card["files"]["video"].startswith("/media/")
 
 
+def test_library_search_and_pagination(client, env):
+    _video(env["merged"], vid="dQw4w9WgXcQ", channel="UCchannel01")
+    _video(env["merged"], vid="kIll0-AyMa0", channel="UCchannel02")
+
+    body = client.get("/api/media/library?q=dQw4w9WgXcQ").get_json()
+    assert body["total"] == 1
+    assert [v["video_id"] for v in body["videos"]] == ["dQw4w9WgXcQ"]
+
+    body = client.get("/api/media/library?q=no-such-video").get_json()
+    assert body["videos"] == [] and body["total"] == 0
+
+    body = client.get("/api/media/library?page=1&per_page=1&sort=title").get_json()
+    assert body["total"] == 2 and body["pages"] == 2 and len(body["videos"]) == 1
+
+    body = client.get("/api/media/library?page=1&per_page=1&sort=title&q=UCchannel02").get_json()
+    assert body["total"] == 1 and body["videos"][0]["video_id"] == "kIll0-AyMa0"
+
+
 def test_library_prefers_strict_and_shows_fallback(client, env):
     _video(env["merged"])
     _video(env["fallback"], vid="kIll0-AyMa0")

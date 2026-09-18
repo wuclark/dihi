@@ -1843,7 +1843,7 @@ def api_media_catalog():
     return jsonify(items=items, page=page, per_page=per_page, total=total, pages=(total + per_page - 1) // per_page)
 
 
-def _catalog_library_or_scan() -> list[dict]:
+def _catalog_library_or_scan(query: str | None = None) -> list[dict]:
     """Return slim cards from the catalog, falling back to a live scan.
 
     The catalog is rebuildable from disk via ``catalog.refresh``; the scan
@@ -1851,39 +1851,54 @@ def _catalog_library_or_scan() -> list[dict]:
     finishes and any catalog read error.
     """
     try:
-        items, _total = catalog.library_cards(CATALOG_DB)
+        items, _total = catalog.library_cards(CATALOG_DB, q=query)
         if items:
             return items
     except (sqlite3.Error, OSError, ValueError):
         pass
-    return [_slim_video(video) for video in _scan_library_cached()]
+    cards = [_slim_video(video) for video in _scan_library_cached()]
+    needle = (query or "").strip().lower()
+    if needle:
+        cards = [card for card in cards
+                 if needle in str(card.get("title") or "").lower()
+                 or needle in str(card.get("video_id") or "").lower()
+                 or needle in str(card.get("channel_id") or "").lower()]
+    return cards
 
 
 @app.get("/api/media/library")
 def api_media_library():
-    try:
-        page_arg = request.args.get("page")
-        if page_arg is None:
-            items, total = catalog.library_cards(
-                CATALOG_DB, sort=request.args.get("sort", "date-desc"))
-            if items:
-                return jsonify(videos=items, total=total)
-    except (sqlite3.Error, OSError, ValueError):
-        pass
+    sort = request.args.get("sort", "date-desc")
+    query = (request.args.get("q") or "").strip() or None
     try:
         page = max(1, int(request.args.get("page", 1)))
         per_page = min(200, max(1, int(request.args.get("per_page", 50))))
     except ValueError:
         return jsonify(error="page and per_page must be integers"), 400
-    sort = request.args.get("sort", "date-desc")
-    if page_arg is not None:
-        try:
-            items, total = catalog.library_cards(CATALOG_DB, page=page, per_page=per_page, sort=sort)
-            return jsonify(videos=items, page=page, per_page=per_page, total=total,
-                           pages=(total + per_page - 1) // per_page)
-        except (sqlite3.Error, OSError, ValueError):
-            pass
-    return jsonify(videos=_catalog_library_or_scan())
+    paginated = request.args.get("page") is not None or query is not None
+    try:
+        if paginated:
+            items, total = catalog.library_cards(
+                CATALOG_DB, page=page, per_page=per_page, sort=sort, q=query)
+        else:
+            items, total = catalog.library_cards(CATALOG_DB, sort=sort)
+        if total:
+            if paginated:
+                return jsonify(videos=items, page=page, per_page=per_page, total=total,
+                               pages=(total + per_page - 1) // per_page)
+            return jsonify(videos=items, total=total)
+    except (sqlite3.Error, OSError, ValueError):
+        pass
+    # Catalog empty (first-startup window) or unreadable: fall back to a live
+    # scan. A catalog total of 0 with a non-empty scan means unindexed, not
+    # "no match", so the scan result wins in that case.
+    cards = _catalog_library_or_scan(query)
+    if paginated:
+        total = len(cards)
+        start = (page - 1) * per_page
+        return jsonify(videos=cards[start:start + per_page], page=page, per_page=per_page,
+                       total=total, pages=(total + per_page - 1) // per_page)
+    return jsonify(videos=cards)
 
 
 @app.get("/api/media/library/files")

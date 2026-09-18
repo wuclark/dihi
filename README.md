@@ -87,7 +87,7 @@ Compose starts the PO Token provider with the app and publishes its service port
 | `POST` | `/api/youtube/playlist/get/<playlist_id>` | 5/min | Trigger a full playlist download |
 | `POST` | `/api/youtube/playlist/prepare/<playlist_id>` | 5/min | Save playlist name and members without downloading |
 | `GET` | `/api/youtube/playlist/status/<playlist_id>` | 60/min | Poll playlist download progress |
-| `GET` | `/api/media/library` | 30/min | List archived media cards from the catalog (`?page=&per_page=&sort=`; default returns all cards with `total`) |
+| `GET` | `/api/media/library` | 30/min | List archived media cards from the catalog (`?page=&per_page=&sort=&q=`; default returns all cards with `total`) |
 | `GET` | `/api/media/library/files` | — | List every catalog-indexed library file and link |
 | `GET` | `/api/media/library/files.txt` | — | Export every catalog-indexed library file link as text |
 | `GET` | `/api/media/library/youtube.txt` | — | Export all catalog video and playlist YouTube links |

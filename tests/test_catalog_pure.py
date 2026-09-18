@@ -113,6 +113,30 @@ def test_library_cards_paginate_and_rebuild_from_disk(tmp_path):
                    item["files"]["video"], item["files"]["audio"]) for item in rebuilt) == snapshot
 
 
+def test_library_cards_search_filters_title_video_and_channel(tmp_path):
+    root = tmp_path / "media-strict"
+    _make_video(root, "chan-alpha", "aaaaaaaaaaa", "Alpha Song")
+    _make_video(root, "chan-beta", "bbbbbbbbbbb", "Beta Tune")
+    db = tmp_path / "catalog.db"
+    assert refresh(root, db) == 2
+
+    items, total = library_cards(db, q="alpha")
+    assert total == 1
+    assert {item["video_id"] for item in items} == {"aaaaaaaaaaa"}
+
+    items, _ = library_cards(db, q="BBBBBBBBBBB")
+    assert [item["video_id"] for item in items] == ["bbbbbbbbbbb"]
+
+    items, _ = library_cards(db, q="chan-beta")
+    assert [item["video_id"] for item in items] == ["bbbbbbbbbbb"]
+
+    items, total = library_cards(db, q="no-such-video")
+    assert items == [] and total == 0
+
+    items, total = library_cards(db, q="alpha", page=1, per_page=50)
+    assert total == 1 and [item["video_id"] for item in items] == ["aaaaaaaaaaa"]
+
+
 def test_library_files_exports_tags_rebuild_from_disk(tmp_path):
     root = tmp_path / "media-strict"
     _make_video(root, "channel", "aaaaaaaaaaa", "Alpha", {"tags": ["music"]})

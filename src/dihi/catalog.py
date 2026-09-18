@@ -335,41 +335,60 @@ def _slim_files(files: dict[str, Any]) -> dict[str, str]:
     return out
 
 
+def _like_escape(text: str) -> str:
+    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 def _deduped_rows(db: sqlite3.Connection, order: str, limit: int | None = None,
-                  offset: int = 0) -> tuple[list[tuple], int]:
+                  offset: int = 0, q: str | None = None) -> tuple[list[tuple], int]:
     """Return deduped video rows (preferring merged > legacy > bestfallback)."""
-    total = db.execute("SELECT COUNT(DISTINCT video_id) FROM videos").fetchone()[0]
+    needle = (q or "").strip().lower()
+    where = ""
+    params: list[Any] = []
+    if needle:
+        where = """ AND (lower(title) LIKE ? ESCAPE '\\' OR lower(video_id) LIKE ? ESCAPE '\\'
+                   OR lower(channel_id) LIKE ? ESCAPE '\\')"""
+        pattern = f"%{_like_escape(needle)}%"
+        params = [pattern, pattern, pattern]
+    total = db.execute(
+        f"""SELECT COUNT(*) FROM
+            (SELECT v.*, ROW_NUMBER() OVER (PARTITION BY video_id
+             ORDER BY CASE source_root WHEN 'merged' THEN 0 WHEN 'legacy' THEN 1 ELSE 2 END) AS rn
+             FROM videos v) WHERE rn = 1{where}""",
+        params,
+    ).fetchone()[0]
     query = """SELECT video_id, source_root, channel_id, title, upload_date, files_json, metadata_json
                  FROM (SELECT v.*, ROW_NUMBER() OVER (PARTITION BY video_id
                         ORDER BY CASE source_root WHEN 'merged' THEN 0 WHEN 'legacy' THEN 1 ELSE 2 END) AS rn
                        FROM videos v) WHERE rn = 1"""
-    query += f" ORDER BY {order}"
+    query += where + f" ORDER BY {order}"
     if limit is not None:
         query += " LIMIT ? OFFSET ?"
-        rows = db.execute(query, (limit, offset)).fetchall()
+        rows = db.execute(query, (*params, limit, offset)).fetchall()
     else:
-        rows = db.execute(query).fetchall()
+        rows = db.execute(query, params).fetchall()
     return rows, int(total or 0)
 
 
 def library_cards(database: Path, page: int | None = None, per_page: int = 200,
-                  sort: str = "date-desc") -> tuple[list[dict[str, Any]], int]:
+                  sort: str = "date-desc", q: str | None = None) -> tuple[list[dict[str, Any]], int]:
     """Return slim library cards from the catalog without touching media files.
 
     Every field derives from :func:`refresh` inputs (directory names,
     ``*.info.json`` metadata, and the on-disk file listing), so the result is
     fully rebuildable by deleting the DB file and rescanning. ``scanned_at``
-    timestamps are the only values that change across rebuilds.
+    timestamps are the only values that change across rebuilds. ``q`` matches
+    the same fields the web UI filters on (title, video ID, channel ID).
     """
     order = _LIBRARY_SORTS.get(sort, _LIBRARY_SORTS["date-desc"])
     with sqlite3.connect(database) as db:
         db.executescript(SCHEMA)
         if page is None:
-            rows, total = _deduped_rows(db, order)
+            rows, total = _deduped_rows(db, order, q=q)
         else:
             page = max(1, int(page))
             per_page = max(1, min(int(per_page), 2000))
-            rows, total = _deduped_rows(db, order, per_page, (page - 1) * per_page)
+            rows, total = _deduped_rows(db, order, per_page, (page - 1) * per_page, q=q)
     items = []
     for video_id, source_root, channel_id, title, upload_date, files_json, _metadata_json in rows:
         try:
