@@ -70,6 +70,15 @@ _SOURCE_ROOT_ALIASES = {
     "media-fallback": "bestfallback",
 }
 
+_SIDECAR_RE = re.compile(r"\.f\d+\.[^.]+$")
+
+_LIBRARY_SORTS = {
+    "date-asc": "upload_date ASC, video_id ASC",
+    "date-desc": "upload_date DESC, video_id ASC",
+    "title": "title COLLATE NOCASE ASC, video_id ASC",
+    "artist": "artist COLLATE NOCASE ASC, title COLLATE NOCASE ASC, video_id ASC",
+}
+
 
 def _info(path: Path) -> dict[str, Any]:
     for candidate in sorted(path.glob("*.info.json")):
@@ -284,6 +293,217 @@ def refresh(merged_dir: Path | list[Path], database: Path, archive: Path | None 
     return count
 
 
+def _slim_files(files: dict[str, Any]) -> dict[str, str]:
+    """Reduce per-file scan entries to slim card URLs.
+
+    Mirrors the classification in ``app3._classify_file`` so catalog-backed
+    cards keep the same ``files`` shape as filesystem scans. All inputs come
+    from :func:`refresh`, which derives them from the on-disk directory
+    listing; deleting the DB and re-running :func:`refresh` restores them.
+    """
+    out: dict[str, str] = {}
+    for name in sorted(files):
+        entry = files[name]
+        if not isinstance(entry, dict):
+            continue
+        if _SIDECAR_RE.search(name):
+            continue
+        url = entry.get("url")
+        if not url:
+            continue
+        ext = f".{str(entry.get('extension') or '').lower()}"
+        if ext == ".mkv":
+            out["video"] = url
+        elif ext in (".mp4", ".webm") and "video" not in out:
+            out["video"] = url
+        elif ext == ".m4a" and "audio" not in out:
+            out["audio"] = url
+        elif ext == ".opus" and "audio" not in out:
+            out["audio"] = url
+        elif ext == ".png" and "thumbnail" not in out:
+            out["thumbnail"] = url
+        elif ext in (".jpg", ".jpeg", ".webp") and "thumbnail" not in out:
+            out["thumbnail"] = url
+        elif ext == ".vtt" and "subtitles" not in out:
+            out["subtitles"] = url
+        elif ext == ".srt" and "subtitles" not in out:
+            out["subtitles"] = url
+        elif ext == ".json":
+            out["info_json"] = url
+        elif name.endswith(".description"):
+            out["description"] = url
+    return out
+
+
+def _deduped_rows(db: sqlite3.Connection, order: str, limit: int | None = None,
+                  offset: int = 0) -> tuple[list[tuple], int]:
+    """Return deduped video rows (preferring merged > legacy > bestfallback)."""
+    total = db.execute("SELECT COUNT(DISTINCT video_id) FROM videos").fetchone()[0]
+    query = """SELECT video_id, source_root, channel_id, title, upload_date, files_json, metadata_json
+                 FROM (SELECT v.*, ROW_NUMBER() OVER (PARTITION BY video_id
+                        ORDER BY CASE source_root WHEN 'merged' THEN 0 WHEN 'legacy' THEN 1 ELSE 2 END) AS rn
+                       FROM videos v) WHERE rn = 1"""
+    query += f" ORDER BY {order}"
+    if limit is not None:
+        query += " LIMIT ? OFFSET ?"
+        rows = db.execute(query, (limit, offset)).fetchall()
+    else:
+        rows = db.execute(query).fetchall()
+    return rows, int(total or 0)
+
+
+def library_cards(database: Path, page: int | None = None, per_page: int = 200,
+                  sort: str = "date-desc") -> tuple[list[dict[str, Any]], int]:
+    """Return slim library cards from the catalog without touching media files.
+
+    Every field derives from :func:`refresh` inputs (directory names,
+    ``*.info.json`` metadata, and the on-disk file listing), so the result is
+    fully rebuildable by deleting the DB file and rescanning. ``scanned_at``
+    timestamps are the only values that change across rebuilds.
+    """
+    order = _LIBRARY_SORTS.get(sort, _LIBRARY_SORTS["date-desc"])
+    with sqlite3.connect(database) as db:
+        db.executescript(SCHEMA)
+        if page is None:
+            rows, total = _deduped_rows(db, order)
+        else:
+            page = max(1, int(page))
+            per_page = max(1, min(int(per_page), 2000))
+            rows, total = _deduped_rows(db, order, per_page, (page - 1) * per_page)
+    items = []
+    for video_id, source_root, channel_id, title, upload_date, files_json, _metadata_json in rows:
+        try:
+            files = json.loads(files_json or "{}")
+        except ValueError:
+            files = {}
+        if not isinstance(files, dict):
+            files = {}
+        items.append({
+            "video_id": video_id,
+            "channel_id": channel_id,
+            "source_root": source_root,
+            "title": title or video_id,
+            "date": upload_date,
+            "files": _slim_files(files),
+        })
+    return items, total
+
+
+def library_files(database: Path) -> list[dict[str, Any]]:
+    """Return every indexed library file link from the catalog.
+
+    Derived from the ``files_json`` snapshots written by :func:`refresh`,
+    hence rebuildable from disk. Deduped to the preferred copy per video,
+    matching the library card precedence.
+    """
+    with sqlite3.connect(database) as db:
+        db.executescript(SCHEMA)
+        rows, _total = _deduped_rows(db, "video_id ASC")
+    files: list[dict[str, Any]] = []
+    for video_id, _source_root, _channel_id, title, _date, files_json, _metadata in rows:
+        try:
+            entries = json.loads(files_json or "{}")
+        except ValueError:
+            continue
+        if not isinstance(entries, dict):
+            continue
+        for name in sorted(entries):
+            entry = entries[name]
+            if not isinstance(entry, dict) or not entry.get("url"):
+                continue
+            files.append({"video_id": video_id, "title": title or video_id, **entry})
+    return files
+
+
+def library_exports(database: Path) -> tuple[list[str], list[str]]:
+    """Return YouTube links and ``video|playlist <id>`` lines from the catalog.
+
+    Video URLs come from the indexed ``metadata_json`` copies (falling back to
+    canonical watch URLs); playlist URLs come from both indexed video metadata
+    and the ``playlists`` table, which itself is rebuilt from per-video
+    ``playlist_*`` fields plus ``data/playlists/*.info.json`` descriptors.
+    """
+    links: list[str] = []
+    ids: list[str] = []
+    seen_videos: set[str] = set()
+    seen_playlists: set[str] = set()
+    with sqlite3.connect(database) as db:
+        db.executescript(SCHEMA)
+        rows, _total = _deduped_rows(db, "video_id ASC")
+        for video_id, _root, _channel, _title, _date, _files_json, metadata_json in rows:
+            video_id = str(video_id or "").strip()
+            if not video_id or video_id in seen_videos:
+                continue
+            seen_videos.add(video_id)
+            try:
+                info = json.loads(metadata_json or "{}")
+            except ValueError:
+                info = {}
+            if not isinstance(info, dict):
+                info = {}
+            links.append(str(info.get("webpage_url") or f"https://www.youtube.com/watch?v={video_id}"))
+            ids.append(f"video {video_id}")
+            playlist_id = str(info.get("playlist_id") or "").strip()
+            if playlist_id and playlist_id not in seen_playlists:
+                seen_playlists.add(playlist_id)
+                links.append(str(info.get("playlist_webpage_url")
+                                 or f"https://www.youtube.com/playlist?list={playlist_id}"))
+                ids.append(f"playlist {playlist_id}")
+        try:
+            for row in db.execute("SELECT playlist_id, webpage_url FROM playlists").fetchall():
+                playlist_id = str(row[0] or "").strip()
+                if not playlist_id or playlist_id in seen_playlists:
+                    continue
+                seen_playlists.add(playlist_id)
+                links.append(str(row[1] or f"https://www.youtube.com/playlist?list={playlist_id}"))
+                ids.append(f"playlist {playlist_id}")
+        except sqlite3.Error:
+            pass
+    return links, ids
+
+
+def library_tags(database: Path) -> dict[str, Any]:
+    """Return tag counts and tag-grouped slim cards from the catalog.
+
+    Tags come from the ``video_tags`` rows written by :func:`refresh` from
+    each ``*.info.json`` ``tags`` list, so they rebuild from disk.
+    """
+    with sqlite3.connect(database) as db:
+        db.executescript(SCHEMA)
+        video_rows, _total = _deduped_rows(db, "video_id ASC")
+        cards = {}
+        for video_id, source_root, channel_id, title, upload_date, files_json, _meta in video_rows:
+            try:
+                files = json.loads(files_json or "{}")
+            except ValueError:
+                files = {}
+            cards[video_id] = {
+                "video_id": video_id, "channel_id": channel_id, "source_root": source_root,
+                "title": title or video_id, "date": upload_date,
+                "files": _slim_files(files if isinstance(files, dict) else {}),
+            }
+        tag_rows = db.execute(
+            """SELECT t.tag, t.video_id FROM video_tags t
+               JOIN (SELECT video_id, MIN(CASE source_root WHEN 'merged' THEN 0
+                        WHEN 'legacy' THEN 1 ELSE 2 END) AS rank
+                     FROM videos GROUP BY video_id) best
+                 ON best.video_id = t.video_id
+               ORDER BY t.tag COLLATE NOCASE, t.video_id"""
+        ).fetchall()
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for tag, video_id in tag_rows:
+        tag = str(tag or "").strip()
+        card = cards.get(video_id)
+        if not tag or card is None:
+            continue
+        grouped.setdefault(tag, []).append(card)
+    return {
+        "tags": [{"tag": tag, "count": len(items)}
+                 for tag, items in sorted(grouped.items(), key=lambda kv: (-len(kv[1]), kv[0].lower()))],
+        "videos_by_tag": grouped,
+    }
+
+
 def record_attempt(database: Path, video_id: str, status: str, reason: str | None,
                    raw_error: str | None, retryable: bool, started_at: float, finished_at: float) -> None:
     database.parent.mkdir(parents=True, exist_ok=True)
@@ -434,6 +654,90 @@ def set_setting(database: Path, key: str, value: str) -> None:
         db.executescript(SCHEMA)
         db.execute("INSERT OR REPLACE INTO app_settings(key,value) VALUES (?,?)", (key, value))
         db.commit()
+
+
+# Single-object JSON backup for app_settings. JSON (not JSONL): settings are a
+# small key/value map, not an event stream. The DB stays the read path; the
+# file only seeds missing keys after a DB delete and receives a backup copy on
+# every settings write.
+_SETTINGS_BOUNDS = {
+    "max_concurrent_downloads": 10,
+    "max_concurrent_playlists": 5,
+}
+
+
+def _validated_setting(key: str, value: Any) -> str | None:
+    text = str(value or "").strip()
+    if key == "default_download_mode":
+        return text if text in {"immediate", "queue"} else None
+    if key in _SETTINGS_BOUNDS:
+        try:
+            number = int(text)
+        except (TypeError, ValueError):
+            return None
+        if 1 <= number <= _SETTINGS_BOUNDS[key]:
+            return str(number)
+        return None
+    return None
+
+
+def read_settings_file(settings_file: Path) -> dict[str, str]:
+    """Return validated settings from the JSON backup file ({} if absent)."""
+    try:
+        raw = json.loads(Path(settings_file).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    cleaned: dict[str, str] = {}
+    for key, value in raw.items():
+        valid = _validated_setting(str(key), value)
+        if valid is not None:
+            cleaned[str(key)] = valid
+    return cleaned
+
+
+def write_settings_file(settings_file: Path, settings: dict[str, str]) -> None:
+    """Atomically write validated settings to the JSON backup file."""
+    cleaned = {}
+    for key, value in settings.items():
+        valid = _validated_setting(str(key), value)
+        if valid is not None:
+            cleaned[str(key)] = valid
+    path = Path(settings_file)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(json.dumps(cleaned, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(path)
+
+
+def seed_settings_from_file(database: Path, settings_file: Path) -> int:
+    """Fill missing DB settings from the JSON backup; never overwrite DB values.
+
+    Returns the number of keys seeded. DB is authoritative: existing rows win
+    so concurrent workers cannot clobber live settings with stale file data.
+    """
+    wanted = read_settings_file(settings_file)
+    if not wanted:
+        return 0
+    seeded = 0
+    with sqlite3.connect(database) as db:
+        db.executescript(SCHEMA)
+        for key, value in wanted.items():
+            row = db.execute("SELECT value FROM app_settings WHERE key = ?", (key,)).fetchone()
+            if row is None:
+                db.execute("INSERT INTO app_settings(key,value) VALUES (?,?)", (key, value))
+                seeded += 1
+        db.commit()
+    return seeded
+
+
+def backup_settings_to_file(database: Path, settings_file: Path) -> None:
+    """Copy all DB settings into the JSON backup file (best-effort)."""
+    with sqlite3.connect(database) as db:
+        db.executescript(SCHEMA)
+        rows = db.execute("SELECT key, value FROM app_settings").fetchall()
+    write_settings_file(settings_file, {str(k): str(v) for k, v in rows})
 
 
 def download_attempts(database: Path, limit: int = 500) -> list[dict[str, Any]]:

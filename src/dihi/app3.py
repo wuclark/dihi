@@ -57,6 +57,7 @@ LEGACY_MERGED_DIR = Path("./data/media-legacy").expanduser().resolve()
 FALLBACK_DIR = Path("./data/media-fallback").expanduser().resolve()
 CATALOG_DB = Path(os.environ.get("DIHI_CATALOG_DB", "./data/media-catalog.db")).expanduser().resolve()
 PLAYLIST_METADATA_DIR = Path(os.environ.get("DIHI_PLAYLIST_METADATA_DIR", "./data/playlists")).expanduser().resolve()
+SETTINGS_FILE = Path(os.environ.get("DIHI_SETTINGS_FILE", "./data/settings.json")).expanduser().resolve()
 _APP_DIR = Path(__file__).resolve().parent
 _SOURCE_EXTENSION_DIR = _APP_DIR / "extension"
 for _parent in _APP_DIR.parents:
@@ -106,6 +107,12 @@ def _refresh_catalog() -> None:
         count = catalog.refresh([MERGED_DIR, LEGACY_MERGED_DIR, FALLBACK_DIR], CATALOG_DB, CHECK_FILE,
                                 PLAYLIST_METADATA_DIR)
         app.logger.info("Media catalog indexed %d videos", count)
+        try:
+            seeded = catalog.seed_settings_from_file(CATALOG_DB, SETTINGS_FILE)
+            if seeded:
+                app.logger.info("Restored %d settings from %s", seeded, SETTINGS_FILE)
+        except Exception:
+            app.logger.exception("Settings restore failed")
     except Exception:
         app.logger.exception("Media catalog refresh failed")
 
@@ -1836,13 +1843,57 @@ def api_media_catalog():
     return jsonify(items=items, page=page, per_page=per_page, total=total, pages=(total + per_page - 1) // per_page)
 
 
+def _catalog_library_or_scan() -> list[dict]:
+    """Return slim cards from the catalog, falling back to a live scan.
+
+    The catalog is rebuildable from disk via ``catalog.refresh``; the scan
+    fallback covers the first-startup window before the background refresh
+    finishes and any catalog read error.
+    """
+    try:
+        items, _total = catalog.library_cards(CATALOG_DB)
+        if items:
+            return items
+    except (sqlite3.Error, OSError, ValueError):
+        pass
+    return [_slim_video(video) for video in _scan_library_cached()]
+
+
 @app.get("/api/media/library")
 def api_media_library():
-    return jsonify(videos=[_slim_video(video) for video in _scan_library_cached()])
+    try:
+        page_arg = request.args.get("page")
+        if page_arg is None:
+            items, total = catalog.library_cards(
+                CATALOG_DB, sort=request.args.get("sort", "date-desc"))
+            if items:
+                return jsonify(videos=items, total=total)
+    except (sqlite3.Error, OSError, ValueError):
+        pass
+    try:
+        page = max(1, int(request.args.get("page", 1)))
+        per_page = min(200, max(1, int(request.args.get("per_page", 50))))
+    except ValueError:
+        return jsonify(error="page and per_page must be integers"), 400
+    sort = request.args.get("sort", "date-desc")
+    if page_arg is not None:
+        try:
+            items, total = catalog.library_cards(CATALOG_DB, page=page, per_page=per_page, sort=sort)
+            return jsonify(videos=items, page=page, per_page=per_page, total=total,
+                           pages=(total + per_page - 1) // per_page)
+        except (sqlite3.Error, OSError, ValueError):
+            pass
+    return jsonify(videos=_catalog_library_or_scan())
 
 
 @app.get("/api/media/library/files")
 def api_media_library_files():
+    try:
+        files = catalog.library_files(CATALOG_DB)
+        if files:
+            return jsonify(files=files, count=len(files))
+    except (sqlite3.Error, OSError, ValueError):
+        pass
     files = []
     for video in _scan_library_cached():
         for item in video.get("details", {}).get("files", []):
@@ -1852,6 +1903,15 @@ def api_media_library_files():
 
 @app.get("/api/media/library/files.txt")
 def api_media_library_files_text():
+    try:
+        files = catalog.library_files(CATALOG_DB)
+        if files:
+            lines = [f"{item['video_id']}\t{item['title']}\t{item['name']}\t{request.host_url.rstrip('/')}{item['url']}"
+                     for item in files if item.get("url")]
+            return Response("\n".join(lines) + ("\n" if lines else ""), mimetype="text/plain",
+                            headers={"Content-Disposition": "attachment; filename=dihi-library-files.txt"})
+    except (sqlite3.Error, OSError, ValueError):
+        pass
     lines = []
     for video in _scan_library_cached():
         for item in video.get("details", {}).get("files", []):
@@ -1861,6 +1921,12 @@ def api_media_library_files_text():
 
 
 def _library_youtube_exports() -> tuple[list[str], list[str]]:
+    try:
+        links, ids = catalog.library_exports(CATALOG_DB)
+        if links or ids:
+            return links, ids
+    except (sqlite3.Error, OSError, ValueError):
+        pass
     videos, playlists, video_ids, playlist_ids = [], [], [], []
     seen_videos, seen_playlists = set(), set()
     for video in _scan_library_cached():
@@ -1911,11 +1977,11 @@ def api_media_playlist(playlist_id: str):
     playlist = next((item for item in playlist_rows if item["playlist_id"] == playlist_id), None)
     if not playlist:
         return jsonify(error="playlist not found"), 404
-    videos_by_id = {item["video_id"]: item for item in _scan_library_cached()}
+    videos_by_id = {item["video_id"]: item for item in _catalog_library_or_scan()}
     members = []
     for member in catalog.playlist_video_ids(CATALOG_DB, playlist_id):
         video = videos_by_id.get(member["video_id"])
-        members.append({**member, "video": _slim_video(video) if video else None})
+        members.append({**member, "video": video})
     return jsonify(playlist=playlist, videos=members)
 
 
@@ -1951,7 +2017,7 @@ def api_media_playlist_m3u(playlist_id: str):
     if mode not in {"video", "audio"}:
         return jsonify(error="mode must be video or audio"), 400
     members = catalog.playlist_video_ids(CATALOG_DB, playlist_id)
-    videos_by_id = {item["video_id"]: item for item in _scan_library_cached()}
+    videos_by_id = {item["video_id"]: item for item in _catalog_library_or_scan()}
     lines = ["#EXTM3U"]
     for member in members:
         video = videos_by_id.get(member["video_id"]) or {}
@@ -1969,6 +2035,12 @@ def api_media_playlist_m3u(playlist_id: str):
 
 @app.get("/api/media/tags")
 def api_media_tags():
+    try:
+        grouped = catalog.library_tags(CATALOG_DB)
+        if grouped.get("tags"):
+            return jsonify(grouped)
+    except (sqlite3.Error, OSError, ValueError):
+        pass
     return jsonify(_scan_tags())
 
 
@@ -2075,6 +2147,10 @@ def api_queue_cancel_all():
 
 @app.route("/api/settings", methods=["GET", "POST"])
 def api_settings():
+    try:
+        catalog.seed_settings_from_file(CATALOG_DB, SETTINGS_FILE)
+    except (OSError, sqlite3.Error, ValueError):
+        pass
     if request.method == "POST":
         payload = request.get_json(silent=True) or {}
         mode = str(payload.get("default_download_mode") or "").strip().lower()
@@ -2090,6 +2166,10 @@ def api_settings():
                 if not 1 <= value <= maximum:
                     return jsonify(ok=False, error=f"{key} must be between 1 and {maximum}"), 400
                 catalog.set_setting(CATALOG_DB, key, str(value))
+        try:
+            catalog.backup_settings_to_file(CATALOG_DB, SETTINGS_FILE)
+        except (OSError, sqlite3.Error, ValueError):
+            app.logger.exception("Settings backup failed")
     return jsonify(default_download_mode=catalog.setting(CATALOG_DB, "default_download_mode", "immediate"),
                    max_concurrent_downloads=_queue_limit("video"),
                    max_concurrent_playlists=_queue_limit("playlist"))

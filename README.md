@@ -87,11 +87,11 @@ Compose starts the PO Token provider with the app and publishes its service port
 | `POST` | `/api/youtube/playlist/get/<playlist_id>` | 5/min | Trigger a full playlist download |
 | `POST` | `/api/youtube/playlist/prepare/<playlist_id>` | 5/min | Save playlist name and members without downloading |
 | `GET` | `/api/youtube/playlist/status/<playlist_id>` | 60/min | Poll playlist download progress |
-| `GET` | `/api/media/library` | 30/min | List archived media cards for the web UI |
-| `GET` | `/api/media/library/files` | — | List every local library file and link |
-| `GET` | `/api/media/library/files.txt` | — | Export every local library file link as text |
-| `GET` | `/api/media/library/youtube.txt` | — | Export all video and playlist YouTube links |
-| `GET` | `/api/media/library/ids.txt` | — | Export all video and playlist IDs |
+| `GET` | `/api/media/library` | 30/min | List archived media cards from the catalog (`?page=&per_page=&sort=`; default returns all cards with `total`) |
+| `GET` | `/api/media/library/files` | — | List every catalog-indexed library file and link |
+| `GET` | `/api/media/library/files.txt` | — | Export every catalog-indexed library file link as text |
+| `GET` | `/api/media/library/youtube.txt` | — | Export all catalog video and playlist YouTube links |
+| `GET` | `/api/media/library/ids.txt` | — | Export all catalog video and playlist IDs |
 | `GET` | `/playlists` | — | Browse downloaded playlists, play all locally, or load a playlist in VLC |
 | `GET` | `/library-export` | — | Browse and export links for all indexed library files |
 | `GET` | `/api/media/resolve/<id>` | 60/min | Resolve one archived YouTube ID to its media record and preferred playback URL |
@@ -118,7 +118,7 @@ Compose starts the PO Token provider with the app and publishes its service port
 | `POST` | `/api/queue/<item_id>/cancel` | — | Cancel a pending queue item |
 | `POST` | `/api/queue/start-all` | — | Start all paused queue items |
 | `POST` | `/api/queue/cancel-all` | — | Cancel all pending and paused queue items |
-| `GET/POST` | `/api/settings` | — | Read or set default add mode and concurrent video/playlist limits |
+| `GET/POST` | `/api/settings` | — | Read or set default add mode and concurrent video/playlist limits (backed up to `data/settings.json`) |
 | `GET` | `/api/media/failures` | — | List failed download attempts with reasons and retryability |
 | `GET` | `/api/media/download-history` | — | List persistent completed and failed download attempts |
 | `GET` | `/api/media/playlists` | — | List downloaded playlists and member counts |

@@ -98,11 +98,11 @@ Core UI/media routes:
 - `GET /sitemap` renders the site map
 - `GET /cleanup` renders the dry-run cleanup report
 - `GET /status` renders disk and cookie diagnostics
-- `GET /api/media/library` lists library cards
-- `GET /api/media/library/files` lists every indexed library file with a link
-- `GET /api/media/library/files.txt` exports every indexed library file link as text
-- `GET /api/media/library/youtube.txt` exports all video and playlist YouTube links
-- `GET /api/media/library/ids.txt` exports all video and playlist IDs
+- `GET /api/media/library` lists library cards from the SQLite catalog (supports `?page=&per_page=&sort=`; default returns all cards with `total`)
+- `GET /api/media/library/files` lists every indexed library file with a link from the catalog
+- `GET /api/media/library/files.txt` exports every indexed library file link as text from the catalog
+- `GET /api/media/library/youtube.txt` exports all video and playlist YouTube links from the catalog
+- `GET /api/media/library/ids.txt` exports all video and playlist IDs from the catalog
 - `GET /api/media/details/<channel_id>/<video_id>` returns per-video files and metadata
 - `GET /api/media/resolve/<video_id>` returns the archived media record and preferred playable URL for one YouTube ID
 - `GET /api/media/tags` returns tag counts and tag-grouped videos
@@ -146,10 +146,18 @@ Core UI/media routes:
 
 The rebuildable SQLite catalog scans `data/media-strict/`,
 `data/media-legacy/`, and `data/media-fallback/`, retaining source-root and per-file format/subtitle
-details. It also stores playlist names and video memberships from each `.info.json`; a video can belong to multiple playlists. Download failures are classified and persisted as retry information. The catalog endpoint initializes its schema before reading so the UI can continue serving while the background filesystem scan is running. Playlist preflight waits for that startup scan's SQLite write lock when persisting playlist membership.
+details. It also stores playlist names and video memberships from each `.info.json`; a video can belong to multiple playlists. The library, files/exports, playlist-detail, and tags endpoints are served from this catalog (with a live-scan fallback during the first-startup window). Download failures are classified and persisted as retry information. The catalog endpoint initializes its schema before reading so the UI can continue serving while the background filesystem scan is running. Playlist preflight waits for that startup scan's SQLite write lock when persisting playlist membership.
+Rebuildability: videos, tags, files, formats, archive status, and playlists
+(including `data/playlists/*.info.json` descriptors) are fully rebuilt by
+deleting `data/media-catalog.db` and rescanning. `app_settings` also survives
+via `data/settings.json` (single-object JSON, `DIHI_SETTINGS_FILE` override):
+missing keys are seeded from the file after a rescan, every settings write
+backs up to it, and the DB wins on conflict. Not rebuildable and DB-authoritative:
+`download_queue` (pending/scheduled targets) and `download_attempts` history
+(reasons/errors/timestamps).
 The planned indexed artist/album pages and safe rollback are documented in
 [`plan.media-catalog.md`](plan.media-catalog.md). It is not required by the
-current filesystem-backed library; it remains a rebuildable runtime index while
+current catalog-backed library; it remains a rebuildable runtime index while
 media and `.info.json` files stay authoritative.
 
 Archive/download API routes:
@@ -254,12 +262,12 @@ Run:
 venv/bin/pytest
 ```
 
-The current suite is pure unit tests: no network, no real yt-dlp download, no ffmpeg integration, and no browser automation. `make test-docker` additionally runs opt-in smoke tests against the live Compose HTTP service; its library-endpoint budget is generous because `/api/media/library` is an unpaginated full-filesystem scan (see Roadmap).
+The current suite is pure unit tests: no network, no real yt-dlp download, no ffmpeg integration, and no browser automation. `make test-docker` additionally runs opt-in smoke tests against the live Compose HTTP service.
 
 ## Roadmap / TODO
 
 - Keep the browser extension mirrored with the active site flows and API endpoints. When queue, playlist, playback, settings, or response-shape behavior changes, update the extension code, extension README, and extension version together, then test the extension against the documented endpoints.
-- Serve `/api/media/library` (and its `/files`, `*.txt`, playlist-detail, and resolve callers) from the SQLite catalog, paginate it, or otherwise stop the per-request full media-tree rescan that inlines descriptions and `info.json` per video. Check the web UI and extension against any response-shape change in the same update.
+- Serve the remaining scan-backed callers (`/api/media/tags` fallback already catalog-first; `/api/media/resolve` still uses a cheap single-video scan) from the SQLite catalog if they show up in profiling, and add server-side search/sort to `/api/media/library` so the web UI can stop client-side filtering on huge archives.
 
 ## Coding Caveats
 

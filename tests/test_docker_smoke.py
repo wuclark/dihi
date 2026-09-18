@@ -21,9 +21,8 @@ BASE = os.environ.get("DIHI_TEST_URL", "http://localhost:5000").rstrip("/")
 
 
 def get(path: str, timeout: float = 60):
-    # /api/media/library is an unpaginated full-filesystem scan that inlines
-    # descriptions and info.json per video (~75MB / ~11s at 147 videos), so the
-    # budget here must comfortably exceed fast-endpoint timing.
+    # /api/media/library is catalog-backed (slim cards, no per-video
+    # description/info.json inline), so it stays within fast-endpoint timing.
     with urllib.request.urlopen(BASE + path, timeout=timeout) as response:
         return response.status, response.headers, response.read()
 
