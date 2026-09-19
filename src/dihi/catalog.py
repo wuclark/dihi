@@ -855,3 +855,48 @@ def download_attempts(database: Path, limit: int = 500) -> list[dict[str, Any]]:
     )
     attempts.sort(key=lambda item: (item["finished_at"] or item["started_at"], str(item["attempt_id"])), reverse=True)
     return attempts[: max(1, min(int(limit), 2000))]
+
+
+def resolve_video_by_id(database: Path, video_id: str) -> dict[str, Any] | None:
+    """Return one strict-only video record for ``video_id`` from the catalog."""
+    video_id = str(video_id or "").strip()
+    if not video_id:
+        return None
+    try:
+        with sqlite3.connect(database) as db:
+            db.executescript(SCHEMA)
+            row = db.execute(
+                """SELECT video_id, source_root, channel_id, title, upload_date,
+                          files_json, metadata_json
+                     FROM videos
+                    WHERE video_id = ? AND source_root IN ('merged', 'legacy')
+                    ORDER BY CASE source_root WHEN 'merged' THEN 0 ELSE 1 END
+                    LIMIT 1""",
+                (video_id,),
+            ).fetchone()
+    except (sqlite3.Error, OSError, ValueError):
+        return None
+    if not row:
+        return None
+    video_id, source_root, channel_id, title, upload_date, files_json, metadata_json = row
+    try:
+        files = json.loads(files_json or "{}")
+    except ValueError:
+        files = {}
+    if not isinstance(files, dict):
+        files = {}
+    try:
+        metadata = json.loads(metadata_json or "{}")
+    except ValueError:
+        metadata = {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+    return {
+        "video_id": video_id,
+        "source_root": source_root,
+        "channel_id": channel_id,
+        "title": title or video_id,
+        "date": upload_date,
+        "files": files,
+        "metadata": metadata,
+    }

@@ -211,3 +211,25 @@ def test_details_has_full_info_json(client, env):
     assert r.status_code == 200
     info = r.get_json()["metadata"]["info_json"]
     assert info["title"] == "Title"
+
+
+def test_resolve_uses_catalog_first_then_falls_back(client, env):
+    video_dir = _video(env["merged"])
+    info_path = next(video_dir.glob("*.info.json"))
+    info = json.loads(info_path.read_text())
+    info["description"] = "from-info-json"
+    info_path.write_text(json.dumps(info))
+    (video_dir / f"UCchannel01.dQw4w9WgXcQ.20240101.Title [dQw4w9WgXcQ].out.description").unlink()
+
+    assert catalog.refresh(
+        [env["merged"], env["legacy"], env["fallback"]], app3.CATALOG_DB) == 1
+
+    body = client.get("/api/media/resolve/dQw4w9WgXcQ").get_json()
+    assert body["result"] is True
+    assert body["video"]["details"]["metadata"]["description"] == "from-info-json"
+    assert body["video"]["player_url"].endswith(".out.mkv")
+
+    for child in video_dir.iterdir():
+        child.unlink()
+    video_dir.rmdir()
+    assert client.get("/api/media/resolve/dQw4w9WgXcQ").status_code == 404

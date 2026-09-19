@@ -1019,6 +1019,64 @@ def _scan_single_video(video_id: str) -> Optional[dict]:
 
 
 def _resolve_media_by_video_id(video_id: str) -> Optional[dict]:
+    # Catalog-first: single indexed lookup, no channel-directory walk. Falls
+    # back to the filesystem scan during the first-startup window or when the
+    # indexed row is stale/missing.
+    try:
+        record = catalog.resolve_video_by_id(CATALOG_DB, video_id)
+    except Exception:
+        record = None
+    if record:
+        channel_id = str(record.get("channel_id") or "")
+        source_root = str(record.get("source_root") or "")
+        roots = [(MERGED_DIR, "merged", "/media"), (LEGACY_MERGED_DIR, "legacy", "/media-legacy")]
+        roots.sort(key=lambda item: 0 if item[1] == source_root else 1)
+        for root, name, _prefix in roots:
+            try:
+                live_dir = root / channel_id / video_id
+                is_dir = live_dir.is_dir()
+            except (OSError, ValueError):
+                continue
+            if not is_dir or _is_playlist_dir(live_dir):
+                continue
+            try:
+                if name == source_root:
+                    files_full = record.get("files") or {}
+                else:
+                    files_full = catalog._files(live_dir, channel_id, video_id, name)
+                    source_root = name
+            except (OSError, ValueError):
+                continue
+            files = catalog._slim_files(files_full if isinstance(files_full, dict) else {})
+            player_url = files.get("video") or files.get("audio")
+            if not player_url:
+                break
+            detail_files = []
+            if isinstance(files_full, dict):
+                for entry_name in sorted(files_full):
+                    entry = files_full[entry_name]
+                    if not isinstance(entry, dict) or not entry.get("url"):
+                        continue
+                    detail_files.append({
+                        "name": entry.get("name") or entry_name,
+                        "url": entry.get("url"),
+                        "kind": _file_kind(Path(entry.get("name") or entry_name)),
+                        "size": entry.get("size", 0),
+                        "mtime": entry.get("mtime", 0),
+                    })
+            metadata = record.get("metadata") or {}
+            description = str(metadata.get("description") or "")
+            return {
+                "video_id": video_id,
+                "channel_id": channel_id,
+                "source_root": source_root,
+                "title": record.get("title") or video_id,
+                "date": record.get("date"),
+                "files": files,
+                "details": {"files": detail_files, "metadata": {"description": description}},
+                "player_url": player_url,
+                "player_kind": "video" if files.get("video") else "audio" if files.get("audio") else None,
+            }
     video = _scan_single_video(video_id)
     if video is None:
         return None

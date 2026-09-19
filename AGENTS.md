@@ -149,7 +149,7 @@ Core UI/media routes:
 
 The rebuildable SQLite catalog scans `data/media-strict/`,
 `data/media-legacy/`, and `data/media-fallback/`, retaining source-root and per-file format/subtitle
-details. It also stores playlist names and video memberships from each `.info.json`; a video can belong to multiple playlists. The library, files/exports, playlist-detail, and tags endpoints are served from this catalog (with a live-scan fallback during the first-startup window). Download failures are classified and persisted as retry information. The catalog endpoint initializes its schema before reading so the UI can continue serving while the background filesystem scan is running. Playlist preflight waits for that startup scan's SQLite write lock when persisting playlist membership.
+details. It also stores playlist names and video memberships from each `.info.json`; a video can belong to multiple playlists. The library, files/exports, playlist-detail, tags, and resolve endpoints are served from this catalog (with a live-scan fallback during the first-startup window). Download failures are classified and persisted as retry information. The catalog endpoint initializes its schema before reading so the UI can continue serving while the background filesystem scan is running. Playlist preflight waits for that startup scan's SQLite write lock when persisting playlist membership.
 Rebuildability: videos, tags, files, formats, archive status, and playlists
 (including `data/playlists/*.info.json` descriptors) are fully rebuilt by
 deleting `data/media-catalog.db` and rescanning. `app_settings` also survives
@@ -270,7 +270,7 @@ The current suite is pure unit tests: no network, no real yt-dlp download, no ff
 ## Roadmap / TODO
 
 - Keep the browser extension mirrored with the active site flows and API endpoints. When queue, playlist, playback, settings, or response-shape behavior changes, update the extension code, extension README, and extension version together, then test the extension against the documented endpoints.
-- Serve the remaining scan-backed callers (`/api/media/tags` fallback already catalog-first; `/api/media/resolve` still uses a cheap single-video scan) from the SQLite catalog if they show up in profiling, and switch the web UI from client-side filtering to `/api/media/library?q=` on huge archives.
+- Serve the remaining scan-backed callers (`/api/media/tags` fallback already catalog-first; per-video details still reads the live directory lazily) from the SQLite catalog if they show up in profiling, and switch the web UI from client-side filtering to `/api/media/library?q=` on huge archives.
 
 ## Coding Caveats
 

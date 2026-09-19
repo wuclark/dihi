@@ -11,6 +11,7 @@ from catalog import (
     record_attempt,
     record_playlist_membership,
     refresh,
+    resolve_video_by_id,
     set_setting,
     setting,
 )
@@ -84,6 +85,28 @@ def test_playlists_report_available_and_missing_members(tmp_path):
     assert summary["video_count"] == 2
     assert summary["available_count"] == 1
     assert summary["missing_count"] == 1
+
+
+def test_resolve_video_by_id_prefers_strict_and_ignores_fallback(tmp_path):
+    strict = tmp_path / "media-strict"
+    legacy = tmp_path / "media-legacy"
+    fallback = tmp_path / "media-fallback"
+    _make_video(strict, "channel", "aaaaaaaaaaa", "Strict",
+                {"description": "strict-desc"})
+    _make_video(legacy, "channel", "aaaaaaaaaaa", "Legacy")
+    _make_video(fallback, "channel", "bbbbbbbbbbb", "Fallback")
+    db = tmp_path / "catalog.db"
+    assert refresh([strict, legacy, fallback], db) == 3
+
+    record = resolve_video_by_id(db, "aaaaaaaaaaa")
+    assert record is not None
+    assert record["source_root"] == "merged"
+    assert record["channel_id"] == "channel"
+    assert record["metadata"]["description"] == "strict-desc"
+
+    assert resolve_video_by_id(db, "bbbbbbbbbbb") is None
+    assert resolve_video_by_id(db, "ccccccccccc") is None
+    assert resolve_video_by_id(db, "") is None
 
 
 def _make_video(root, channel, video_id, title="Title", extra_info=None):
