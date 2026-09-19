@@ -542,21 +542,60 @@ def _ensure_queue_columns(db: sqlite3.Connection) -> None:
 
 
 def playlists(database: Path) -> list[dict[str, Any]]:
-    """Return known playlists and their indexed video counts."""
+    """Return playlists with total and locally playable member counts."""
     with sqlite3.connect(database) as db:
         db.executescript(SCHEMA)
         _ensure_queue_columns(db)
         rows = db.execute(
             """SELECT p.playlist_id, p.title, p.webpage_url,
-                      COUNT(pv.video_id), p.updated_at
+                      COUNT(pv.video_id), p.updated_at,
+                      GROUP_CONCAT(pv.video_id)
                  FROM playlists p LEFT JOIN playlist_videos pv
                    ON pv.playlist_id = p.playlist_id
                 GROUP BY p.playlist_id ORDER BY lower(p.title), p.playlist_id"""
         ).fetchall()
-    return [
-        {"playlist_id": r[0], "title": r[1], "webpage_url": r[2], "video_count": r[3], "updated_at": r[4]}
-        for r in rows
-    ]
+        video_rows = db.execute(
+            """SELECT video_id, source_root, files_json FROM videos
+               ORDER BY CASE source_root WHEN 'merged' THEN 0
+                                        WHEN 'legacy' THEN 1 ELSE 2 END"""
+        ).fetchall()
+    playable_by_id: dict[str, bool] = {}
+    for video_id, _source_root, files_json in video_rows:
+        if video_id in playable_by_id:
+            continue
+        try:
+            files = json.loads(files_json or "{}")
+        except (TypeError, ValueError):
+            files = {}
+        playable_by_id[video_id] = bool(
+            isinstance(files, dict)
+            and any(isinstance(item, dict) and item.get("kind") == "video" for item in files.values())
+            and any(isinstance(item, dict) and item.get("kind") == "audio" for item in files.values())
+        )
+    result = []
+    for playlist_id, title, webpage_url, video_count, updated_at, member_ids in rows:
+        members = [item for item in (member_ids or "").split(",") if item]
+        available_count = sum(1 for video_id in members if playable_by_id.get(video_id, False))
+        result.append({
+            "playlist_id": playlist_id, "title": title, "webpage_url": webpage_url,
+            "video_count": video_count, "available_count": available_count,
+            "missing_count": max(0, video_count - available_count), "updated_at": updated_at,
+        })
+    result.sort(key=lambda item: (-item["missing_count"], str(item["title"] or "").lower(), item["playlist_id"]))
+    return result
+
+
+def delete_playlist(database: Path, playlist_id: str) -> bool:
+    """Delete one playlist descriptor and its membership rows, not media files."""
+    with sqlite3.connect(database) as db:
+        db.executescript(SCHEMA)
+        exists = db.execute("SELECT 1 FROM playlists WHERE playlist_id = ?", (playlist_id,)).fetchone()
+        if not exists:
+            return False
+        db.execute("DELETE FROM playlist_videos WHERE playlist_id = ?", (playlist_id,))
+        db.execute("DELETE FROM playlists WHERE playlist_id = ?", (playlist_id,))
+        db.commit()
+    return True
 
 
 def playlist_video_ids(database: Path, playlist_id: str) -> list[dict[str, Any]]:

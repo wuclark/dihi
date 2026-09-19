@@ -5,9 +5,11 @@ from catalog import (
     library_exports,
     library_files,
     library_tags,
+    playlists,
     queue_add,
     queue_items,
     record_attempt,
+    record_playlist_membership,
     refresh,
     set_setting,
     setting,
@@ -63,6 +65,25 @@ def test_refresh_restores_playlist_from_descriptor(tmp_path):
         member = conn.execute("SELECT video_id, playlist_index FROM playlist_videos").fetchone()
     assert playlist == ("PLexample", "Saved playlist")
     assert member == ("dQw4w9WgXcQ", 1)
+
+
+def test_playlists_report_available_and_missing_members(tmp_path):
+    root = tmp_path / "media-strict"
+    _make_video(root, "channel", "aaaaaaaaaaa", "Available")
+    missing = root / "channel" / "bbbbbbbbbbb"
+    missing.mkdir(parents=True)
+    (missing / "missing.out.info.json").write_text(json.dumps({"title": "Missing"}), encoding="utf-8")
+    db = tmp_path / "catalog.db"
+    assert refresh(root, db) == 2
+    record_playlist_membership(db, "PLexample", "Example", None, [
+        {"video_id": "aaaaaaaaaaa", "playlist_index": 1, "title": "Available"},
+        {"video_id": "bbbbbbbbbbb", "playlist_index": 2, "title": "Missing"},
+    ])
+
+    summary = playlists(db)[0]
+    assert summary["video_count"] == 2
+    assert summary["available_count"] == 1
+    assert summary["missing_count"] == 1
 
 
 def _make_video(root, channel, video_id, title="Title", extra_info=None):

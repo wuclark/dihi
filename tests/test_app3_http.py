@@ -24,6 +24,7 @@ def env(monkeypatch, tmp_path):
     monkeypatch.setattr(app3, "MERGED_DIR", merged.resolve())
     monkeypatch.setattr(app3, "LEGACY_MERGED_DIR", legacy.resolve())
     monkeypatch.setattr(app3, "FALLBACK_DIR", fallback.resolve())
+    monkeypatch.setattr(app3, "PLAYLIST_METADATA_DIR", (tmp_path / "playlists").resolve())
     monkeypatch.setattr(app3, "CATALOG_DB", (tmp_path / "catalog.db").resolve())
     monkeypatch.setattr(app3, "_LIBRARY_CACHE", {"fingerprint": None, "videos": []})
     return {"merged": merged, "legacy": legacy, "fallback": fallback}
@@ -159,6 +160,48 @@ def test_playlist_members_are_slim(client, env):
     assert len(members) == 1
     assert "details" not in members[0]["video"]
     assert members[0]["video"]["files"]["video"].startswith("/media/")
+
+
+def test_playlist_snapshot_saves_members(client, env):
+    response = client.post("/api/media/playlists/snapshot", json={
+        "source_playlist_id": "RDw0hME8Zmbx8",
+        "title": "My Mix",
+        "webpage_url": "https://www.youtube.com/watch?v=w0hME8Zmbx8&list=RDw0hME8Zmbx8",
+        "members": [{"video_id": "dQw4w9WgXcQ", "title": "First", "playlist_index": 1}],
+    })
+    assert response.status_code == 200
+    body = response.get_json()
+    assert body["ok"] is True
+    assert body["members"] == 1
+    assert body["snapshot_id"].startswith("SNAP_RDw0hME8Zmbx8_")
+    detail = client.get(f"/api/media/playlists/{body['snapshot_id']}").get_json()
+    assert detail["playlist"]["title"].startswith("My Mix — snapshot")
+    assert detail["videos"][0]["video_id"] == "dQw4w9WgXcQ"
+    removed = client.delete(f"/api/media/playlists/{body['snapshot_id']}")
+    assert removed.status_code == 200
+    assert removed.get_json()["media_deleted"] is False
+    assert client.get(f"/api/media/playlists/{body['snapshot_id']}").status_code == 404
+
+
+def test_playlist_prepare_repairs_empty_descriptor_from_video_metadata(client, env):
+    video_dir = _video(env["merged"])
+    info_path = next(video_dir.glob("*.info.json"))
+    info = json.loads(info_path.read_text())
+    info.update({
+        "playlist_id": "PLEbx7vyLeh7QI8teTH66B_QIfu38iKBLE",
+        "playlist_title": "🌿 MV Inspo (art, mixed media)",
+        "playlist_index": 22,
+        "playlist_webpage_url": "https://www.youtube.com/playlist?list=PLEbx7vyLeh7QI8teTH66B_QIfu38iKBLE",
+    })
+    info_path.write_text(json.dumps(info))
+    descriptor = app3.PLAYLIST_METADATA_DIR / "PLEbx7vyLeh7QI8teTH66B_QIfu38iKBLE.info.json"
+    descriptor.parent.mkdir(parents=True, exist_ok=True)
+    descriptor.write_text(json.dumps({"_type": "playlist", "id": "PLEbx7vyLeh7QI8teTH66B_QIfu38iKBLE", "title": info["playlist_title"], "entries": []}))
+
+    response = client.post("/api/youtube/playlist/prepare/PLEbx7vyLeh7QI8teTH66B_QIfu38iKBLE")
+    assert response.status_code == 200
+    assert response.get_json()["repaired"] is True
+    assert response.get_json()["members"] == 1
 
 
 def test_details_has_full_info_json(client, env):
