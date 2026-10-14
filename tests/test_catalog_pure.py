@@ -205,6 +205,64 @@ def test_library_files_exports_tags_rebuild_from_disk(tmp_path):
     assert library_tags(db) == tags
 
 
+def test_library_cards_carry_artist_and_match_search(tmp_path):
+    root = tmp_path / "media-strict"
+    _make_video(root, "UCchan1", "aaaaaaaaaaa", "Alpha Song",
+                {"uploader": "Uploader One", "artist": "Real Artist", "track": "Alpha",
+                 "tags": ["music"]})
+    _make_video(root, "UCchan2", "bbbbbbbbbbb", "Beta Tune",
+                {"uploader": "Uploader Two"})
+    db = tmp_path / "catalog.db"
+    assert refresh(root, db) == 2
+
+    items, total = library_cards(db, sort="artist")
+    assert total == 2
+    first, second = items
+    assert (first["artist"], second["artist"]) == ("Real Artist", "Uploader Two")
+    assert first["track"] == "Alpha"
+    assert first["uploader"] == "Uploader One"
+    assert second["track"] == ""
+    # Music metadata wins over uploader for the artist field.
+    assert second["artist"] == "Uploader Two"
+
+    for needle, expected in (("real artist", ["aaaaaaaaaaa"]),
+                             ("uploader two", ["bbbbbbbbbbb"]),
+                             ("alpha", ["aaaaaaaaaaa"])):
+        found, found_total = library_cards(db, q=needle)
+        assert found_total == 1
+        assert [item["video_id"] for item in found] == expected
+
+    tags = library_tags(db)
+    assert tags["tags"] == [{"tag": "music", "count": 1}]
+    assert tags["videos_by_tag"]["music"][0]["artist"] == "Real Artist"
+    record = resolve_video_by_id(db, "aaaaaaaaaaa")
+    assert record is not None
+    assert record["artist"] == "Real Artist"
+    assert record["uploader"] == "Uploader One"
+    assert record["track"] == "Alpha"
+
+
+def test_refresh_migrates_database_without_track_column(tmp_path):
+    import sqlite3
+
+    root = tmp_path / "media-strict"
+    _make_video(root, "channel", "aaaaaaaaaaa", "Alpha", {"track": "Alpha Track"})
+    db = tmp_path / "catalog.db"
+    with sqlite3.connect(db) as conn:
+        conn.execute("""CREATE TABLE videos (
+          video_id TEXT, source_root TEXT, channel_id TEXT, title TEXT,
+          artist TEXT, album TEXT, uploader TEXT, upload_date TEXT, duration REAL,
+          metadata_json TEXT, files_json TEXT, scanned_at REAL, formats_json TEXT,
+          PRIMARY KEY(video_id, source_root))""")
+        conn.commit()
+    assert refresh(root, db) == 1
+
+    items, total = library_cards(db)
+    assert total == 1
+    assert items[0]["track"] == "Alpha Track"
+    assert items[0]["artist"] == "Artist"
+
+
 def test_settings_json_seed_and_backup_roundtrip(tmp_path):
     from catalog import (
         backup_settings_to_file,

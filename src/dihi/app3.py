@@ -894,6 +894,10 @@ def _scan_video_dir(channel_id: str, video_dir: Path, media_prefix: str, source_
         "source_root": source_root,
         "title": title or video_id,
         "date": date,
+        "artist": (info or {}).get("artist") or (info or {}).get("creator")
+                  or (info or {}).get("uploader") or (info or {}).get("channel") or channel_id,
+        "uploader": (info or {}).get("uploader") or (info or {}).get("channel") or channel_id,
+        "track": (info or {}).get("track") or "",
         "files": files,
         "details": {
             "files": detail_files,
@@ -1072,6 +1076,9 @@ def _resolve_media_by_video_id(video_id: str) -> Optional[dict]:
                 "source_root": source_root,
                 "title": record.get("title") or video_id,
                 "date": record.get("date"),
+                "artist": record.get("artist") or record.get("uploader") or channel_id,
+                "uploader": record.get("uploader") or channel_id,
+                "track": record.get("track") or "",
                 "files": files,
                 "details": {"files": detail_files, "metadata": {"description": description}},
                 "player_url": player_url,
@@ -1094,6 +1101,9 @@ def _resolve_media_by_video_id(video_id: str) -> Optional[dict]:
         "source_root": video.get("source_root"),
         "title": video.get("title"),
         "date": video.get("date"),
+        "artist": video.get("artist") or video.get("uploader") or video.get("channel_id"),
+        "uploader": video.get("uploader") or video.get("channel_id"),
+        "track": video.get("track") or "",
         "files": files,
         "details": {"files": detail_files, "metadata": {"description": description}},
         "player_url": player_url,
@@ -1115,6 +1125,9 @@ def _slim_video(video: dict) -> dict:
         "source_root": video.get("source_root"),
         "title": video.get("title"),
         "date": video.get("date"),
+        "artist": video.get("artist") or video.get("uploader") or video.get("channel_id"),
+        "uploader": video.get("uploader") or video.get("channel_id"),
+        "track": video.get("track") or "",
         "files": video.get("files") or {},
     }
 
@@ -1974,7 +1987,10 @@ def _catalog_library_or_scan(query: str | None = None) -> list[dict]:
         cards = [card for card in cards
                  if needle in str(card.get("title") or "").lower()
                  or needle in str(card.get("video_id") or "").lower()
-                 or needle in str(card.get("channel_id") or "").lower()]
+                 or needle in str(card.get("channel_id") or "").lower()
+                 or needle in str(card.get("artist") or "").lower()
+                 or needle in str(card.get("uploader") or "").lower()
+                 or needle in str(card.get("track") or "").lower()]
     return cards
 
 
@@ -1996,7 +2012,7 @@ def api_media_library():
             items, total = catalog.library_cards(
                 CATALOG_DB, page=page, per_page=per_page, sort=sort, q=query)
         else:
-            items, total = catalog.library_cards(CATALOG_DB, sort=sort)
+            items, total = catalog.library_cards(CATALOG_DB, sort=sort, q=query)
         if total:
             if paginated:
                 return jsonify(videos=items, page=page, per_page=per_page, total=total,

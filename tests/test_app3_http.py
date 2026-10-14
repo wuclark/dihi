@@ -61,7 +61,8 @@ def test_library_returns_slim_cards(client, env):
     videos = r.get_json()["videos"]
     assert len(videos) == 1
     card = videos[0]
-    assert set(card) == {"video_id", "channel_id", "source_root", "title", "date", "files"}
+    assert set(card) == {"video_id", "channel_id", "source_root", "title", "date",
+                         "artist", "uploader", "track", "files"}
     assert card["source_root"] == "merged"
     assert card["files"]["video"].startswith("/media/")
 

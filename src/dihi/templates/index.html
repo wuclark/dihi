@@ -29,7 +29,7 @@ header {
   padding: 12px 24px; display: flex; align-items: center; gap: 12px;
   flex-wrap: wrap;
 }
-.logo { font-size: 1.3rem; font-weight: 700; color: var(--accent); flex-shrink: 0; }
+.logo { font-size: 1.3rem; font-weight: 700; color: var(--accent); flex-shrink: 0; text-decoration: none; }
 #search {
   flex: 1; min-width: 160px; max-width: 460px;
   background: var(--bg); border: 1px solid var(--border); color: var(--text);
@@ -87,6 +87,7 @@ select {
   transition: opacity .15s;
 }
 .btn:hover { opacity: .75; }
+.btn:disabled { opacity: .35; cursor: default; }
 .btn-primary { background: var(--accent); color: #000; }
 .btn-ghost { background: var(--surface2); color: var(--text); border: 1px solid var(--border); }
 .btn-close { background: transparent; color: var(--muted); border: 1px solid var(--border); margin-left: auto; }
@@ -272,10 +273,13 @@ select {
 <body>
 
 <header>
-  <span class="logo">DIHI</span>
+  <a class="logo" href="/">DIHI</a>
   <input id="search" type="search" placeholder="Search videos…" autocomplete="off" aria-label="Search">
   <div class="hcontrols">
-    <button class="hbtn" id="play-all-btn" type="button" onclick="playAll()">▶ Play All</button>
+    <button class="hbtn" id="play-all-btn" type="button" onclick="playAll(true)">▶ Play All</button>
+    <a class="hbtn" href="/playlists">Playlists</a>
+    <a class="hbtn" href="/queue">Queue</a>
+    <a class="hbtn" href="/tags">Tags</a>
     <a class="hbtn" href="/downloads">Downloads</a>
     <a class="hbtn" href="/catalog">Catalog</a>
     <a class="hbtn" href="/tools">Tools</a>
@@ -284,6 +288,7 @@ select {
       <option value="date-asc">Oldest first</option>
       <option value="title-asc">Title A–Z</option>
       <option value="title-desc">Title Z–A</option>
+      <option value="artist-asc">Artist A–Z</option>
       <option value="channel">By channel</option>
     </select>
     <span id="count"></span>
@@ -305,6 +310,7 @@ select {
       <video id="vpanel" controls preload="metadata" playsinline></video>
       <audio id="apanel" controls preload="metadata" hidden></audio>
       <div id="playback-msg" role="status" aria-live="polite"></div>
+      <button id="sound-btn" class="btn btn-primary" type="button" hidden onclick="playActiveMedia(true)">🔊 Tap for sound</button>
       <details id="video-description" class="video-description" hidden>
         <summary>Description</summary>
         <div id="video-description-text"></div>
@@ -314,6 +320,9 @@ select {
       <div id="p-title"></div>
       <div class="p-meta" id="p-meta"></div>
       <div class="p-actions">
+        <button class="btn btn-ghost" id="btn-prev" onclick="playPrev(true)">⏮ Prev</button>
+        <button class="btn btn-ghost" id="btn-next" onclick="playNext(true)">⏭ Next</button>
+        <span class="p-meta" id="play-pos"></span>
         <button class="btn btn-primary" id="btn-video" onclick="setMode('video')">▶ Video</button>
         <button class="btn btn-ghost"   id="btn-audio" onclick="setMode('audio')">♫ Audio only</button>
         <button class="btn btn-close"   onclick="closePlayer()">✕</button>
@@ -358,7 +367,7 @@ const $ = id => document.getElementById(id);
 // Playlist mode keeps client-side filtering (playlist endpoint has no q).
 const SERVER_SORT_PARAM = {
   'date-desc': 'date-desc', 'date-asc': 'date-asc', 'title-asc': 'title',
-  'title-desc': 'title-desc', 'channel': 'channel',
+  'title-desc': 'title-desc', 'artist-asc': 'artist', 'channel': 'channel',
 };
 let searchTimer = null;
 
@@ -417,7 +426,10 @@ function applyFilters() {
     list = list.filter(v =>
       v.title.toLowerCase().includes(q) ||
       v.channel_id.toLowerCase().includes(q) ||
-      v.video_id.toLowerCase().includes(q)
+      v.video_id.toLowerCase().includes(q) ||
+      (v.artist || '').toLowerCase().includes(q) ||
+      (v.uploader || '').toLowerCase().includes(q) ||
+      (v.track || '').toLowerCase().includes(q)
     );
   }
 
@@ -427,6 +439,9 @@ function applyFilters() {
       case 'date-asc':  return (a.date || '').localeCompare(b.date || '');
       case 'title-asc': return a.title.localeCompare(b.title);
       case 'title-desc':return b.title.localeCompare(a.title);
+      case 'artist-asc':
+        return artistName(a).localeCompare(artistName(b)) ||
+               a.title.localeCompare(b.title);
       case 'channel':
         return a.channel_id.localeCompare(b.channel_id) ||
                (b.date || '').localeCompare(a.date || '');
@@ -471,12 +486,12 @@ function renderGrid() {
       ? `<span class="badge bt">${esc(v.source_root === 'bestfallback' ? 'FALLBACK' : v.source_root.toUpperCase())}</span>` : '';
 
     return `<div class="card${active}" data-id="${esc(v.video_id)}" role="button" tabindex="0"
-              onclick="openVideo('${esc(v.video_id)}')"
+              onclick="openVideo('${esc(v.video_id)}', true)"
               aria-label="${esc(v.title)}">
       <div class="card-thumb">${thumb}<div class="badges">${bv}${ba}${bt}</div></div>
       <div class="card-body">
         <div class="card-title">${esc(v.title)}</div>
-        <div class="card-meta">${fmtDate(v.date)} · ${esc(v.channel_id)}</div>
+        <div class="card-meta">${esc(artistLabel(v))} · ${fmtDate(v.date)}</div>
       </div>
     </div>`;
   }).join('') + (S.renderLimit < S.filtered.length
@@ -487,13 +502,13 @@ function renderGrid() {
   // after every filter, sort, and incremental render update.
   grid.onclick = e => {
     const card = e.target.closest('.card');
-    if (card && grid.contains(card)) openVideo(card.dataset.id);
+    if (card && grid.contains(card)) openVideo(card.dataset.id, true);
   };
   grid.onkeydown = e => {
     const card = e.target.closest('.card');
     if (card && (e.key === 'Enter' || e.key === ' ')) {
       e.preventDefault();
-      openVideo(card.dataset.id);
+      openVideo(card.dataset.id, true);
     }
   };
   $('load-more-btn')?.addEventListener('click', loadMoreVideos);
@@ -506,7 +521,7 @@ function loadMoreVideos() {
 
 // ── Player ─────────────────────────────────────────────────────────────────
 
-function openVideo(videoId) {
+function openVideo(videoId, userInitiated = false) {
   const v = S.videos.find(x => x.video_id === videoId);
   if (!v) return;
   S.current = v;
@@ -515,6 +530,12 @@ function openVideo(videoId) {
   $('playback-msg').textContent = '';
   renderPlayer();
   loadDetails(v);
+  // A card click is an explicit user gesture, so start playback immediately
+  // with sound. Direct links only autoplay when they include autoplay=1,
+  // and those start muted because browsers block audible autoplay.
+  if (userInitiated || new URLSearchParams(location.search).get('autoplay') === '1') {
+    playActiveMedia(userInitiated);
+  }
   // Set the display state directly as well as the class. This keeps the
   // player visible when the page is opened with ?play=... before the grid
   // finishes its first render.
@@ -542,18 +563,17 @@ function showPlayer() {
 
 function openInitialVideoFromUrl() {
   const params = new URLSearchParams(location.search);
-  const videoId = params.get('play') || params.get('v');
+  const videoId = params.get('play') || params.get('v') || params.get('video');
   if (!videoId || !VIDEO_ID_RE.test(videoId)) return;
   if (!S.videos.some(v => v.video_id === videoId)) return;
   openVideo(videoId);
-  if (params.get('autoplay') === '1') playActiveMedia();
 }
 
 function playableList() {
   return S.filtered.filter(v => v.files.video || v.files.audio);
 }
 
-function playAll() {
+function playAll(userInitiated = false) {
   const list = playableList();
   if (!list.length) return;
   S.playAll = true;
@@ -561,8 +581,7 @@ function playAll() {
   const start = S.current && list.some(v => v.video_id === S.current.video_id)
     ? S.current
     : list[0];
-  openVideo(start.video_id);
-  playActiveMedia();
+  openVideo(start.video_id, userInitiated);
 }
 
 function stopPlayAll() {
@@ -576,30 +595,82 @@ function updatePlayAllButton() {
   btn.classList.toggle('active', S.playAll);
   btn.textContent = S.playAll ? 'Playing All' : '▶ Play All';
   btn.disabled = !playableList().length;
+  updateNavButtons();
 }
 
-function playActiveMedia() {
+function playActiveMedia(withSound = false) {
   const p = activePlayer();
   if (!p || p.hidden || !p.src) return;
-  // Audible autoplay is blocked by browsers; start direct links muted.
-  p.muted = true;
   $('playback-msg').textContent = '';
-  p.play().catch(e => {
+  const soundBtn = $('sound-btn');
+  if (soundBtn) soundBtn.hidden = true;
+  if (withSound) {
+    // User-gesture playback: try with sound first. Browsers throw
+    // NotAllowedError when audible play is not allowed; fall back to
+    // muted playback in that case rather than staying silent.
+    p.muted = false;
+    p.play().then(() => {
+      if (soundBtn) soundBtn.hidden = true;
+    }).catch(e => {
+      if (e && e.name === 'NotAllowedError') {
+        p.muted = true;
+        $('playback-msg').textContent = 'Started muted (browser blocked sound).';
+        if (soundBtn) soundBtn.hidden = false;
+        p.play().catch(e2 => {
+          $('playback-msg').textContent = e2?.message || 'Playback could not start.';
+        });
+      } else {
+        $('playback-msg').textContent = e?.message || 'Playback could not start.';
+      }
+    });
+    return;
+  }
+  // Programmatic autoplay (direct link, playlist auto-advance): browsers
+  // only allow muted autoplay without a user gesture. The Tap-for-sound
+  // button gives sound back with a single gesture on this page.
+  p.muted = true;
+  p.play().then(() => {
+    if (soundBtn) soundBtn.hidden = false;
+  }).catch(e => {
     $('playback-msg').textContent = e?.message || 'Playback could not start.';
   });
 }
 
-function playNext() {
-  if (!S.playAll || !S.current) return;
+function playNext(manual = false) {
+  if (!S.current) return;
+  if (!manual && !S.playAll) return;
   const list = playableList();
   const idx = list.findIndex(v => v.video_id === S.current.video_id);
   const next = idx >= 0 ? list[idx + 1] : null;
   if (!next) {
-    stopPlayAll();
+    if (!manual) stopPlayAll();
     return;
   }
-  openVideo(next.video_id);
-  playActiveMedia();
+  openVideo(next.video_id, manual);
+  // Auto-advance (track ended) still tries with sound so a playlist
+  // started with sound keeps sound when the browser allows it.
+  if (!manual) playActiveMedia(true);
+}
+
+function playPrev(manual = false) {
+  if (!S.current) return;
+  const list = playableList();
+  const idx = list.findIndex(v => v.video_id === S.current.video_id);
+  const prev = idx > 0 ? list[idx - 1] : null;
+  if (!prev) return;
+  openVideo(prev.video_id, true);
+}
+
+function updateNavButtons() {
+  const prev = $('btn-prev');
+  const next = $('btn-next');
+  const pos = $('play-pos');
+  if (!prev || !next) return;
+  const list = playableList();
+  const idx = S.current ? list.findIndex(v => v.video_id === S.current.video_id) : -1;
+  prev.disabled = idx <= 0;
+  next.disabled = idx < 0 || idx >= list.length - 1;
+  if (pos) pos.textContent = idx >= 0 && list.length ? `${idx + 1}/${list.length}` : '';
 }
 
 function renderPlayer() {
@@ -608,6 +679,7 @@ function renderPlayer() {
 
   $('p-title').textContent = v.title;
   $('p-meta').innerHTML = [
+    `🎤 ${esc(artistLabel(v))}`,
     v.date   ? `📅 ${fmtDate(v.date)}` : '',
     `📁 ${esc(v.channel_id)}`,
     `🔗 ${esc(v.video_id)}`,
@@ -658,6 +730,7 @@ function renderPlayer() {
     $('vlc-hint').hidden = true;
   }
 
+  updateNavButtons();
   renderAssetDetails();
 }
 
@@ -678,6 +751,8 @@ function closePlayer() {
   updatePlayAllButton();
   $('asset-details').innerHTML = '';
   $('playback-msg').textContent = '';
+  const soundBtn = $('sound-btn');
+  if (soundBtn) soundBtn.hidden = true;
   document.querySelectorAll('.card.active').forEach(el => el.classList.remove('active'));
 }
 
@@ -733,7 +808,7 @@ function renderAssetDetails() {
       <summary>info.json</summary>
       <pre class="metadata-json">${infoJson}</pre>
     </details>
-    ${metadata.description ? `<details><summary>Description</summary><pre class="metadata-description">${esc(metadata.description)}</pre></details>` : ''}`;
+    ${metadata?.description ? `<details><summary>Description</summary><pre class="metadata-description">${esc(metadata.description)}</pre></details>` : ''}`;
 }
 
 function renderMetadataRows(metadata) {
@@ -777,6 +852,21 @@ function fmtDate(d) {
   return `${d.slice(0,4)}-${d.slice(4,6)}-${d.slice(6,8)}`;
 }
 
+// Display artist: true music metadata (artist/track) wins, otherwise the
+// uploader/channel name, which is the reliable artist proxy across the
+// whole archive. Titles are never auto-split on " - " (too noisy).
+function artistName(v) {
+  return v.artist || v.uploader || v.channel_id || '';
+}
+
+function artistLabel(v) {
+  const artist = artistName(v);
+  if (v.track && artist && v.track.toLowerCase() !== v.title.toLowerCase()) {
+    return `${artist} – ${v.track}`;
+  }
+  return artist;
+}
+
 function fmtBytes(n) {
   const size = Number(n);
   if (!Number.isFinite(size)) return '';
@@ -806,7 +896,7 @@ document.addEventListener('keydown', e => {
   if (e.key === 'Escape') { closePlayer(); return; }
   if (!S.current) return;
   const p = activePlayer();
-  if (e.key === ' ')           { e.preventDefault(); p.paused ? playActiveMedia() : p.pause(); }
+  if (e.key === ' ')           { e.preventDefault(); p.paused ? playActiveMedia(true) : p.pause(); }
   if (e.key === 'ArrowRight')  { e.preventDefault(); p.currentTime += 10; }
   if (e.key === 'ArrowLeft')   { e.preventDefault(); p.currentTime -= 10; }
   if (e.key === 'ArrowUp')     { e.preventDefault(); p.volume = Math.min(1, p.volume + 0.1); }
@@ -1028,7 +1118,7 @@ async function restoreDownloadQueue() {
 $('vpanel').addEventListener('click', e => {
   const vp = e.currentTarget;
   if (vp.hidden || !vp.src) return;
-  if (vp.paused) playActiveMedia();
+  if (vp.paused) playActiveMedia(true);
   else vp.pause();
 });
 

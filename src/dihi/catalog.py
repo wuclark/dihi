@@ -16,7 +16,7 @@ from urllib.parse import quote
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS videos (
   video_id TEXT NOT NULL, source_root TEXT NOT NULL, channel_id TEXT NOT NULL, title TEXT,
-  artist TEXT, album TEXT, uploader TEXT, upload_date TEXT, duration REAL,
+  artist TEXT, album TEXT, uploader TEXT, track TEXT, upload_date TEXT, duration REAL,
   metadata_json TEXT NOT NULL, files_json TEXT NOT NULL, scanned_at REAL NOT NULL,
   formats_json TEXT NOT NULL DEFAULT '[]',
   PRIMARY KEY(video_id, source_root)
@@ -156,6 +156,8 @@ def refresh(merged_dir: Path | list[Path], database: Path, archive: Path | None 
             db.executescript(SCHEMA)
         if "formats_json" not in {row[1] for row in db.execute("PRAGMA table_info(videos)")}:
             db.execute("ALTER TABLE videos ADD COLUMN formats_json TEXT NOT NULL DEFAULT '[]'")
+        if "track" not in {row[1] for row in db.execute("PRAGMA table_info(videos)")}:
+            db.execute("ALTER TABLE videos ADD COLUMN track TEXT")
         for root in roots:
           # ``merged/`` and legacy ``data/merged/`` share a basename.
           source_root = "legacy" if root.as_posix().rstrip("/").endswith("data/merged") else _SOURCE_ROOT_ALIASES.get(root.name, root.name)
@@ -173,20 +175,22 @@ def refresh(merged_dir: Path | list[Path], database: Path, archive: Path | None 
                 video_id = video_dir.name
                 seen_video_ids.add(video_id)
                 uploader = info.get("uploader") or info.get("channel") or channel_dir.name
-                artist = info.get("artist") or uploader
+                artist = info.get("artist") or info.get("creator") or uploader
+                track = info.get("track") or ""
                 album = info.get("album") or info.get("playlist_title") or "Uncategorized"
                 db.execute("""INSERT INTO videos
-                  (video_id, source_root, channel_id, title, artist, album, uploader, upload_date,
+                  (video_id, source_root, channel_id, title, artist, album, uploader, track, upload_date,
                   duration, metadata_json, files_json, scanned_at, formats_json)
-                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s','now'), ?)
+                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s','now'), ?)
                   ON CONFLICT(video_id, source_root) DO UPDATE SET
                    channel_id=excluded.channel_id, title=excluded.title,
                    artist=excluded.artist, album=excluded.album, uploader=excluded.uploader,
+                   track=excluded.track,
                    upload_date=excluded.upload_date, duration=excluded.duration,
                    metadata_json=excluded.metadata_json, files_json=excluded.files_json,
                    scanned_at=excluded.scanned_at, formats_json=excluded.formats_json""", (
                     video_id, source_root, channel_dir.name, info.get("title") or video_id,
-                    str(artist), str(album), str(uploader), info.get("upload_date"),
+                    str(artist), str(album), str(uploader), str(track), info.get("upload_date"),
                     info.get("duration"), json.dumps(info, ensure_ascii=False, default=str),
                     json.dumps(_files(video_dir, channel_dir.name, video_id, source_root), ensure_ascii=False),
                     json.dumps(_formats(video_dir), ensure_ascii=False, default=str),
@@ -341,17 +345,30 @@ def _like_escape(text: str) -> str:
     return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
+def _ensure_read_columns(db: sqlite3.Connection) -> None:
+    """Add columns that newer schema versions select, without a full rescan.
+
+    The background :func:`refresh` migrates and repopulates these on startup,
+    but read paths must not fail in the window before it runs.
+    """
+    columns = {row[1] for row in db.execute("PRAGMA table_info(videos)")}
+    if "track" not in columns:
+        db.execute("ALTER TABLE videos ADD COLUMN track TEXT")
+
+
 def _deduped_rows(db: sqlite3.Connection, order: str, limit: int | None = None,
                   offset: int = 0, q: str | None = None) -> tuple[list[tuple], int]:
     """Return deduped video rows (preferring merged > legacy > bestfallback)."""
+    _ensure_read_columns(db)
     needle = (q or "").strip().lower()
     where = ""
     params: list[Any] = []
     if needle:
         where = """ AND (lower(title) LIKE ? ESCAPE '\\' OR lower(video_id) LIKE ? ESCAPE '\\'
-                   OR lower(channel_id) LIKE ? ESCAPE '\\')"""
+                   OR lower(channel_id) LIKE ? ESCAPE '\\' OR lower(artist) LIKE ? ESCAPE '\\'
+                   OR lower(uploader) LIKE ? ESCAPE '\\' OR lower(track) LIKE ? ESCAPE '\\')"""
         pattern = f"%{_like_escape(needle)}%"
-        params = [pattern, pattern, pattern]
+        params = [pattern, pattern, pattern, pattern, pattern, pattern]
     total = db.execute(
         f"""SELECT COUNT(*) FROM
             (SELECT v.*, ROW_NUMBER() OVER (PARTITION BY video_id
@@ -359,10 +376,11 @@ def _deduped_rows(db: sqlite3.Connection, order: str, limit: int | None = None,
              FROM videos v) WHERE rn = 1{where}""",
         params,
     ).fetchone()[0]
-    query = """SELECT video_id, source_root, channel_id, title, upload_date, files_json, metadata_json
-                 FROM (SELECT v.*, ROW_NUMBER() OVER (PARTITION BY video_id
-                        ORDER BY CASE source_root WHEN 'merged' THEN 0 WHEN 'legacy' THEN 1 ELSE 2 END) AS rn
-                       FROM videos v) WHERE rn = 1"""
+    query = """SELECT video_id, source_root, channel_id, title, upload_date, artist,
+                        uploader, track, files_json, metadata_json
+                  FROM (SELECT v.*, ROW_NUMBER() OVER (PARTITION BY video_id
+                         ORDER BY CASE source_root WHEN 'merged' THEN 0 WHEN 'legacy' THEN 1 ELSE 2 END) AS rn
+                        FROM videos v) WHERE rn = 1"""
     query += where + f" ORDER BY {order}"
     if limit is not None:
         query += " LIMIT ? OFFSET ?"
@@ -380,7 +398,8 @@ def library_cards(database: Path, page: int | None = None, per_page: int = 200,
     ``*.info.json`` metadata, and the on-disk file listing), so the result is
     fully rebuildable by deleting the DB file and rescanning. ``scanned_at``
     timestamps are the only values that change across rebuilds. ``q`` matches
-    the same fields the web UI filters on (title, video ID, channel ID).
+    the same fields the web UI filters on (title, video ID, channel ID,
+    artist, uploader, and track).
     """
     order = _LIBRARY_SORTS.get(sort, _LIBRARY_SORTS["date-desc"])
     with sqlite3.connect(database) as db:
@@ -392,7 +411,7 @@ def library_cards(database: Path, page: int | None = None, per_page: int = 200,
             per_page = max(1, min(int(per_page), 2000))
             rows, total = _deduped_rows(db, order, per_page, (page - 1) * per_page, q=q)
     items = []
-    for video_id, source_root, channel_id, title, upload_date, files_json, _metadata_json in rows:
+    for video_id, source_root, channel_id, title, upload_date, artist, uploader, track, files_json, _metadata_json in rows:
         try:
             files = json.loads(files_json or "{}")
         except ValueError:
@@ -405,6 +424,9 @@ def library_cards(database: Path, page: int | None = None, per_page: int = 200,
             "source_root": source_root,
             "title": title or video_id,
             "date": upload_date,
+            "artist": artist or uploader or channel_id,
+            "uploader": uploader or channel_id,
+            "track": track or "",
             "files": _slim_files(files),
         })
     return items, total
@@ -421,7 +443,7 @@ def library_files(database: Path) -> list[dict[str, Any]]:
         db.executescript(SCHEMA)
         rows, _total = _deduped_rows(db, "video_id ASC")
     files: list[dict[str, Any]] = []
-    for video_id, _source_root, _channel_id, title, _date, files_json, _metadata in rows:
+    for video_id, _source_root, _channel_id, title, _date, _artist, _uploader, _track, files_json, _metadata in rows:
         try:
             entries = json.loads(files_json or "{}")
         except ValueError:
@@ -451,7 +473,7 @@ def library_exports(database: Path) -> tuple[list[str], list[str]]:
     with sqlite3.connect(database) as db:
         db.executescript(SCHEMA)
         rows, _total = _deduped_rows(db, "video_id ASC")
-        for video_id, _root, _channel, _title, _date, _files_json, metadata_json in rows:
+        for video_id, _root, _channel, _title, _date, _artist, _uploader, _track, _files_json, metadata_json in rows:
             video_id = str(video_id or "").strip()
             if not video_id or video_id in seen_videos:
                 continue
@@ -493,7 +515,7 @@ def library_tags(database: Path) -> dict[str, Any]:
         db.executescript(SCHEMA)
         video_rows, _total = _deduped_rows(db, "video_id ASC")
         cards = {}
-        for video_id, source_root, channel_id, title, upload_date, files_json, _meta in video_rows:
+        for video_id, source_root, channel_id, title, upload_date, artist, uploader, track, files_json, _meta in video_rows:
             try:
                 files = json.loads(files_json or "{}")
             except ValueError:
@@ -501,6 +523,9 @@ def library_tags(database: Path) -> dict[str, Any]:
             cards[video_id] = {
                 "video_id": video_id, "channel_id": channel_id, "source_root": source_root,
                 "title": title or video_id, "date": upload_date,
+                "artist": artist or uploader or channel_id,
+                "uploader": uploader or channel_id,
+                "track": track or "",
                 "files": _slim_files(files if isinstance(files, dict) else {}),
             }
         tag_rows = db.execute(
@@ -865,9 +890,10 @@ def resolve_video_by_id(database: Path, video_id: str) -> dict[str, Any] | None:
     try:
         with sqlite3.connect(database) as db:
             db.executescript(SCHEMA)
+            _ensure_read_columns(db)
             row = db.execute(
                 """SELECT video_id, source_root, channel_id, title, upload_date,
-                          files_json, metadata_json
+                          artist, uploader, track, files_json, metadata_json
                      FROM videos
                     WHERE video_id = ? AND source_root IN ('merged', 'legacy')
                     ORDER BY CASE source_root WHEN 'merged' THEN 0 ELSE 1 END
@@ -878,7 +904,7 @@ def resolve_video_by_id(database: Path, video_id: str) -> dict[str, Any] | None:
         return None
     if not row:
         return None
-    video_id, source_root, channel_id, title, upload_date, files_json, metadata_json = row
+    video_id, source_root, channel_id, title, upload_date, artist, uploader, track, files_json, metadata_json = row
     try:
         files = json.loads(files_json or "{}")
     except ValueError:
@@ -897,6 +923,9 @@ def resolve_video_by_id(database: Path, video_id: str) -> dict[str, Any] | None:
         "channel_id": channel_id,
         "title": title or video_id,
         "date": upload_date,
+        "artist": artist or uploader or channel_id,
+        "uploader": uploader or channel_id,
+        "track": track or "",
         "files": files,
         "metadata": metadata,
     }

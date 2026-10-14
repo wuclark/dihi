@@ -172,11 +172,11 @@ function renderVideos() {
     const ba = v.files?.audio ? '<span class="badge ba">M4A</span>' : '';
     const bt = v.source_root && v.source_root !== 'merged'
       ? `<span class="badge bt">${esc(v.source_root === 'bestfallback' ? 'FALLBACK' : v.source_root.toUpperCase())}</span>` : '';
-    return `<a class="card" href="/?video=${encodeURIComponent(v.video_id)}">
+    return `<a class="card" href="/?play=${encodeURIComponent(v.video_id)}&autoplay=1">
       <div class="card-thumb">${thumb}<div class="badges">${bv}${ba}${bt}</div></div>
       <div class="card-body">
         <div class="card-title">${esc(v.title)}</div>
-        <div class="card-meta">${fmtDate(v.date)} · ${esc(v.channel_id)}</div>
+        <div class="card-meta">${esc(artistLabel(v))} · ${fmtDate(v.date)}</div>
       </div>
     </a>`;
   }).join('');
@@ -208,7 +208,10 @@ function filteredVideos() {
     videos = videos.filter(v =>
       v.title.toLowerCase().includes(q) ||
       v.channel_id.toLowerCase().includes(q) ||
-      v.video_id.toLowerCase().includes(q)
+      v.video_id.toLowerCase().includes(q) ||
+      (v.artist || '').toLowerCase().includes(q) ||
+      (v.uploader || '').toLowerCase().includes(q) ||
+      (v.track || '').toLowerCase().includes(q)
     );
   }
 
@@ -237,6 +240,14 @@ function esc(s) {
 function fmtDate(d) {
   if (!d || d.length !== 8) return d || '';
   return `${d.slice(0,4)}-${d.slice(4,6)}-${d.slice(6,8)}`;
+}
+
+function artistLabel(v) {
+  const artist = v.artist || v.uploader || v.channel_id || '';
+  if (v.track && artist && v.track.toLowerCase() !== (v.title || '').toLowerCase()) {
+    return `${artist} – ${v.track}`;
+  }
+  return artist;
 }
 
 $('tag-search').addEventListener('input', e => {
