@@ -51,13 +51,14 @@ def _queue_limit(kind: str) -> int:
         return default
 
 # Archive lines look like: "youtube <id>"
-CHECK_FILE = Path("./data/archive.txt").expanduser().resolve()
-MERGED_DIR = Path("./data/media-strict").expanduser().resolve()
-LEGACY_MERGED_DIR = Path("./data/media-legacy").expanduser().resolve()
-FALLBACK_DIR = Path("./data/media-fallback").expanduser().resolve()
-CATALOG_DB = Path(os.environ.get("DIHI_CATALOG_DB", "./data/media-catalog.db")).expanduser().resolve()
-PLAYLIST_METADATA_DIR = Path(os.environ.get("DIHI_PLAYLIST_METADATA_DIR", "./data/playlists")).expanduser().resolve()
-SETTINGS_FILE = Path(os.environ.get("DIHI_SETTINGS_FILE", "./data/settings.json")).expanduser().resolve()
+DATA_ROOT = Path(os.environ.get("DIHI_DATA_DIR", "./data")).expanduser().resolve()
+CHECK_FILE = DATA_ROOT / "archive.txt"
+MERGED_DIR = DATA_ROOT / "media-strict"
+LEGACY_MERGED_DIR = DATA_ROOT / "media-legacy"
+FALLBACK_DIR = DATA_ROOT / "media-fallback"
+CATALOG_DB = Path(os.environ.get("DIHI_CATALOG_DB", str(DATA_ROOT / "media-catalog.db"))).expanduser().resolve()
+PLAYLIST_METADATA_DIR = Path(os.environ.get("DIHI_PLAYLIST_METADATA_DIR", str(DATA_ROOT / "playlists"))).expanduser().resolve()
+SETTINGS_FILE = Path(os.environ.get("DIHI_SETTINGS_FILE", str(DATA_ROOT / "settings.json"))).expanduser().resolve()
 _APP_DIR = Path(__file__).resolve().parent
 _SOURCE_EXTENSION_DIR = _APP_DIR / "extension"
 for _parent in _APP_DIR.parents:
@@ -99,7 +100,7 @@ _last_queue_log_message: Optional[str] = None
 _queue_wakeup = threading.Event()
 _cleanup_tasks: dict[str, dict] = {}
 _cleanup_report_cache: tuple[float, dict] | None = None
-_VERIFY_CACHE = Path(os.environ.get("DIHI_VERIFY_CACHE", "./data/media-verification.json")).expanduser().resolve()
+_VERIFY_CACHE = Path(os.environ.get("DIHI_VERIFY_CACHE", str(DATA_ROOT / "media-verification.json"))).expanduser().resolve()
 
 
 def _refresh_catalog() -> None:
@@ -482,7 +483,10 @@ def _download_worker(video_id: str, cookies_browser: str | None = None, queue_it
             audio_meta=True,
             cookies_browser=cookies_browser,
             extra_opts={"progress_hooks": [_progress_hook(video_id)],
-                        "download_archive": None if _media_needs_sidecar_retry(video_id) else str(CHECK_FILE)},
+                        "download_archive": None if (
+                            _media_needs_archive_retry(video_id)
+                            or _media_needs_sidecar_retry(video_id)
+                        ) else str(CHECK_FILE)},
         )
         # Give filesystem time to sync archive.txt
         time.sleep(0.5)
@@ -491,16 +495,27 @@ def _download_worker(video_id: str, cookies_browser: str | None = None, queue_it
         with _lock:
             _cached_mtime = None  # Force refresh
         _ensure_cache()
-        media = _resolve_media_by_video_id(video_id) or {}
+        # The catalog may still contain the pre-download file list. Read the
+        # live strict/legacy directory first so freshly created video/audio
+        # outputs are visible to the completion check immediately.
+        media = _scan_single_video(video_id) or _resolve_media_by_video_id(video_id) or {}
         media_files = media.get("files") or {}
         has_video = bool(media_files.get("video"))
         has_audio = bool(media_files.get("audio"))
         with _lock:
-            success = result_code == 0 and video_id in _cached_ids and has_video and has_audio
+            # Retries of incomplete archived items intentionally disable
+            # yt-dlp's archive option, so archive membership is not available
+            # as a completion signal here. The playable outputs are the
+            # authoritative result of this download.
+            success = result_code == 0 and has_video and has_audio
         if result_code:
             error_text = f"yt-dlp returned exit code {result_code}"
         elif not success:
             error_text = "download did not produce both a playable video and audio file"
+        if not success and _media_needs_archive_retry(video_id):
+            _remove_from_archive(video_id)
+        elif success:
+            _add_to_archive(video_id)
     except Exception as e:
         error_text = str(e)
         app.logger.exception("Download failed for %s: %s", video_id, e)
@@ -566,7 +581,14 @@ def _prepare_playlist_membership(playlist_id: str, cookies_browser: str | None =
         opts = getvidyt.build_ydl_opts(
             merged_dir=MERGED_DIR, archive=CHECK_FILE, cookies_browser=cookies_browser,
             extra_opts={"skip_download": True, "extract_flat": "in_playlist", "quiet": True,
-                        "no_warnings": True, "ignoreerrors": True},
+                        "no_warnings": True, "ignoreerrors": True,
+                        # Preflight must list every playlist entry, including
+                        # videos already in the download archive. yt-dlp drops
+                        # archived entries from flat-preflight results, which
+                        # used to shrink membership and zero out the
+                        # locally-available count for playlists with
+                        # previously downloaded members.
+                        "download_archive": None},
         )
         with getvidyt.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False) or {}
@@ -633,7 +655,10 @@ def _playlist_download_worker(playlist_id: str, queue_item_id: int | None = None
                     member["video_id"],
                     audio_meta=True,
                     extra_opts={"progress_hooks": [_progress_hook(playlist_id)],
-                                "download_archive": None if _media_needs_sidecar_retry(member["video_id"]) else str(CHECK_FILE)},
+                                "download_archive": None if (
+                                    _media_needs_archive_retry(member["video_id"])
+                                    or _media_needs_sidecar_retry(member["video_id"])
+                                ) else str(CHECK_FILE)},
                 )
                 if child_rc:
                     rc = child_rc
@@ -733,6 +758,18 @@ threading.Thread(target=_queue_scheduler, name="download-queue", daemon=True).st
 def _enqueue_target(target: str, kind: str, scheduled_at: float | None = None,
                     cookies_browser: str | None = None, status: str = "pending") -> tuple[int | None, bool]:
     """Add a target to the persistent queue, returning (id, already_queued)."""
+    if status == "pending":
+        # The schema allows a pending and paused row for the same target, so
+        # this case does not raise IntegrityError. Promote the paused row
+        # first so an explicit immediate request cannot leave it stranded.
+        for item in catalog.queue_items(CATALOG_DB, 2000):
+            if item["target"] == target and item["kind"] == kind and item["status"] == "paused":
+                catalog.queue_set_status(
+                    CATALOG_DB, int(item["id"]), "pending",
+                    scheduled_at=scheduled_at or time.time(),
+                )
+                _queue_wakeup.set()
+                return int(item["id"]), True
     try:
         item_id = catalog.queue_add(CATALOG_DB, target, kind, scheduled_at, cookies_browser, status)
         _queue_wakeup.set()
@@ -740,6 +777,15 @@ def _enqueue_target(target: str, kind: str, scheduled_at: float | None = None,
     except sqlite3.IntegrityError:
         for item in catalog.queue_items(CATALOG_DB, 2000):
             if item["target"] == target and item["kind"] == kind and item["status"] in {"pending", "paused"}:
+                # An explicit immediate request should wake an item that was
+                # previously held in the paused queue (for example, from the
+                # per-song Download button on the playlist page).
+                if status == "pending" and item["status"] == "paused":
+                    catalog.queue_set_status(
+                        CATALOG_DB, int(item["id"]), "pending",
+                        scheduled_at=scheduled_at or time.time(),
+                    )
+                    _queue_wakeup.set()
                 return int(item["id"]), True
         raise
 
@@ -1145,6 +1191,71 @@ def _media_needs_sidecar_retry(video_id: str) -> bool:
                         and any(name.endswith((".out.webp", ".out.png", ".out.jpg")) for name in names)
                         and any(name.endswith((".out.description", ".out.en.vtt", ".out.en-orig.vtt")) for name in names))
     return False
+
+
+def _media_needs_archive_retry(video_id: str) -> bool:
+    """Return whether an archive entry lacks both strict playable outputs.
+
+    yt-dlp skips an archived ID before inspecting the filesystem. Bypass the
+    archive when a previous attempt recorded the ID but left an incomplete
+    strict/legacy media directory, or when only a fallback copy exists.
+    """
+    media = _scan_single_video(video_id)
+    files = (media or {}).get("files") or {}
+    return not (files.get("video") and files.get("audio"))
+
+
+def _remove_from_archive(video_id: str, archive: Path | None = None) -> bool:
+    """Remove one incomplete video from yt-dlp's archive and refresh cache."""
+    path = (archive or CHECK_FILE).expanduser().resolve()
+    if not path.is_file():
+        return False
+    temporary: Path | None = None
+    try:
+        lines = path.read_text(encoding="utf-8", errors="ignore").splitlines(keepends=True)
+        kept = [line for line in lines if _parse_archive_line(line) != video_id]
+        if len(kept) == len(lines):
+            return False
+        temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        temporary.write_text("".join(kept), encoding="utf-8")
+        os.replace(temporary, path)
+        if path == CHECK_FILE:
+            global _cached_mtime
+            with _lock:
+                _cached_mtime = None
+                _cached_ids.discard(video_id)
+        return True
+    except OSError:
+        app.logger.exception("Could not remove %s from archive %s", video_id, path)
+        if temporary is not None:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+        return False
+
+
+def _add_to_archive(video_id: str, archive: Path | None = None) -> bool:
+    """Record a successfully completed video in yt-dlp's archive."""
+    path = (archive or CHECK_FILE).expanduser().resolve()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        lines = path.read_text(encoding="utf-8", errors="ignore").splitlines(keepends=True) if path.is_file() else []
+        if any(_parse_archive_line(line) == video_id for line in lines):
+            return False
+        with path.open("a", encoding="utf-8") as stream:
+            if lines and not lines[-1].endswith("\n"):
+                stream.write("\n")
+            stream.write(f"youtube {video_id}\n")
+        if path == CHECK_FILE:
+            with _lock:
+                global _cached_mtime
+                _cached_mtime = None
+                _cached_ids.add(video_id)
+        return True
+    except OSError:
+        app.logger.exception("Could not add %s to archive %s", video_id, path)
+        return False
 
 
 def _cleanup_report() -> dict:
@@ -2507,6 +2618,8 @@ def api_youtube_get(video_id: str):
     permanent = _permanent_failure(vid)
     if permanent:
         return jsonify(ok=False, error=f"not retryable: {permanent[0]} — {permanent[1]}"), 409
+    if _media_needs_archive_retry(vid):
+        _remove_from_archive(vid)
 
     queue_status = "pending" if catalog.setting(CATALOG_DB, "default_download_mode", "immediate") == "immediate" else "paused"
     item_id, already_queued = _enqueue_target(vid, "video", status=queue_status)
@@ -2531,6 +2644,8 @@ def api_youtube_retry(video_id: str):
         vid = _normalize_id(video_id)
         if not vid:
             return jsonify(error="invalid video id"), 400
+        if _media_needs_archive_retry(vid):
+            _remove_from_archive(vid)
         item_id, already_queued = _enqueue_target(vid, "video", cookies_browser=browser)
         return jsonify(ok=True, id=vid, queue_id=item_id, started=not already_queued, authenticated=True)
     return api_youtube_get(video_id)
@@ -2578,7 +2693,7 @@ def api_system_status():
                     except OSError: pass
         except OSError: pass
         return total
-    result = {"disk": {"free_bytes": usage.free, "total_bytes": usage.total, "free_percent": round(usage.free * 100 / usage.total, 1)}, "directories": {str(path): directory_size(path) for path in (MERGED_DIR, LEGACY_MERGED_DIR, FALLBACK_DIR, Path("./data/audio").resolve())}, "cookies": {"present": cookie.is_file(), "netscape_format": False, "youtube_domains": [], "count": 0, "expired": 0}}
+    result = {"disk": {"free_bytes": usage.free, "total_bytes": usage.total, "free_percent": round(usage.free * 100 / usage.total, 1)}, "directories": {str(path): directory_size(path) for path in (MERGED_DIR, LEGACY_MERGED_DIR, FALLBACK_DIR, DATA_ROOT / "audio")}, "cookies": {"present": cookie.is_file(), "netscape_format": False, "youtube_domains": [], "count": 0, "expired": 0}}
     if cookie.is_file():
         try:
             lines = cookie.read_text(encoding="utf-8", errors="ignore").splitlines()

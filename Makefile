@@ -1,18 +1,24 @@
 # Variables
+ifneq ($(wildcard .env),)
+include .env
+endif
+
 VENV := venv
 PYTHON := python3
 PIP := $(VENV)/bin/pip
 PYTEST := $(VENV)/bin/pytest
 DIHI := $(VENV)/bin/dihi
 YTDLP := $(VENV)/bin/yt-dlp
+DATA_DIR ?= $(if $(DIHI_DATA_DIR),$(DIHI_DATA_DIR),./data)
+STATIC_CATALOG_PORT ?= 8765
 .DEFAULT_GOAL := help
 
 # WSL2: detect Windows username and locate browser profiles on the host C: drive
-_WIN_USER     := $(shell cmd.exe /c "echo %USERNAME%" 2>/dev/null | tr -d '\r\n')
+_WIN_USER     := $(shell command -v cmd.exe >/dev/null 2>&1 && timeout 2s cmd.exe /c "echo %USERNAME%" 2>/dev/null | tr -d '\r\n' || true)
 _CHROME_PROF  := /mnt/c/Users/$(_WIN_USER)/AppData/Local/Google/Chrome/User Data
 _EDGE_PROF    := /mnt/c/Users/$(_WIN_USER)/AppData/Local/Microsoft/Edge/User Data
 
-.PHONY: help startup setup install dev-install pot-provider docker-up docker-down docker-logs test-docker run clean test data cookies cookies-browser install-chrome git-add git-commit-push
+.PHONY: help startup setup install dev-install pot-provider docker-up docker-down docker-logs test-docker run clean test data data-size data-migrate catalog-static catalog-static-serve cookies cookies-browser install-chrome git-add git-commit-push
 
 help:
 	@echo 'Available targets:'
@@ -29,6 +35,10 @@ help:
 	@echo '  run              Run the app with the venv Python'
 	@echo '  test             Run unit tests with coverage'
 	@echo '  data             Create Docker bind-mount data files'
+	@echo '  data-size        Show runtime data disk usage'
+	@echo '  data-migrate     Copy runtime data to DEST_DATA_DIR without deleting source'
+	@echo '  catalog-static   Generate an offline catalog browser under the data root'
+	@echo '  catalog-static-serve  Generate and serve it at http://localhost:8765'
 	@echo '  cookies          Export YouTube cookies from a WSL2 browser'
 	@echo '  cookies-browser  Export cookies from a fresh Linux browser session'
 	@echo '  install-chrome   Install Chrome on Debian/Ubuntu'
@@ -82,7 +92,7 @@ test-docker: docker-up
 
 # Run your app using the venv's python
 run: $(VENV)/.setup-complete
-	$(VENV)/bin/python src/dihi/app3.py
+	DIHI_DATA_DIR="$(DATA_DIR)" $(VENV)/bin/python src/dihi/app3.py
 
 # Run unit tests (pure — no network, no ffmpeg, no HTTP)
 test: $(VENV)/.setup-complete
@@ -108,10 +118,33 @@ git-commit-push: git-add
 # Docker creates missing mount targets as directories; running this first
 # ensures they are plain files so yt-dlp can read/write them correctly.
 data:
-	mkdir -p data/media-strict data/media-legacy data/media-fallback data/playlists data/audio
-	touch data/archive.txt data/cookies.txt data/media-fallback/archive.txt data/media-catalog.db
+	mkdir -p $(DATA_DIR)/media-strict $(DATA_DIR)/media-legacy $(DATA_DIR)/media-fallback $(DATA_DIR)/playlists $(DATA_DIR)/audio
+	touch $(DATA_DIR)/archive.txt $(DATA_DIR)/cookies.txt $(DATA_DIR)/media-fallback/archive.txt $(DATA_DIR)/media-catalog.db
 
-# Export YouTube cookies from your Windows browser into data/cookies.txt (WSL2 only).
+data-size:
+	@echo "Data root: $(DATA_DIR)"
+	@du -sh "$(DATA_DIR)" 2>/dev/null || { echo "Data directory does not exist: $(DATA_DIR)"; exit 1; }
+	@du -sh "$(DATA_DIR)"/* 2>/dev/null | sort -h || true
+
+catalog-static:
+	PYTHONPATH=src/dihi $(PYTHON) src/dihi/static_catalog.py --data-root "$(DATA_DIR)"
+
+catalog-static-serve: catalog-static
+	@echo "Serving $(DATA_DIR)/static-catalog at http://localhost:$(STATIC_CATALOG_PORT)"
+	$(PYTHON) -m http.server "$(STATIC_CATALOG_PORT)" --directory "$(DATA_DIR)/static-catalog"
+
+data-migrate:
+	@test -n "$(DEST_DATA_DIR)" || { echo 'Usage: make data-migrate DEST_DATA_DIR=/mnt/e/dihi-data'; exit 1; }
+	@test "$(DEST_DATA_DIR)" != "$(DATA_DIR)" || { echo 'DEST_DATA_DIR must differ from DATA_DIR'; exit 1; }
+	@test -d "$(DATA_DIR)" || { echo "Source data directory does not exist: $(DATA_DIR)"; exit 1; }
+	mkdir -p "$(DEST_DATA_DIR)"
+	@if command -v rsync >/dev/null 2>&1; then \
+		rsync -r --inplace --no-perms --no-owner --no-group "$(DATA_DIR)/" "$(DEST_DATA_DIR)/"; \
+	else cp -r --no-preserve=mode,ownership,timestamps "$(DATA_DIR)/." "$(DEST_DATA_DIR)/"; fi
+	@echo "Copied $(DATA_DIR) to $(DEST_DATA_DIR); source was not removed."
+	@du -sh "$(DEST_DATA_DIR)"
+
+# Export YouTube cookies from your Windows browser into the configured data root (WSL2 only).
 # Tries Chrome → Edge → Firefox in order; stops at the first one found.
 # Run this before `docker compose up` so the bind-mount target is a real file.
 #   make cookies
@@ -119,20 +152,20 @@ cookies: data $(VENV)/.setup-complete
 	@if [ -d "$(_CHROME_PROF)" ]; then \
 		echo "Found Chrome ($(_WIN_USER)) — exporting cookies…"; \
 		$(YTDLP) --cookies-from-browser "chrome:$(_CHROME_PROF)" \
-		          --cookies data/cookies.txt --skip-download \
+		          --cookies "$(DATA_DIR)/cookies.txt" --skip-download \
 		          "https://www.youtube.com/watch?v=dQw4w9WgXcQ"; \
 	elif [ -d "$(_EDGE_PROF)" ]; then \
 		echo "Found Edge ($(_WIN_USER)) — exporting cookies…"; \
 		$(YTDLP) --cookies-from-browser "edge:$(_EDGE_PROF)" \
-		          --cookies data/cookies.txt --skip-download \
+		          --cookies "$(DATA_DIR)/cookies.txt" --skip-download \
 		          "https://www.youtube.com/watch?v=dQw4w9WgXcQ"; \
 	else \
 		echo "Chrome/Edge not found — trying Firefox…"; \
 		$(YTDLP) --cookies-from-browser firefox \
-		          --cookies data/cookies.txt --skip-download \
+		          --cookies "$(DATA_DIR)/cookies.txt" --skip-download \
 		          "https://www.youtube.com/watch?v=dQw4w9WgXcQ"; \
 	fi
-	@echo "Done — cookies written to data/cookies.txt"
+	@echo "Done — cookies written to $(DATA_DIR)/cookies.txt"
 
 # Linux / WSLg: launch a fresh browser, let you log into YouTube, then extract
 # the session cookies once you close the window.
@@ -165,7 +198,7 @@ cookies-browser: data $(VENV)/.setup-complete
 			"https://accounts.google.com/ServiceLogin?service=youtube" 2>/dev/null; \
 		echo "Browser closed — extracting cookies from Chrome profile…"; \
 		$(YTDLP) --cookies-from-browser "chrome:$$TMPPROF" \
-			--cookies data/cookies.txt --skip-download \
+			--cookies "$(DATA_DIR)/cookies.txt" --skip-download \
 			"https://www.youtube.com/watch?v=dQw4w9WgXcQ"; \
 	else \
 		FFPROF="$$TMPPROF/ffprofile"; mkdir -p "$$FFPROF"; \
@@ -173,11 +206,11 @@ cookies-browser: data $(VENV)/.setup-complete
 			"https://accounts.google.com/ServiceLogin?service=youtube" 2>/dev/null; \
 		echo "Browser closed — extracting cookies from Firefox profile…"; \
 		$(YTDLP) --cookies-from-browser "firefox:$$FFPROF" \
-			--cookies data/cookies.txt --skip-download \
+			--cookies "$(DATA_DIR)/cookies.txt" --skip-download \
 			"https://www.youtube.com/watch?v=dQw4w9WgXcQ"; \
 	fi; \
 	rm -rf "$$TMPPROF"; \
-	echo "Done — cookies written to data/cookies.txt"
+	echo "Done — cookies written to $(DATA_DIR)/cookies.txt"
 
 # Install Google Chrome on Debian/Ubuntu (WSL2 or native Linux).
 install-chrome:
@@ -206,4 +239,4 @@ clean:
 .DEFAULT:
 	@test -x "$(DIHI)" || { echo "Run 'make dev-install' first to install the dihi CLI."; exit 1; }
 	@if [ -z "$${DIHI_PO_TOKEN_PROVIDER_URL:-}" ]; then $(MAKE) --no-print-directory pot-provider; fi
-	@$(DIHI) download "$@"
+	@$(DIHI) download "$@" --archive "$(DATA_DIR)/archive.txt" --merged-dir "$(DATA_DIR)/media-strict"

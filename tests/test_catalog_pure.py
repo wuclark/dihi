@@ -8,6 +8,7 @@ from catalog import (
     playlists,
     queue_add,
     queue_items,
+    queue_set_status,
     record_attempt,
     record_playlist_membership,
     refresh,
@@ -321,6 +322,18 @@ def test_queue_attempts_settings_are_db_only_not_rebuilt(tmp_path):
     import sqlite3
     with sqlite3.connect(db) as conn:
         assert conn.execute("SELECT COUNT(*) FROM download_attempts").fetchone()[0] == 0
+
+
+def test_queue_status_collision_keeps_existing_active_item(tmp_path):
+    db = tmp_path / "catalog.db"
+    stale_id = queue_add(db, "aaaaaaaaaaa", "video", status="running")
+    paused_id = queue_add(db, "aaaaaaaaaaa", "video", status="paused")
+
+    queue_set_status(db, stale_id, "paused", error="paused after server restart")
+
+    items = {item["id"]: item for item in queue_items(db)}
+    assert stale_id not in items
+    assert items[paused_id]["status"] == "paused"
 
 
 def test_refresh_keeps_renamed_media_roots_on_same_catalog_row(tmp_path):

@@ -22,6 +22,7 @@ Examples
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import urllib.parse
 from pathlib import Path
@@ -42,6 +43,10 @@ from getvidyt import (
     load_archive,
     to_youtube_url,
 )
+
+DATA_ROOT = Path(os.environ.get("DIHI_DATA_DIR", "./data")).expanduser()
+DEFAULT_ARCHIVE = str(DATA_ROOT / "archive.txt")
+DEFAULT_MEDIA_DIR = str(DATA_ROOT / "media-strict")
 
 
 # ---------------------------------------------------------------------------
@@ -71,13 +76,13 @@ def _add_download_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("target", help="YouTube URL, video ID (11 chars), or playlist ID.")
     p.add_argument(
         "--archive",
-        default="data/archive.txt",
-        help="yt-dlp download archive file (default: data/archive.txt).",
+        default=DEFAULT_ARCHIVE,
+        help=f"yt-dlp download archive file (default: {DEFAULT_ARCHIVE}).",
     )
     p.add_argument(
         "--merged-dir",
-        default="data/media-strict",
-        help="Output base directory (default: data/media-strict).",
+        default=DEFAULT_MEDIA_DIR,
+        help=f"Output base directory (default: {DEFAULT_MEDIA_DIR}).",
     )
     p.add_argument(
         "--cookies-browser",
@@ -191,8 +196,8 @@ def main() -> int:
     ck.add_argument("target", help="Video ID, or full YouTube URL.")
     ck.add_argument(
         "--archive",
-        default="data/archive.txt",
-        help="yt-dlp archive file to search (default: data/archive.txt).",
+        default=DEFAULT_ARCHIVE,
+        help=f"yt-dlp archive file to search (default: {DEFAULT_ARCHIVE}).",
     )
 
     args = ap.parse_args()

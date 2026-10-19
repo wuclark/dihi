@@ -30,6 +30,9 @@ from app3 import (
     _cleanup_old_results,
     _cleanup_old_playlist_results,
     _resolve_media_by_video_id,
+    _media_needs_archive_retry,
+    _remove_from_archive,
+    _add_to_archive,
     _scan_library_cached,
     _scan_tags,
     _download_status_snapshot,
@@ -129,6 +132,39 @@ def test_queue_prefers_playlist_id_when_watch_url_has_both(monkeypatch):
     assert queued == [("PLR9DU4SPdPFiHtop6ajZN_PVuq9NaZZcV", "playlist", "paused")]
 
 
+def test_immediate_video_request_promotes_existing_paused_item(monkeypatch, tmp_path):
+    db = tmp_path / "catalog.db"
+    monkeypatch.setattr(app3, "CATALOG_DB", db)
+    monkeypatch.setattr(app3, "_queue_wakeup", type("NoopEvent", (), {"set": lambda self: None})())
+    paused_id = app3.catalog.queue_add(db, "dQw4w9WgXcQ", "video", status="paused")
+
+    item_id, already = app3._enqueue_target("dQw4w9WgXcQ", "video", status="pending")
+
+    assert (item_id, already) == (paused_id, True)
+    item = next(item for item in app3.catalog.queue_items(db) if item["id"] == paused_id)
+    assert item["status"] == "pending"
+
+
+def test_download_worker_checks_fresh_files_before_catalog(monkeypatch, tmp_path):
+    video_id = "dQw4w9WgXcQ"
+    archive = tmp_path / "archive.txt"
+    monkeypatch.setattr(app3, "CHECK_FILE", archive)
+    monkeypatch.setattr(app3.getvidyt, "download_youtube", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(app3, "_ensure_cache", lambda: app3._cached_ids.add(video_id))
+    monkeypatch.setattr(app3, "_scan_single_video", lambda value: {
+        "video_id": value,
+        "files": {"video": "/media/video.mkv", "audio": "/media/audio.m4a"},
+    })
+    monkeypatch.setattr(app3, "_resolve_media_by_video_id", lambda _value: {})
+    monkeypatch.setattr(app3, "_refresh_catalog", lambda: None)
+    monkeypatch.setattr(app3.catalog, "record_attempt", lambda *args, **kwargs: None)
+
+    app3._download_worker(video_id)
+
+    assert app3._download_results[video_id] == "completed"
+    assert archive.read_text(encoding="utf-8").strip() == f"youtube {video_id}"
+
+
 def test_restart_recovery_pauses_running_queue_items(monkeypatch):
     items = [
         {"id": 11, "status": "running"},
@@ -168,6 +204,51 @@ def test_playlist_prepare_skips_existing_descriptor(monkeypatch, tmp_path):
         "existing": True,
         "members": 1,
     }
+
+
+def test_playlist_preflight_ignores_download_archive(monkeypatch, tmp_path):
+    """Preflight must list archived members instead of dropping them.
+
+    Regression test: yt-dlp removes download-archive entries from
+    flat-preflight results, which used to shrink playlist membership and
+    zero out the locally-available count.
+    """
+    captured = {}
+
+    class FakeYDL:
+        def __init__(self, opts):
+            captured.update(opts)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def extract_info(self, url, download=False):
+            assert download is False
+            return {
+                "title": "Some Playlist",
+                "webpage_url": "https://www.youtube.com/playlist?list=PLtest12345678",
+                "entries": [
+                    {"id": "dQw4w9WgXcQ", "title": "Archived One", "playlist_index": 1,
+                     "webpage_url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ"},
+                    {"id": "9bZkp7q19f0", "title": "Fresh One", "playlist_index": 2,
+                     "webpage_url": "https://www.youtube.com/watch?v=9bZkp7q19f0"},
+                ],
+            }
+
+    monkeypatch.setattr(app3.getvidyt, "YoutubeDL", FakeYDL)
+    monkeypatch.setattr(app3, "MERGED_DIR", tmp_path.resolve())
+    monkeypatch.setattr(app3, "CHECK_FILE", (tmp_path / "archive.txt").resolve())
+    monkeypatch.setattr(app3, "CATALOG_DB", (tmp_path / "catalog.db").resolve())
+    monkeypatch.setattr(app3, "PLAYLIST_METADATA_DIR", (tmp_path / "playlists").resolve())
+
+    members = app3._prepare_playlist_membership("PLtest12345678")
+
+    assert captured.get("download_archive") is None
+    assert members is not None
+    assert [m["video_id"] for m in members] == ["dQw4w9WgXcQ", "9bZkp7q19f0"]
 
 
 def test_progress_hook_tracks_each_file_and_overall_bytes():
@@ -376,6 +457,26 @@ class TestResolveMediaByVideoId:
         assert result["details"]["metadata"]["description"] == "lyrics here"
         assert result["details"]["files"]
         assert result["files"]["video"].endswith(".out.mkv")
+
+    def test_archive_retry_required_when_playable_outputs_are_missing(self, monkeypatch, tmp_path):
+        video_dir = tmp_path / "UCchannel01" / "dQw4w9WgXcQ"
+        video_dir.mkdir(parents=True)
+        (video_dir / "partial.out.info.json").write_text("{}")
+        monkeypatch.setattr(app3, "MERGED_DIR", tmp_path.resolve())
+        monkeypatch.setattr(app3, "LEGACY_MERGED_DIR", (tmp_path / "nolegacy").resolve())
+
+        assert _media_needs_archive_retry("dQw4w9WgXcQ") is True
+
+    def test_remove_from_archive_removes_only_requested_video(self, tmp_path):
+        archive = tmp_path / "archive.txt"
+        archive.write_text(
+            "youtube dQw4w9WgXcQ\n"
+            "youtube abc12345678\n",
+            encoding="utf-8",
+        )
+
+        assert _remove_from_archive("dQw4w9WgXcQ", archive) is True
+        assert archive.read_text(encoding="utf-8") == "youtube abc12345678\n"
 
 
 # ---------------------------------------------------------------------------

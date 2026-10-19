@@ -12,6 +12,140 @@ A YouTube video archive management system. Downloads videos and playlists via yt
 
 ---
 
+## Fresh Clone Setup (WSL2 + Windows USB)
+
+This is the complete setup for a new WSL2 checkout with DIHI data stored on a
+Windows-formatted USB drive. If you are not using a USB drive, keep
+`DIHI_DATA_DIR=./data` in `.env` and skip the mount steps.
+
+Prerequisites: WSL2, Docker with Compose, Git, Python 3.11+, and a Windows
+drive letter assigned to the USB drive.
+
+```bash
+# 1. Clone the repository
+git clone <repository-url> ~/dihi
+cd ~/dihi
+
+# 2. Mount the USB drive in a clearly named WSL path (replace D: if needed)
+sudo mkdir -p /mnt/usbdocker1
+sudo mount -t drvfs D: /mnt/usbdocker1
+ls -la /mnt/usbdocker1
+
+# 3. Configure the persistent data root
+cp .env.example .env
+sed -i 's#^DIHI_DATA_DIR=.*#DIHI_DATA_DIR=/mnt/usbdocker1/docker/dihi/data#' .env
+
+# 4. Install the host CLI and initialize the complete data tree
+make setup
+make dev-install
+make data
+
+# 5. Start the server and PO Token provider
+make docker-up
+curl http://localhost:5000/health
+```
+
+The Compose container mounts the complete `DIHI_DATA_DIR` as `/app/data`, so
+media, archive files, cookies, settings, queue/history, catalog, playlists,
+and verification cache remain on the USB drive. Keep the drive mounted while
+Docker is running. To confirm usage, run `make data-size`.
+
+For authenticated YouTube downloads, export cookies after `make setup`:
+
+```bash
+make cookies                 # import from an existing Windows browser
+# or
+make cookies-browser         # open a fresh WSL browser session
+make docker-up               # restart so the container reads updated cookies
+```
+
+To download from the host CLI instead of the web server, export the same data
+root and start the provider:
+
+```bash
+export DIHI_DATA_DIR=/mnt/usbdocker1/docker/dihi/data
+make pot-provider
+venv/bin/dihi download VIDEO_ID
+```
+
+Useful lifecycle commands:
+
+```bash
+make docker-logs             # follow server/provider logs
+make docker-down             # stop the stack
+make data-migrate DEST_DATA_DIR=/some/new/location  # copy without deleting
+```
+
+If the USB drive is disconnected, stop Docker, reconnect/remount the drive,
+verify `ls -la /mnt/usbdocker1/docker/dihi/data`, and run `make docker-up` again. Do not
+start the stack against an empty replacement directory or Docker may create a
+new empty archive there.
+
+---
+
+## Migrate Existing Data to the USB Drive
+
+With no `.env` file, the current setup uses `./data`. The following procedure
+copies it to the USB without deleting the original, then switches Docker and
+the host CLI to the new location.
+
+```bash
+cd ~/github/dihi
+
+# 1. Stop the current stack
+docker compose down
+
+# 2. Mount the USB drive once at a neutral path
+sudo umount /mnt/docker/dihi 2>/dev/null || true
+sudo mkdir -p /mnt/usbdocker1
+sudo mount -t drvfs D: /mnt/usbdocker1
+ls -la /mnt/usbdocker1
+
+# 3. Confirm the current data exists
+du -sh ./data
+
+# 4. Copy it to the project-specific USB directory
+DIHI_DATA_DIR=./data make data-migrate \
+  DEST_DATA_DIR=/mnt/usbdocker1/docker/dihi/data
+
+# 5. Compare the source and destination sizes
+du -sh ./data /mnt/usbdocker1/docker/dihi/data
+
+# 6. Switch the repository to the USB data root
+cp .env.example .env
+sed -i 's#^DIHI_DATA_DIR=.*#DIHI_DATA_DIR=/mnt/usbdocker1/docker/dihi/data#' .env
+
+# 7. Ensure any required empty files/directories exist
+make data
+
+# 8. Start the USB-backed stack and verify it
+make docker-up
+curl http://localhost:5000/health
+```
+
+The migration target uses Windows-compatible copy options for DrvFs: it does
+not preserve Linux ownership, permissions, or timestamps, and writes files
+in place so long filenames are less likely to fail. If a copy is interrupted,
+rerun the same command; it is safe to resume over the partial destination.
+
+After verifying the library, cookies, queue, and downloads, keep `./data` as a
+backup for a while. Do not start Docker if the USB is disconnected: verify
+`/mnt/usbdocker1/docker/dihi/data` first, or Docker may start against a new
+empty directory. If the drive letter changes, remount the new letter at the
+same `/mnt/usbdocker1` path; `.env` does not need to change.
+
+To move the data to a second storage drive later:
+
+```bash
+make docker-down
+DIHI_DATA_DIR=/mnt/usbdocker1/docker/dihi/data \
+  make data-migrate DEST_DATA_DIR=/mnt/usbdocker2/docker/dihi/data
+sed -i 's#^DIHI_DATA_DIR=.*#DIHI_DATA_DIR=/mnt/usbdocker2/docker/dihi/data#' .env
+make docker-up
+```
+
+---
+
 ## CLI Quick Start
 
 ```bash
@@ -71,6 +205,52 @@ curl http://localhost:5000/health
 ```
 
 Compose starts the PO Token provider with the app and publishes its service port only on host loopback.
+
+Compose reads `DIHI_DATA_DIR` from `.env`; the default is `./data`. Copy
+`.env.example` to `.env` before changing the data root. For a Windows USB
+drive mounted in WSL2 as `D:`, use a neutral mount point and set
+`DIHI_DATA_DIR=/mnt/usbdocker1/docker/dihi/data`:
+
+```bash
+sudo mkdir -p /mnt/usbdocker1
+sudo mount -t drvfs D: /mnt/usbdocker1
+ls -la /mnt/usbdocker1
+```
+
+Replace `D:` with the assigned Windows drive letter when necessary. Copy the
+existing `data/` contents to `/mnt/usbdocker1/docker/dihi/data`, run `make data`, and
+restart Compose. `make data-size` reports total and per-directory usage; after
+stopping Compose, `make data-migrate DEST_DATA_DIR=/mnt/usbdocker1/docker/dihi/data` copies
+the current data tree without deleting the source. Keep the drive connected
+while Docker is running. This moves DIHI's bind-mounted archive and media,
+cookies, settings, queue/history, catalog, playlists, and verification cache;
+it does not move Docker Desktop's own image/build cache.
+
+The host CLI and `make run` use the same `DIHI_DATA_DIR` when it is exported;
+for direct CLI use, run `export DIHI_DATA_DIR=/mnt/usbdocker1/docker/dihi/data` first.
+The `make <video-id>` workflow passes the configured data root automatically.
+
+### Offline static catalog
+
+Generate a portable catalog browser without running Flask or Docker:
+
+```bash
+make catalog-static
+```
+
+The export is written to `${DIHI_DATA_DIR}/static-catalog` and references the
+existing media files without copying them. It includes search, thumbnails,
+video/audio playback where the browser supports the format, downloads, and
+playlist membership. You can open `index.html` directly, or use the optional
+localhost server for more reliable browser media behavior:
+
+```bash
+make catalog-static-serve
+# open http://localhost:8765
+```
+
+Regenerate the export after the catalog or media changes. MKV playback remains
+browser-dependent; use the generated file links or VLC for unsupported codecs.
 
 ---
 
@@ -251,7 +431,7 @@ curl http://localhost:5000/api/downloads/status
 }
 ```
 
-The `/downloads` page polls this endpoint and shows active video/playlist downloads, recent completed or failed results, persistent completed/failed attempt history, and a queue output. Playlist progress groups each item's video, audio, and metadata files beneath that item's title. The `/downloaded` page shows the persistent history in a scrollable panel. The `/playlists` page groups indexed videos by their saved YouTube playlist metadata, with ordered links, browser play-all, and separate video and audio-only M3U files for VLC. Each saved playlist shows locally available versus total members, such as `9/10 videos`, and incomplete playlists appear first. Playlist preflight records all members, including videos already in the archive. The `/video/<id>` page provides dedicated local playback, a collapsed full description, complete saved metadata and file inventory, and a direct VLC media URL. The `/status` page reports total disk capacity and usage for each media directory. The `/wordcloud` page generates on request and displays a spinner/progress state while descriptions are scanned and the cloud is arranged. A download is complete only when the archive entry and playable video/audio files are present; the catalog shows the missing-media reason and retry actions, including retry with browser cookies. Catalog rows with missing sidecars such as lyrics/subtitles, descriptions, thumbnails, or format manifests also provide a Retry missing files action. When there are no active downloads it shows `Queue Empty`. Queue state changes are also logged by the server.
+The `/downloads` page polls this endpoint and shows active video/playlist downloads, recent completed or failed results, persistent completed/failed attempt history, and a queue output. Playlist progress groups each item's video, audio, and metadata files beneath that item's title. The `/downloaded` page shows the persistent history in a scrollable panel. The `/playlists` page groups indexed videos by their saved YouTube playlist metadata, with ordered links, browser play-all, and separate video and audio-only M3U files for VLC. Each saved playlist shows locally available versus total members, such as `9/10 videos`, and incomplete playlists appear first. Playlist preflight records all members, including videos already in the archive. The `/video/<id>` page provides dedicated local playback, a collapsed full description, complete saved metadata and file inventory, and a direct VLC media URL. The `/status` page reports total disk capacity and usage for each media directory. The `/wordcloud` page generates on request and displays a spinner/progress state while descriptions are scanned and the cloud is arranged. A download is complete when playable video and audio files are present; successful archive-bypassing retries restore the archive entry. The catalog shows the missing-media reason and retry actions, including retry with browser cookies. Catalog rows with missing sidecars such as lyrics/subtitles, descriptions, thumbnails, or format manifests also provide a Retry missing files action. When there are no active downloads it shows `Queue Empty`. Queue state changes are also logged by the server.
 
 The `/queue` page manages a persistent download queue. New downloads start immediately by default, but the setting can be changed to queue-only. Items can also be assigned a future start time; jobs interrupted by a server restart are returned to `paused` and do not resume until manually started. It also accepts one playlist URL, ID, or `playlist <ID>` line per entry for batch playlist JSON preparation or paused queue insertion, including CSV-style rows containing a watch URL; when both `v=` and `list=` are present, the playlist is loaded and the individual video is ignored. The **Preflight & save playlist JSON** button creates missing `data/playlists/<playlist_id>.info.json` files and skips valid existing descriptors, while the output panel reports each playlist's progress and result. The **Refresh playlist** action on `/playlists` explicitly fetches current membership. Adding a playlist first saves its name and ordered members without downloading; `/playlists` provides the explicit Download playlist action plus per-video Download buttons. Playlist jobs preflight their entries and download children sequentially, isolating fallback retries to failed videos instead of retrying successful playlist items.
 Older queue rows that stored a playlist ID as a video job are automatically reclassified as playlist jobs when the queue is listed or scheduled.
@@ -263,6 +443,12 @@ The `/cleanup` Tools report is a dry run. It lists fallback duplicates and remov
 ### Extension/API compatibility roadmap
 
 The browser extension must mirror the active site flows and API endpoints. Changes to queue, playlist, playback, settings, or API response shapes should update the extension code, extension README, and extension version together, followed by endpoint-focused tests.
+
+### Storage roadmap
+
+- Validate the WSL2 Windows USB workflow end to end, including copying existing data, initializing it with `.env`, verifying Compose mounts, and documenting disconnected-drive recovery.
+- Measure USB/DrvFs performance and decide whether media should live on USB while the SQLite catalog, archive, and queue state remain on native WSL storage.
+- Document moving Docker Desktop's disk image separately when Docker images or build cache—not DIHI media—consume Windows C: space.
 
 ---
 
@@ -498,16 +684,23 @@ The merged `.mkv` contains embedded subtitle streams, cover art, and metadata ta
 
 | Host Path | Container Path | Description |
 |-----------|---------------|-------------|
-| `./data/archive.txt` | `/app/data/archive.txt` | Download archive |
-| `./data/cookies.txt` | `/app/data/cookies.txt` | YouTube cookies (optional) |
-| `./data/media-strict` | `/app/data/media-strict` | Downloaded files |
-| `./data/media-fallback` | `/app/data/media-fallback` | Fallback downloads and fallback archive |
+| `${DIHI_DATA_DIR}` | `/app/data` | Complete persistent application data tree |
+
+This includes the archive files, cookies, strict/legacy/fallback media,
+playlists, SQLite catalog, queue and download history, settings backup, and
+verification cache. Docker's own images, build cache, and container logs are
+stored outside this data directory.
+
+All host paths above use the `DIHI_DATA_DIR` value from `.env`; `./data` is
+the default. `.env.example` documents the default WSL location and a Windows
+USB example.
 
 ### Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `PORT` | `5000` | API server port |
+| `DIHI_DATA_DIR` | `./data` | Host root for Docker bind-mounted runtime data |
 
 ---
 

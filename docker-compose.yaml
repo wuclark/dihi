@@ -8,19 +8,10 @@ services:
     ports:
       - "5000:5000"
     volumes:
-      # Persistent data
-      # Note: host files must exist before `docker compose up` or Docker will
-      # create them as directories. Run `make data` to initialise them.
-      - ./data/archive.txt:/app/data/archive.txt
-      - ./data/cookies.txt:/app/data/cookies.txt
-      # Strict downloads land in data/media-strict/; legacy and fallback
-      # trees stay readable under data/ as well.
-      - ./data/media-strict:/app/data/media-strict
-      # Legacy downloads made before the primary strict mount was aligned.
-      - ./data/media-legacy:/app/data/media-legacy
-      - ./data/media-fallback:/app/data/media-fallback
-      - ./data/playlists:/app/data/playlists
-      - ./data/media-catalog.db:/app/data/media-catalog.db
+      # Keep the complete application data tree—including cookies, settings,
+      # catalog, queue/history, playlists, verification cache, and media—on
+      # the configured host data root. Run `make data` before starting.
+      - ${DIHI_DATA_DIR:-./data}:/app/data
     environment:
       - PORT=5000
       # App container reaches the provider by Compose service name; host CLI uses loopback.

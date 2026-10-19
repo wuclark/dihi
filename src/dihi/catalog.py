@@ -713,7 +713,26 @@ def queue_set_status(database: Path, item_id: int, status: str, **fields: Any) -
     with sqlite3.connect(database) as db:
         db.executescript(SCHEMA)
         _ensure_queue_columns(db)
-        db.execute(f"UPDATE download_queue SET {assignments} WHERE id = ?", (*updates.values(), item_id))
+        try:
+            db.execute(f"UPDATE download_queue SET {assignments} WHERE id = ?", (*updates.values(), item_id))
+        except sqlite3.IntegrityError:
+            # Older databases use UNIQUE(target, kind, status). A restart
+            # can leave one row running while an equivalent paused row
+            # already exists, and duplicate workers can race to the same
+            # terminal status. Keep the existing row and discard only the
+            # redundant transition source.
+            duplicate = db.execute(
+                """SELECT 1 FROM download_queue AS duplicate
+                   JOIN download_queue AS source
+                     ON source.target = duplicate.target
+                    AND source.kind = duplicate.kind
+                   WHERE source.id = ? AND duplicate.id != source.id
+                     AND duplicate.status = ? LIMIT 1""",
+                (item_id, status),
+            ).fetchone()
+            if duplicate is None:
+                raise
+            db.execute("DELETE FROM download_queue WHERE id = ?", (item_id,))
         db.commit()
 
 

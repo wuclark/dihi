@@ -923,7 +923,7 @@ def download_youtube(
         If True, run AudioMetadataPostProcessor to create clean audio copies
         with embedded metadata. Default is False (skip).
     best_fallback : bool
-        If True, retry failed strict-format downloads into data/bestfallback
+        If True, retry failed strict-format downloads into data/media-fallback
         with a broader format string and separate archive.
 
     Returns
@@ -946,7 +946,7 @@ def download_youtube(
     if result == 0 or not best_fallback:
         return result
 
-    fallback_dir = Path("data/bestfallback")
+    fallback_dir = Path("data/media-fallback")
     fallback_archive = fallback_dir / "archive.txt"
     fallback_extra_opts = {
         **(extra_opts or {}),
