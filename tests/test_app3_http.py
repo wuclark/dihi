@@ -148,8 +148,10 @@ def test_tags_entries_are_slim(client, env):
             assert "details" not in entry
 
 
-def test_playlist_members_are_slim(client, env):
+def test_playlist_members_are_slim(client, env, monkeypatch):
     _video(env["merged"])
+    catalog.refresh([env["merged"], env["legacy"], env["fallback"]], app3.CATALOG_DB)
+    monkeypatch.setattr(app3, "_catalog_library_or_scan", lambda: (_ for _ in ()).throw(AssertionError("playlist detail must not scan the filesystem")))
     catalog.record_playlist_membership(
         app3.CATALOG_DB, "PLtestplaylist01", "Test playlist", None,
         [{"video_id": "dQw4w9WgXcQ", "playlist_index": 1, "title": "Title"}],
@@ -161,6 +163,32 @@ def test_playlist_members_are_slim(client, env):
     assert len(members) == 1
     assert "details" not in members[0]["video"]
     assert members[0]["video"]["files"]["video"].startswith("/media/")
+
+
+def test_playlist_add_persists_indexed_video_and_is_idempotent(client, env):
+    _video(env["merged"])
+    catalog.record_playlist_membership(
+        app3.CATALOG_DB, "PLtestplaylist01", "Test playlist", None, []
+    )
+
+    response = client.post(
+        "/api/media/playlists/PLtestplaylist01/add",
+        json={"video_id": "dQw4w9WgXcQ"},
+    )
+    assert response.status_code == 200
+    assert response.get_json()["already_present"] is False
+    assert response.get_json()["members"] == 1
+
+    duplicate = client.post(
+        "/api/media/playlists/PLtestplaylist01/add",
+        json={"video_id": "dQw4w9WgXcQ"},
+    )
+    assert duplicate.status_code == 200
+    assert duplicate.get_json()["already_present"] is True
+    assert duplicate.get_json()["members"] == 1
+
+    detail = client.get("/api/media/playlists/PLtestplaylist01").get_json()
+    assert [item["video_id"] for item in detail["videos"]] == ["dQw4w9WgXcQ"]
 
 
 def test_playlist_snapshot_saves_members(client, env):
@@ -182,6 +210,26 @@ def test_playlist_snapshot_saves_members(client, env):
     assert removed.status_code == 200
     assert removed.get_json()["media_deleted"] is False
     assert client.get(f"/api/media/playlists/{body['snapshot_id']}").status_code == 404
+
+
+def test_playlist_finish_queues_members_independently(client, env, monkeypatch):
+    catalog.record_playlist_membership(
+        app3.CATALOG_DB, "PLtestplaylist01", "Test playlist", None,
+        [
+            {"video_id": "dQw4w9WgXcQ", "playlist_index": 1},
+            {"video_id": "kIll0-AyMa0", "playlist_index": 2},
+        ],
+    )
+    queued = []
+    monkeypatch.setattr(app3, "_enqueue_target", lambda target, kind, **kwargs: (queued.append((target, kind)) or (len(queued), False)))
+    monkeypatch.setattr(app3, "_queue_wakeup", type("NoopEvent", (), {"set": lambda self: None})())
+
+    response = client.post("/api/media/playlists/PLtestplaylist01/finish")
+
+    assert response.status_code == 200
+    assert queued == [("dQw4w9WgXcQ", "video"), ("kIll0-AyMa0", "video")]
+    assert response.get_json()["queued"] == 2
+    assert response.get_json()["members"] == 2
 
 
 def test_playlist_prepare_repairs_empty_descriptor_from_video_metadata(client, env):

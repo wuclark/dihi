@@ -1,7 +1,32 @@
 <style>
-.site-header{position:sticky;top:0;z-index:100;background:#1a1a1a;border-bottom:1px solid #333;padding:12px 24px;display:flex;align-items:center;gap:12px;flex-wrap:wrap}
-.site-logo{font-size:1.3rem;font-weight:700;color:#3ea6ff;text-decoration:none;margin-right:2px}
-.site-link{background:#272727;border:1px solid #333;color:#f1f1f1;padding:6px 10px;border-radius:6px;font-size:.82rem;text-decoration:none;white-space:nowrap}
-.site-link:hover{border-color:#3ea6ff}
+:root{--di-bg:#0d0e11;--di-sidebar:#101216;--di-surface:#14161b;--di-surface2:#16181d;--di-border:#23262e;--di-text:#eceef2;--di-muted:#9aa1ae;--di-blue:#5aa9ff;--di-orange:#f0a04b}
+*{box-sizing:border-box}.app-sidebar{position:fixed;inset:0 auto 0 0;width:252px;background:var(--di-sidebar);border-right:1px solid var(--di-border);padding:22px 14px;z-index:1000;overflow:auto;color:var(--di-text);font:14px/1.4 'IBM Plex Sans',system-ui,sans-serif}.app-brand{display:block;color:var(--di-blue);font:700 24px/1 'Space Grotesk',system-ui,sans-serif;text-decoration:none;padding:4px 10px 24px}.app-nav-title{color:var(--di-muted);font-size:11px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;padding:15px 10px 6px}.app-nav a,.app-nav button{display:flex;align-items:center;gap:10px;width:100%;min-height:40px;padding:9px 10px;border:0;border-radius:9px;background:transparent;color:var(--di-text);text-decoration:none;text-align:left;cursor:pointer}.app-nav a:hover,.app-nav button:hover,.app-nav a[aria-current=true]{background:var(--di-surface2);color:var(--di-blue)}.app-nav .quiet{color:var(--di-muted);font-size:13px}.app-nav .new-playlist{color:var(--di-blue)}.sidebar-playlists{display:grid;gap:2px;max-height:220px;overflow:auto}.sidebar-playlists a{font-size:13px;min-height:34px}.sidebar-backdrop,#nav-toggle{display:none}
+body:has(.app-sidebar){padding-left:252px;background:var(--di-bg);color:var(--di-text)}
+@media(max-width:760px){.app-sidebar{transform:translateX(-100%);transition:transform .2s}.app-sidebar.open{transform:none}body:has(.app-sidebar){padding-left:0}#nav-toggle{display:block;position:fixed;top:12px;left:12px;z-index:1001;border:1px solid var(--di-border);border-radius:9px;background:var(--di-surface);color:var(--di-text);font-size:22px;width:44px;height:44px}.sidebar-backdrop{position:fixed;inset:0;background:#0008;z-index:999}.sidebar-backdrop.open{display:block}}
 </style>
-<header class="site-header"><a class="site-logo" href="/">DIHI</a><a class="site-link" href="/downloads">Downloads</a><a class="site-link" href="/queue">Queue</a><a class="site-link" href="/downloaded">Downloaded</a><a class="site-link" href="/playlists">Playlists</a><a class="site-link" href="/catalog">Catalog</a><a class="site-link" href="/library-export">Export files</a><a class="site-link" href="/tags">Tags</a><a class="site-link" href="/tools">Tools</a><a class="site-link" href="/wordcloud">Word cloud</a><a class="site-link" href="/tagcloud">Tag cloud</a><a class="site-link" href="/status">Status</a><a class="site-link" href="/extension.zip">Edge extension</a></header>
+<button id="nav-toggle" type="button" aria-label="Open navigation">☰</button>
+<div class="sidebar-backdrop" id="sidebar-backdrop"></div>
+<aside class="app-sidebar" id="app-sidebar">
+  <a class="app-brand" href="/">DIHI</a>
+  <nav class="app-nav" aria-label="Primary navigation">
+    <div class="app-nav-title">Browse</div>
+    <a href="/">▦ <span>Library</span></a>
+    <a href="/?sort=artist">♬ <span>Artists</span></a>
+    <a href="/playlists">▤ <span>Playlists</span></a>
+    <a href="/tags"># <span>Tags</span></a>
+    <a href="/wordcloud">✦ <span>Word cloud</span></a>
+    <div class="app-nav-title">Playlists</div>
+    <div class="sidebar-playlists" id="sidebar-playlists"><span class="app-nav-title">Loading…</span></div>
+    <a class="new-playlist" href="/playlists#new">＋ <span>New playlist</span></a>
+    <div class="app-nav-title">Manage</div>
+    <a class="quiet" href="/downloads">▥ <span>Downloads</span></a>
+    <a class="quiet" href="/catalog">▤ <span>Catalog / admin table</span></a>
+    <a class="quiet" href="/queue">↗ <span>Queue</span></a>
+    <a class="quiet" href="/status">◉ <span>Status</span></a>
+    <a class="quiet" href="/tools">⚙ <span>Tools &amp; export</span></a>
+    <a class="quiet" href="/extension.zip">⇩ <span>Edge extension</span></a>
+  </nav>
+</aside>
+<script>
+document.documentElement.lang='en';document.documentElement.setAttribute('translate','no');(()=>{const b=document.getElementById('nav-toggle'),s=document.getElementById('app-sidebar'),o=document.getElementById('sidebar-backdrop');if(!b)return;const close=()=>{s.classList.remove('open');o.classList.remove('open')};b.onclick=()=>{s.classList.add('open');o.classList.add('open')};o.onclick=close;s.querySelectorAll('a').forEach(a=>a.addEventListener('click',close));const box=document.getElementById('sidebar-playlists'),key='dihi-sidebar-playlists',render=d=>{const rows=(d.playlists||[]).filter(p=>!String(p.playlist_id).startsWith('RD')).slice(0,30);box.innerHTML=rows.map(p=>`<a href="/?playlist=${encodeURIComponent(p.playlist_id)}" title="${String(p.title||'').replace(/"/g,'&quot;')}">♫ <span>${String(p.title||p.playlist_id).replace(/[&<>]/g,'')}</span></a>`).join('')||'<span class="app-nav-title">No saved playlists</span>'};let cached;try{cached=JSON.parse(sessionStorage.getItem(key)||'null')}catch(_){}if(cached?.data){render(cached.data)}if(!cached||Date.now()-Number(cached.time)>60000){fetch('/api/media/playlists').then(r=>r.json()).then(d=>{sessionStorage.setItem(key,JSON.stringify({time:Date.now(),data:d}));render(d)}).catch(()=>{})}})();
+</script>

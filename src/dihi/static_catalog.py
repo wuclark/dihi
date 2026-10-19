@@ -92,10 +92,11 @@ input{width:min(600px,100%);padding:10px;font-size:16px}.cards{display:grid;grid
 article,.playlist{background:white;border:1px solid #ddd;border-radius:8px;padding:12px;box-shadow:0 1px 3px #0001}
 article img{width:100%;aspect-ratio:16/9;object-fit:cover;background:#ddd}h1,h2{margin-bottom:6px}
 audio,video{width:100%;margin-top:8px}.meta{color:#666;font-size:.9em}.files{margin-top:8px;display:flex;gap:8px;flex-wrap:wrap}
-a{color:#0645ad}.playlist{margin:6px 0}.playlist summary{cursor:pointer}.empty{color:#666}"""
+a{color:#0645ad}.playlist{margin:6px 0}.playlist summary{cursor:pointer}.missing{color:#888}.empty{color:#666}"""
 
 
 JS = r'''const data=window.CATALOG;
+const downloaded=new Set(data.cards.map(x=>x.video_id));
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const files=(items,exts)=>(items||[]).filter(x=>exts.includes(x.extension));
 function render(q=''){
@@ -111,7 +112,7 @@ function render(q=''){
     return `<article id="${esc(x.video_id)}">${image}<h3>${esc(x.title)}</h3><div class="meta">${esc(x.artist||x.uploader)} · ${esc(x.date||'')}</div>${video}${audio}<div class="files">${links}</div><div class="meta">${esc(x.video_id)}</div></article>`;
   }).join('')||'<p class="empty">No matching videos.</p>';
 }
-document.querySelector('#playlists').innerHTML=data.playlists.map(p=>`<details class="playlist"><summary>${esc(p.title)} (${p.members.length})</summary>${p.members.map(m=>`<a href="#${esc(m.video_id)}">${esc(m.playlist_index||'')} ${esc(m.title)}</a>`).join('<br>')}</details>`).join('')||'<p class="empty">No playlists.</p>';
+document.querySelector('#playlists').innerHTML=data.playlists.map(p=>{const available=p.members.filter(m=>downloaded.has(m.video_id)).length;return `<details class="playlist"><summary>${esc(p.title)} (${available}/${p.members.length} downloaded)</summary>${p.members.map(m=>downloaded.has(m.video_id)?`<a href="#${esc(m.video_id)}">${esc(m.playlist_index||'')} ${esc(m.title)} · Downloaded</a>`:`<span class="missing">${esc(m.playlist_index||'')} ${esc(m.title)} · Missing</span>`).join('<br>')}</details>`}).join('')||'<p class="empty">No playlists.</p>';
 document.querySelector('#search').addEventListener('input',e=>render(e.target.value));render();'''
 
 

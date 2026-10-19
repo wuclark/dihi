@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Optional, Set
 from urllib.parse import quote
 
-from flask import Flask, Response, abort, jsonify, render_template, request, send_file
+from flask import Flask, Response, abort, jsonify, make_response, render_template, request, send_file
 from flask_cors import CORS
 
 mimetypes.add_type("video/x-matroska", ".mkv")
@@ -28,6 +28,7 @@ mimetypes.add_type("audio/opus", ".opus")
 
 import getvidyt  # must be importable in this environment
 import catalog
+from library_helpers import clean_display_title, human_date
 
 app = Flask(__name__)
 CORS(app)  # Allow all origins
@@ -149,6 +150,42 @@ def _save_playlist_metadata(playlist_id: str, title: str, webpage_url: str,
     temporary = path.with_name(f".{path.name}.tmp")
     temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     temporary.replace(path)
+
+
+def _fast_playlist_snapshot(playlist_id: str) -> tuple[dict, list[dict]] | None:
+    """Read saved playlist membership without waiting on the catalog writer."""
+    path = PLAYLIST_METADATA_DIR / f"{playlist_id}.info.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    entries = payload.get("entries") or []
+    if not isinstance(entries, list):
+        entries = []
+    members = [entry for entry in entries if isinstance(entry, dict) and entry.get("video_id")]
+    return ({"playlist_id": playlist_id, "title": payload.get("title") or playlist_id,
+             "webpage_url": payload.get("webpage_url"), "updated_at": payload.get("saved_at")}, members)
+
+
+def _fast_catalog_videos() -> dict[str, dict]:
+    """Best-effort catalog enrichment with a sub-second lock wait."""
+    try:
+        with sqlite3.connect(CATALOG_DB, timeout=0.25) as db:
+            rows = db.execute("SELECT video_id, title, files_json FROM videos ORDER BY CASE source_root WHEN 'merged' THEN 0 WHEN 'legacy' THEN 1 ELSE 2 END").fetchall()
+    except (sqlite3.Error, OSError):
+        return {}
+    videos = {}
+    for video_id, title, raw_files in rows:
+        if video_id in videos:
+            continue
+        try:
+            files = catalog._slim_files(json.loads(raw_files or "{}"))
+        except (TypeError, ValueError):
+            files = {}
+        videos[video_id] = {"video_id": video_id, "title": title or video_id, "files": files}
+    return videos
 
 
 def _recover_playlist_members_from_media(playlist_id: str) -> tuple[str, str, list[dict]] | None:
@@ -448,7 +485,19 @@ def _download_status_snapshot() -> dict:
     active_videos = [entry for entry in videos if entry["active"]]
     active_playlists = [entry for entry in playlists if entry["active"]]
     remaining_videos = len(active_videos)
-    queue = _queue_summary_from_active(remaining_videos, len(active_playlists))
+    remaining_playlists = len(active_playlists)
+    pending_videos = pending_playlists = 0
+    try:
+        persisted = catalog.queue_items(CATALOG_DB, 2000)
+        pending_videos = sum(1 for item in persisted if item["kind"] == "video" and item["status"] in {"running", "pending", "paused"})
+        pending_playlists = sum(1 for item in persisted if item["kind"] == "playlist" and item["status"] in {"running", "pending", "paused"})
+        remaining_videos = max(remaining_videos, pending_videos)
+        remaining_playlists = max(remaining_playlists, pending_playlists)
+    except (sqlite3.Error, OSError, ValueError):
+        pass
+    queue = _queue_summary_from_active(remaining_videos, remaining_playlists)
+    queue["pending_videos"] = max(0, pending_videos - len(active_videos))
+    queue["pending_playlists"] = max(0, pending_playlists - len(active_playlists))
     return {
         "ok": True,
         "active": active,
@@ -459,7 +508,7 @@ def _download_status_snapshot() -> dict:
         "counts": {
             "active": len(active),
             "recent": len(recent),
-            "active_videos": remaining_videos,
+            "active_videos": len(active_videos),
             "active_playlists": len(active_playlists),
             "max_videos": _queue_limit("video"),
             "max_playlists": _queue_limit("playlist"),
@@ -1525,7 +1574,9 @@ def downloaded_page():
 
 @app.get("/catalog")
 def catalog_page():
-    return render_template("catalog.html")
+    response = make_response(render_template("catalog.html"))
+    response.headers["Content-Language"] = "en"
+    return response
 
 
 @app.get("/library-export")
@@ -1935,6 +1986,7 @@ def api_docs_page():
         ("GET", "/api/media/details/<channel_id>/<video_id>", "Return files and metadata"),
         ("GET", "/api/media/playlists", "List indexed playlists"),
         ("GET", "/api/media/playlists/<playlist_id>", "Return playlist members"),
+        ("POST", "/api/media/playlists/<playlist_id>/add", "Add an indexed video to a saved playlist"),
         ("POST", "/api/media/playlists/snapshot", "Save browser-captured playlist members"),
         ("DELETE", "/api/media/playlists/<playlist_id>", "Remove a local snapshot descriptor without deleting media"),
         ("GET", "/api/media/playlists/<playlist_id>.m3u?mode=video|audio", "Export a VLC playlist"),
@@ -2075,7 +2127,7 @@ def api_media_catalog():
                 title, artist, album, uploader, upload_date, duration = row[3:9]
         else:
             title, artist, album, uploader, upload_date, duration = row[3:9]
-        items.append({"video_id": video_id, "source_root": source_root, "channel_id": channel_id, "title": title, "artist": artist, "album": album, "uploader": uploader, "upload_date": upload_date, "duration": duration, "files": files, "formats": formats, "failure_reason": row[11] or ""})
+        items.append({"video_id": video_id, "source_root": source_root, "channel_id": channel_id, "title": title, "display_title": clean_display_title(title, artist or uploader), "artist": artist, "album": album, "uploader": uploader, "upload_date": upload_date, "human_date": human_date(upload_date), "duration": duration, "files": files, "formats": formats, "failure_reason": row[11] or ""})
     return jsonify(items=items, page=page, per_page=per_page, total=total, pages=(total + per_page - 1) // per_page)
 
 
@@ -2289,16 +2341,61 @@ def api_media_playlist_delete(playlist_id: str):
 def api_media_playlist(playlist_id: str):
     if not PLAYLIST_ID_RE.match(playlist_id):
         return jsonify(error="invalid playlist id"), 400
-    playlist_rows = catalog.playlists(CATALOG_DB)
-    playlist = next((item for item in playlist_rows if item["playlist_id"] == playlist_id), None)
+    snapshot = _fast_playlist_snapshot(playlist_id)
+    playlist = snapshot[0] if snapshot else None
+    snapshot_members = snapshot[1] if snapshot else []
+    if playlist is None:
+        try:
+            with sqlite3.connect(CATALOG_DB, timeout=0.25) as db:
+                row = db.execute("SELECT playlist_id, title, webpage_url, updated_at FROM playlists WHERE playlist_id = ?", (playlist_id,)).fetchone()
+                rows = db.execute("SELECT video_id, playlist_index, title, video_url FROM playlist_videos WHERE playlist_id = ? ORDER BY playlist_index IS NULL, playlist_index, video_id", (playlist_id,)).fetchall()
+            if row:
+                playlist = {"playlist_id": row[0], "title": row[1], "webpage_url": row[2], "updated_at": row[3]}
+                snapshot_members = [{"video_id": item[0], "playlist_index": item[1], "title": item[2], "video_url": item[3]} for item in rows]
+        except (sqlite3.Error, OSError):
+            playlist = None
     if not playlist:
         return jsonify(error="playlist not found"), 404
-    videos_by_id = {item["video_id"]: item for item in _catalog_library_or_scan()}
+    videos_by_id = _fast_catalog_videos()
     members = []
-    for member in catalog.playlist_video_ids(CATALOG_DB, playlist_id):
+    for member in snapshot_members:
         video = videos_by_id.get(member["video_id"])
         members.append({**member, "video": video})
     return jsonify(playlist=playlist, videos=members)
+
+
+@app.post("/api/media/playlists/<string:playlist_id>/add")
+def api_media_playlist_add(playlist_id: str):
+    """Add one already-indexed video to a saved playlist without downloading it."""
+    if not PLAYLIST_ID_RE.match(playlist_id):
+        return jsonify(ok=False, error="invalid playlist id"), 400
+    payload = request.get_json(silent=True) or {}
+    video_id = _normalize_id(str(payload.get("video_id") or payload.get("id") or ""))
+    if not video_id:
+        return jsonify(ok=False, error="invalid video id"), 400
+    playlist = next((item for item in catalog.playlists(CATALOG_DB)
+                     if item["playlist_id"] == playlist_id), None)
+    if not playlist:
+        return jsonify(ok=False, error="playlist not found"), 404
+    members = catalog.playlist_video_ids(CATALOG_DB, playlist_id)
+    if any(member["video_id"] == video_id for member in members):
+        return jsonify(ok=True, playlist_id=playlist_id, video_id=video_id,
+                       already_present=True, members=len(members))
+    video = next((item for item in _catalog_library_or_scan()
+                  if item.get("video_id") == video_id), None) or {}
+    member = {
+        "video_id": video_id,
+        "playlist_index": len(members) + 1,
+        "title": video.get("title") or video_id,
+        "video_url": f"https://www.youtube.com/watch?v={video_id}",
+    }
+    members.append(member)
+    webpage_url = playlist.get("webpage_url") or f"https://www.youtube.com/playlist?list={playlist_id}"
+    _save_playlist_metadata(playlist_id, playlist.get("title") or playlist_id, webpage_url, members)
+    catalog.record_playlist_membership(CATALOG_DB, playlist_id, playlist.get("title") or playlist_id,
+                                       webpage_url, members)
+    return jsonify(ok=True, playlist_id=playlist_id, video_id=video_id,
+                   already_present=False, members=len(members))
 
 
 @app.post("/api/media/playlists/<string:playlist_id>/refresh")
@@ -2316,15 +2413,33 @@ def api_media_playlist_refresh(playlist_id: str):
 
 @app.post("/api/media/playlists/<string:playlist_id>/finish")
 def api_media_playlist_finish(playlist_id: str):
-    """Start the playlist worker; it downloads incomplete members sequentially."""
+    """Queue each incomplete member independently so one unavailable video cannot block the playlist."""
     if not PLAYLIST_ID_RE.match(playlist_id):
         return jsonify(error="invalid playlist id"), 400
     if not any(item["playlist_id"] == playlist_id for item in catalog.playlists(CATALOG_DB)):
         return jsonify(error="playlist not found"), 404
-    item_id, already = _enqueue_target(playlist_id, "playlist", status="pending")
-    _queue_wakeup.set()
-    return jsonify(ok=True, playlist_id=playlist_id, queued=0 if already else 1,
-                   already_queued=already, queue_id=item_id)
+    members = catalog.playlist_video_ids(CATALOG_DB, playlist_id)
+    try:
+        cards, _total = catalog.library_cards(CATALOG_DB)
+    except (sqlite3.Error, OSError, ValueError):
+        cards = []
+    playable = {
+        card["video_id"] for card in cards
+        if card.get("files", {}).get("video") and card.get("files", {}).get("audio")
+    }
+    queued = already = skipped = 0
+    for member in members:
+        video_id = member["video_id"]
+        if video_id in playable:
+            skipped += 1
+            continue
+        _item_id, was_already = _enqueue_target(video_id, "video", status="pending")
+        queued += int(not was_already)
+        already += int(was_already)
+    if members:
+        _queue_wakeup.set()
+    return jsonify(ok=True, playlist_id=playlist_id, members=len(members),
+                   queued=queued, already_queued=already, skipped_complete=skipped)
 
 
 @app.get("/api/media/playlists/<string:playlist_id>.m3u")
@@ -2653,14 +2768,17 @@ def api_youtube_retry(video_id: str):
 
 @app.get("/api/media/failures")
 def api_media_failures():
-    with sqlite3.connect(CATALOG_DB) as db:
-        db.executescript(catalog.SCHEMA)
-        rows = db.execute("""SELECT latest.video_id,latest.status,latest.reason,latest.raw_error,latest.retryable,latest.started_at,latest.finished_at
-          FROM (SELECT a.*, ROW_NUMBER() OVER (PARTITION BY a.video_id ORDER BY a.finished_at DESC) rn FROM download_attempts a)
-          AS latest
-          WHERE latest.rn=1 AND latest.status='failed' AND NOT EXISTS
-          (SELECT 1 FROM archive_entries e WHERE e.video_id=latest.video_id AND e.status='complete')
-          ORDER BY latest.finished_at DESC""").fetchall()
+    try:
+        with sqlite3.connect(CATALOG_DB, timeout=30) as db:
+            db.executescript(catalog.SCHEMA)
+            rows = db.execute("""SELECT latest.video_id,latest.status,latest.reason,latest.raw_error,latest.retryable,latest.started_at,latest.finished_at
+              FROM (SELECT a.*, ROW_NUMBER() OVER (PARTITION BY a.video_id ORDER BY a.finished_at DESC) rn FROM download_attempts a)
+              AS latest
+              WHERE latest.rn=1 AND latest.status='failed' AND NOT EXISTS
+              (SELECT 1 FROM archive_entries e WHERE e.video_id=latest.video_id AND e.status='complete')
+              ORDER BY latest.finished_at DESC""").fetchall()
+    except sqlite3.OperationalError:
+        return jsonify(error="download history is temporarily busy; try again", failures=[]), 503
     return jsonify(failures=[{"video_id":r[0],"status":r[1],"reason":r[2],"error":r[3],"retryable":bool(r[4]),"started_at":r[5],"finished_at":r[6],"age_restricted":r[2]=="age_restricted","authenticated":str(r[3] or '').startswith('[cookies]')} for r in rows])
 
 
@@ -2671,6 +2789,8 @@ def api_media_download_history():
         rows = catalog.download_attempts(CATALOG_DB, request.args.get("limit", 500))
     except (TypeError, ValueError):
         return jsonify(error="limit must be a number"), 400
+    except sqlite3.OperationalError:
+        return jsonify(error="download history is temporarily busy; try again", attempts=[]), 503
     return jsonify(attempts=rows)
 
 

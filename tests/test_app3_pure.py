@@ -614,7 +614,8 @@ class TestFallbackVisibility:
 # ---------------------------------------------------------------------------
 
 class TestDownloadStatusSnapshot:
-    def test_reports_active_and_recent_video_downloads(self):
+    def test_reports_active_and_recent_video_downloads(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(app3, "CATALOG_DB", tmp_path / "catalog.db")
         now = time.time()
         app3._active_downloads.add("dQw4w9WgXcQ")
         app3._download_started_at["dQw4w9WgXcQ"] = now - 15
@@ -649,7 +650,8 @@ class TestDownloadStatusSnapshot:
         assert snapshot["recent"][0]["kind"] == "playlist"
         assert snapshot["recent"][0]["status"] == "failed"
 
-    def test_expires_old_recent_results(self):
+    def test_expires_old_recent_results(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(app3, "CATALOG_DB", tmp_path / "catalog.db")
         now = time.time()
         app3._download_history["oldresult1"] = "completed"
         app3._download_history_timestamps["oldresult1"] = now - (_RESULT_TTL + 1)

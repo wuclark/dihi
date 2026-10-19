@@ -149,7 +149,7 @@ def refresh(merged_dir: Path | list[Path], database: Path, archive: Path | None 
     database.parent.mkdir(parents=True, exist_ok=True)
     count = 0
     known_roots: set[str] = set()
-    with sqlite3.connect(database) as db:
+    with sqlite3.connect(database, timeout=30) as db:
         db.executescript(SCHEMA)
         if "source_root" not in {row[1] for row in db.execute("PRAGMA table_info(videos)")}:  # rebuild old schema
             db.execute("DROP TABLE IF EXISTS videos")
@@ -568,7 +568,7 @@ def _ensure_queue_columns(db: sqlite3.Connection) -> None:
 
 def playlists(database: Path) -> list[dict[str, Any]]:
     """Return playlists with total and locally playable member counts."""
-    with sqlite3.connect(database) as db:
+    with sqlite3.connect(database, timeout=120) as db:
         db.executescript(SCHEMA)
         _ensure_queue_columns(db)
         rows = db.execute(
@@ -678,7 +678,7 @@ def queue_add(database: Path, target: str, kind: str, scheduled_at: float | None
               cookies_browser: str | None = None, status: str = "pending") -> int:
     """Persist a pending queue item and return its id."""
     now = time.time()
-    with sqlite3.connect(database) as db:
+    with sqlite3.connect(database, timeout=120) as db:
         db.executescript(SCHEMA)
         _ensure_queue_columns(db)
         db.execute(
@@ -692,7 +692,7 @@ def queue_add(database: Path, target: str, kind: str, scheduled_at: float | None
 
 
 def queue_items(database: Path, limit: int = 500) -> list[dict[str, Any]]:
-    with sqlite3.connect(database) as db:
+    with sqlite3.connect(database, timeout=120) as db:
         db.executescript(SCHEMA)
         _ensure_queue_columns(db)
         rows = db.execute(
@@ -710,7 +710,7 @@ def queue_set_status(database: Path, item_id: int, status: str, **fields: Any) -
     updates = {key: value for key, value in fields.items() if key in allowed}
     updates["status"] = status
     assignments = ", ".join(f"{key} = ?" for key in updates)
-    with sqlite3.connect(database) as db:
+    with sqlite3.connect(database, timeout=120) as db:
         db.executescript(SCHEMA)
         _ensure_queue_columns(db)
         try:
@@ -740,7 +740,7 @@ def queue_set_kind(database: Path, item_id: int, kind: str) -> None:
     """Repair a queued target whose kind was inferred incorrectly."""
     if kind not in {"video", "playlist"}:
         raise ValueError("invalid queue kind")
-    with sqlite3.connect(database) as db:
+    with sqlite3.connect(database, timeout=120) as db:
         db.executescript(SCHEMA)
         db.execute("UPDATE download_queue SET kind = ? WHERE id = ?", (kind, item_id))
         db.commit()
@@ -847,8 +847,7 @@ def backup_settings_to_file(database: Path, settings_file: Path) -> None:
 def download_attempts(database: Path, limit: int = 500) -> list[dict[str, Any]]:
     """Return the durable download attempt history, newest first."""
     database.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(database) as db:
-        db.executescript(SCHEMA)
+    with sqlite3.connect(database, timeout=30) as db:
         rows = db.execute(
             """SELECT a.id, a.video_id, a.status, a.reason, a.raw_error,
                       a.retryable, a.started_at, a.finished_at,

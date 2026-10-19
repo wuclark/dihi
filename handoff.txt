@@ -1,0 +1,173 @@
+DIHI handoff notes
+===================
+
+Date: 2026-10-19
+
+Current continuation
+--------------------
+
+- The Library redesign remains an uncommitted worktree change.
+- The template had duplicated JavaScript generations; redundant listener
+  wiring was removed and the catalog-backed loader is the active path.
+- `AGENTS.md` now requires this handoff file to stay current during ongoing
+  work and agent handoffs.
+- Verification before this continuation: `venv/bin/pytest` passed 179 tests
+  with 3 Docker smoke tests skipped. A Node syntax check using process
+  substitution was invalid because Node cannot read that procfs path; rerun
+  syntax validation with a temporary file if needed.
+- Focused verification after the continuation: `git diff --check` passed and
+  the focused helper, HTTP, and static-catalog tests passed (17 passed).
+- Added an HTTP regression test covering the new playlist-add endpoint,
+  including persistence and idempotent duplicate adds; `tests/test_app3_http.py`
+  now passes 15 tests.
+- Extracted the executable Library frontend into
+  `src/dihi/static/js/library.js`; removed the former inert inline migration
+  block from `index.html`. `node --check` passes for the module.
+- Replaced the Library's browser `prompt()` playlist picker with an accessible
+  native `<dialog>` and playlist `<select>`; cancel safely leaves the video
+  unchanged.
+- Added a Library paste-and-go download control accepting YouTube URLs or IDs;
+  it posts immediate queue jobs and reports start, duplicate, or error status
+  inline.
+- Hardened paste-and-go against HTML error responses, replacing the raw JSON
+  parse exception with a useful refresh/service message and cache-busted the
+  Library module URL.
+- Playlist detail loading now has an HTTP error/15-second timeout path instead
+  of remaining on “Loading videos…” forever. Playlist cards show their saved/
+  updated date, list unavailable members, and label the action as queuing
+  missing downloads so the page does not imply it waits for completion.
+- Playlist finishing now queues each missing member as an independent video
+  job and skips complete members; one unavailable video cannot block the rest.
+  The HTTP suite covers this behavior.
+- Playlist “Show videos” no longer calls the filesystem-scan fallback; it reads
+  indexed SQLite cards directly and returns all membership rows immediately,
+  leaving local details blank until the background catalog refresh catches up.
+  A regression test prevents the endpoint from reintroducing a full scan.
+- After the first fix still hit SQLite-lock timeouts, the endpoint now prefers
+  the saved playlist descriptor JSON and uses a 250ms best-effort catalog
+  enrichment query. It can return membership rows even while the catalog
+  writer is locked.
+- Hardened Downloads failure/history loading against the same lock condition:
+  history reads wait up to 30 seconds, failures return a JSON 503 when still
+  busy, and the UI reports HTML/non-JSON responses clearly instead of throwing
+  `Unexpected token '<'`.
+- Corrected the Downloads queue summary to count persistent running, pending,
+  and paused video/playlist rows instead of only in-memory active workers;
+  active concurrency counters remain separate. Queue status tests pass.
+- Fixed download-history HTTP 500s during catalog locks: history reads no
+  longer execute schema migrations, use the long busy timeout, and return a
+  JSON 503 when still unavailable. Focused HTTP/catalog tests pass (29).
+- Docker logs exposed transient `database is locked` errors while the startup
+  catalog scan held SQLite's write lock. Queue add/list/status/kind operations
+  now use a 120-second busy timeout so the scheduler waits through that scan.
+  Queue/catalog verification: 77 tests passed.
+- Full verification after the extraction: `venv/bin/pytest` passed 180 tests
+  with 3 Docker smoke tests skipped; `git diff --check` passed.
+- Focused verification after the picker change: `node --check` passed and 17
+  HTTP/helper tests passed.
+- The Node syntax-check attempt remains unavailable because this Node build
+  cannot read JavaScript supplied through `/dev/stdin` or process substitution;
+  no repository file was created for that check.
+
+Docker checkpoint
+-----------------
+
+- The legacy inline Library script has been removed; the external module is the
+  only Library frontend script in the template.
+- Rebuilt the Compose image and recreated the actual `dihi` container.
+- `make test-docker` passed all 3 live smoke tests in 49.59 seconds:
+  health/library, catalog/extension download, and a catalog-backed media
+  route.
+- `node --check src/dihi/static/js/library.js` and `git diff --check` pass.
+- This checkpoint is ready to commit; no runtime data is intended for staging.
+
+Current storage situation
+--------------------------
+
+DIHI runs in Docker under WSL2 on Windows. The repository currently stores
+runtime data under ./data. Current data size is approximately 16 GB:
+
+- data/media-strict: about 14 GB
+- data/media-fallback: about 849 MB
+- data/bestfallback: about 536 MB
+- data/media-catalog.db: about 222 MB
+
+The Makefile now provides:
+
+- make data-size
+- make data-migrate DEST_DATA_DIR=/mnt/e/dihi-data
+
+data-migrate copies the current data tree without deleting the source. Stop
+Docker before migrating:
+
+    docker compose down
+    make data-migrate DEST_DATA_DIR=/mnt/e/dihi-data
+
+Then configure the destination:
+
+    cp .env.example .env
+    sed -i 's#DIHI_DATA_DIR=./data#DIHI_DATA_DIR=/mnt/e/dihi-data#' .env
+    make data
+    make data-size
+    docker compose up -d --build
+
+docker-compose.yaml uses ${DIHI_DATA_DIR:-./data} for all persistent mounts.
+Make also loads .env so make data initializes the configured destination.
+.env.example is tracked; the real .env is ignored.
+
+WSL USB diagnosis
+-----------------
+
+The current WSL environment has /mnt/c mounted to the Windows C: drive, but
+/mnt/e is only an empty directory and is not the USB drive. `df -h /mnt/e`
+currently reports the WSL root filesystem, which proves the USB is not mounted
+there.
+
+In Windows PowerShell, identify the USB:
+
+    Get-Volume | Format-Table DriveLetter, FileSystem, SizeRemaining, Size
+
+If it has no drive letter, assign one through Disk Management. Then restart
+WSL from PowerShell:
+
+    wsl --shutdown
+
+Reopen WSL and verify:
+
+    df -h /mnt/e
+    ls -la /mnt/e
+
+The USB should use NTFS if possible. FAT32 has a 4 GB per-file limit and is
+not suitable for potentially large video files. Keep the USB connected while
+Docker is running.
+
+Important storage caveat
+------------------------
+
+Moving DIHI's bind-mounted data does not move Docker Desktop's own image/build
+cache. Moving the Docker disk image is a separate Docker Desktop operation.
+USB/DrvFs performance and whether the SQLite catalog/archive should remain on
+native WSL storage are still roadmap items.
+
+Recent code fixes
+-----------------
+
+- Queue recovery now handles duplicate status rows without scheduler loops.
+- Playlist per-song Download promotes paused queue items to pending.
+- Download completion checks fresh live media files before the catalog.
+- Incomplete archived videos bypass stale archive entries on retry.
+- Failed/incomplete archive IDs are removed so they can be retried.
+- Successful archive-bypassing downloads restore their archive entry.
+
+Tests last run: `venv/bin/pytest` passed 179 tests with 3 Docker smoke tests
+skipped; `git diff --check` passed.
+
+Repository notes
+----------------
+
+- Active server: src/dihi/app3.py
+- Active downloader: src/dihi/getvidyt.py
+- Docker Compose file: docker-compose.yaml
+- Runtime data is ignored and should not be committed.
+- There are existing uncommitted code/documentation changes in the working
+  tree; preserve them when continuing.
