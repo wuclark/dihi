@@ -56,7 +56,9 @@ def test_health_ok(client):
 
 def test_queue_start_all_promotes_paused_items(client, env, monkeypatch):
     monkeypatch.setattr(app3.catalog, "queue_start_all", lambda _database: 3)
-    monkeypatch.setattr(app3, "_queue_wakeup", type("NoopEvent", (), {"set": lambda self: None})())
+    monkeypatch.setattr(app3, "_queue_wakeup", type(
+        "NoopEvent", (), {"set": lambda self: None, "clear": lambda self: None}
+    )())
 
     response = client.post("/api/queue/start-all")
 
@@ -249,7 +251,9 @@ def test_playlist_finish_queues_members_independently(client, env, monkeypatch):
     )
     queued = []
     monkeypatch.setattr(app3, "_enqueue_target", lambda target, kind, **kwargs: (queued.append((target, kind)) or (len(queued), False)))
-    monkeypatch.setattr(app3, "_queue_wakeup", type("NoopEvent", (), {"set": lambda self: None})())
+    monkeypatch.setattr(app3, "_queue_wakeup", type(
+        "NoopEvent", (), {"set": lambda self: None, "clear": lambda self: None}
+    )())
 
     response = client.post("/api/media/playlists/PLtestplaylist01/finish")
 

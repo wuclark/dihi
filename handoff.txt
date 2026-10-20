@@ -1,20 +1,20 @@
 DIHI handoff notes
 ===================
 
-Date: 2026-10-19
+Date: 2026-10-20
 
 Current continuation
 --------------------
 
-- The Library redesign remains an uncommitted worktree change.
+- The Library redesign is committed; the current worktree has only the
+  housekeeping edits from this continuation pending local commit.
 - The template had duplicated JavaScript generations; redundant listener
   wiring was removed and the catalog-backed loader is the active path.
 - `AGENTS.md` now requires this handoff file to stay current during ongoing
   work and agent handoffs.
-- Verification before this continuation: `venv/bin/pytest` passed 179 tests
-  with 3 Docker smoke tests skipped. A Node syntax check using process
-  substitution was invalid because Node cannot read that procfs path; rerun
-  syntax validation with a temporary file if needed.
+- Latest verification: `venv/bin/pytest` passed 182 tests with 3 Docker smoke
+  tests skipped. The queue-event test double now implements both `set()` and
+  `clear()`, so the suite completes without the previous thread warning.
 - Focused verification after the continuation: `git diff --check` passed and
   the focused helper, HTTP, and static-catalog tests passed (17 passed).
 - Added an HTTP regression test covering the new playlist-add endpoint,
@@ -67,7 +67,8 @@ Current continuation
   now use a 120-second busy timeout so the scheduler waits through that scan.
   Queue/catalog verification: 77 tests passed.
 - Full verification after the extraction: `venv/bin/pytest` passed 180 tests
-  with 3 Docker smoke tests skipped; `git diff --check` passed.
+  with 3 Docker smoke tests skipped; `git diff --check` passed. Later test
+  additions brought the current total to 182.
 - Focused verification after the picker change: `node --check` passed and 17
   HTTP/helper tests passed.
 - The Node syntax-check attempt remains unavailable because this Node build
@@ -256,7 +257,7 @@ Recent code fixes
 - Failed/incomplete archive IDs are removed so they can be retried.
 - Successful archive-bypassing downloads restore their archive entry.
 
-Tests last run: `venv/bin/pytest` passed 179 tests with 3 Docker smoke tests
+Tests last run: `venv/bin/pytest` passed 182 tests with 3 Docker smoke tests
 skipped; `git diff --check` passed.
 
 Repository notes
@@ -266,8 +267,8 @@ Repository notes
 - Active downloader: src/dihi/getvidyt.py
 - Docker Compose file: docker-compose.yaml
 - Runtime data is ignored and should not be committed.
-- There are existing uncommitted code/documentation changes in the working
-  tree; preserve them when continuing.
+- The worktree had only these housekeeping edits at the last handoff update;
+  preserve unrelated user changes if they appear in a future continuation.
 
 Startup acceleration
 --------------------

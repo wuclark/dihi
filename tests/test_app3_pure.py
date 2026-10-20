@@ -136,7 +136,9 @@ def test_queue_prefers_playlist_id_when_watch_url_has_both(monkeypatch):
 def test_immediate_video_request_promotes_existing_paused_item(monkeypatch, tmp_path):
     db = tmp_path / "catalog.db"
     monkeypatch.setattr(app3, "CATALOG_DB", db)
-    monkeypatch.setattr(app3, "_queue_wakeup", type("NoopEvent", (), {"set": lambda self: None})())
+    monkeypatch.setattr(app3, "_queue_wakeup", type(
+        "NoopEvent", (), {"set": lambda self: None, "clear": lambda self: None}
+    )())
     paused_id = app3.catalog.queue_add(db, "dQw4w9WgXcQ", "video", status="paused")
 
     item_id, already = app3._enqueue_target("dQw4w9WgXcQ", "video", status="pending")
