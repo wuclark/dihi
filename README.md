@@ -494,6 +494,8 @@ player. The live download dashboard is available at `/downloads` under Manage
 → Downloads. The dense catalog/status table remains at `/catalog` as Catalog /
 admin table, with its Rebuild catalog action on that page.
 
+The current application release is `1.1.0`.
+
 The Library JavaScript uses a manually incremented query-string cache-buster
 (currently `library.js?v=9`). Increment the version when changing
 `src/dihi/static/js/library.js` so browsers do not reuse stale cached code.
