@@ -51,7 +51,10 @@ def test_catalog_and_extension_download():
 
 def test_media_route_serves_a_catalog_file():
     _, _, body = get("/api/media/catalog?page=1&per_page=1")
-    item = json.loads(body)["items"][0]
+    items = json.loads(body).get("items") or []
+    if not items:
+        pytest.skip("catalog is empty; no local media file to serve")
+    item = items[0]
     files = item.get("files") or {}
     candidate = next((f for f in files.values() if f.get("kind") in {"video", "audio", "thumbnail"}), None)
     if candidate is None:

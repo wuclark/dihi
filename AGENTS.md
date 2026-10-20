@@ -68,6 +68,7 @@ make setup
 make dev-install
 make pot-provider
 make docker-up
+make usb-mount USB_DRIVE=D:
 make docker-down
 make docker-logs
 make test-docker
@@ -81,7 +82,7 @@ make git-commit-push MSG="Describe the change"
 
 `make help` works before setup and is the default Make target. `make setup` installs the pinned yt-dlp and PO Token plugin in the venv and writes `venv/.setup-complete` only after all installs succeed; a failed pip run remains retryable. `make dev-install` installs the CLI entry point. Both use venv executables directly. To activate the venv in your shell, run `source venv/bin/activate` yourself (or use `make startup` to display that command). `make <video ID or URL>` starts the Docker PO Token service before downloading unless `DIHI_PO_TOKEN_PROVIDER_URL` points to another provider. `make pot-provider` starts it explicitly for direct CLI calls or server-triggered downloads. `make run` starts the active server in `src/dihi/app3.py`.
 
-`make docker-up` initializes bind-mount data files under `DIHI_DATA_DIR` (from `.env`, default `./data`), then builds and starts the dihi server and PO Token provider. `make docker-down` stops the Compose services; `make docker-logs` follows their logs. `make git-add` intentionally excludes local runtime data: everything under `data/`.
+`make docker-up` verifies the configured data root before initializing bind-mount data files, then builds and starts the dihi server and PO Token provider. For a Windows USB data root, `make usb-mount USB_DRIVE=D:` mounts it at `/mnt/usbdocker1`; `docker-up` fails with a recovery command if that mount is unavailable. `make docker-down` stops the Compose services; `make docker-logs` follows their logs. `make git-add` intentionally excludes local runtime data: everything under `data/`.
 
 `make data-size` reports total and per-directory runtime data usage. After
 stopping Compose, `make data-migrate DEST_DATA_DIR=/mnt/usbdocker1/docker/dihi/data` copies
@@ -161,7 +162,7 @@ Core UI/media routes:
 - Catalog responses re-read the live media directory when an indexed row points to a stale source, keeping thumbnail and media URLs usable before the persistent catalog is rebuilt.
 - `GET /api/media/cleanup/tasks/<task_id>` reports cleanup action phase, progress, completion, or error
 - Cleanup UI actions show live progress and a completion notification; bulk move/delete operations remain confirmation-gated.
-- The Tools page includes a confirmation-free filesystem rescan button that refreshes catalog paths and links without deleting media.
+- The Tools page includes startup timing history, a confirmation-free filesystem rescan button that refreshes catalog paths and links without deleting media.
 - `POST /api/media/cleanup/verify` starts a full media verification pass cached by file MD5
 - `POST /api/media/cleanup/retry-missing` queues incomplete media while skipping permanent failures and complete files
 - Catalog rows with missing metadata, formats, thumbnails, descriptions, or subtitles/lyrics expose a “Retry missing files” action; sidecar retries bypass the download archive when needed.
@@ -169,13 +170,18 @@ Core UI/media routes:
 - `GET /api/media/failures` lists recorded failed download attempts and reasons
 - `GET /api/media/download-history` lists persistent completed and failed download attempts
 - `GET /api/system/status` reports disk capacity and safe cookie-file diagnostics without cookie values
+- `GET /api/system/cache-status` reports cache coverage and refresh state for expensive endpoint groups
+- `GET /api/system/startup-history` returns persisted cold/full-scan and warm/cache-hit startup timings shown on `/status`
 - `GET /api/downloads/status` returns active video/playlist downloads, recent completed/failed results, queue summary fields including `Queue Empty` when idle, and yt-dlp progress details (`phase`, `percent`, `filename`, and recent `logs`)
 - `GET /api/queue` lists persistent pending, running, completed, failed, and cancelled queue items
 - `POST /api/queue` adds a video or playlist to the queue; the default is immediate start, configurable through `/api/settings`
 - `POST /api/queue/<item_id>/start` starts a paused/scheduled queue item immediately
-- `POST /api/queue/<item_id>/cancel` cancels a pending queue item
+- `POST /api/queue/<item_id>/pause` requests a cooperative pause for a running item; video jobs pause after the current file and playlist jobs after the current child video
+- `POST /api/queue/<item_id>/stop` immediately persists a running queue item as paused, then stops active yt-dlp work at the next progress boundary; the live dashboard reports `stopping` during that handoff
+- `POST /api/queue/<item_id>/cancel` cancels a pending/paused item or stops a running item and removes it from the queue
 - Queue listing and scheduling repair old rows that stored playlist IDs as video jobs.
 - `POST /api/queue/start-all` starts all paused queue items
+- `POST /api/queue/clear` removes pending and paused queue items without interrupting active downloads
 - `POST /api/queue/cancel-all` cancels all pending and paused queue items
 - `GET/POST /api/settings` reads or updates the default add behavior (`immediate` or `queue`) and concurrent video/playlist limits
 - `GET /media/<path>` serves downloaded files with conditional/range-capable responses
@@ -277,6 +283,7 @@ Meaning:
 - Metadata, chapters, thumbnails, subtitles, descriptions, info JSON, and format manifests are written when available.
 - `AudioMetadataPostProcessor` can create clean audio copies with embedded metadata.
 - A video is marked complete only when both playable video and audio files exist; the completion check reads the live strict/legacy directory before the catalog so freshly downloaded outputs are recognized, then restores the archive entry after successful archive-bypassing retries. If an archive entry exists without both playable outputs, retries remove that ID from the archive and bypass it so yt-dlp does not skip the repair. Incomplete attempts are persisted as failures with a reason and remain retryable from the catalog, including browser-cookie authentication.
+- Optional yt-dlp postprocessor errors do not trigger a fallback retry when the canonical playable video/audio pair already exists; the worker likewise treats that pair as authoritative completion. This avoids duplicate lower-quality downloads when, for example, thumbnail embedding rejects a kept WebM sidecar.
 - The cleanup report uses `ffprobe` and FFmpeg stream-copy remux checks; the Docker image installs both as part of the `ffmpeg` package. Results are cached per source folder/container during each report.
 - The word cloud keeps lyric vocabulary but filters common URL terms and description credit/promotion boilerplate (such as video, lyrics, director, producer, and subscribe). `/wordcloud` generates only when its Generate button is pressed and shows a spinner/progress state while descriptions are scanned and the layout is arranged.
 - Server-triggered video and playlist downloads call `download_youtube(..., audio_meta=True)`. Playlist downloads preflight entries and invoke the downloader per child video, so fallback is isolated to failed children and successful strict children are not re-downloaded into `data/media-fallback/`.
@@ -287,7 +294,7 @@ Meaning:
 
 ## UI Notes
 
-The web UI is part of `app3.py`, not a separate server yet. It lists the archive (strict `data/media-strict/` first, then legacy `data/media-legacy/`, then `data/media-fallback/` playable entries last), batches thumbnail rendering, supports video/audio playback, exposes VLC URLs, loads per-video details lazily, and includes `/queue` for persistent manual/scheduled downloads. The default add behavior is immediate; changing the queue setting holds new items until manually started. An immediate video request, including a per-song Download button on the playlist page, promotes an existing paused row to pending. Jobs interrupted by a server restart are recovered as paused queue items and do not auto-resume; if an interrupted duplicate collides with an existing paused row, recovery keeps the existing paused item. The queue page's playlist batch tool accepts bare IDs, `playlist <ID>` lines, URLs, and CSV-style watch rows; its preparation button creates missing playlist descriptor JSON files, skips valid existing descriptors, and reports each playlist's progress in the output box. `/playlists` provides named playlist membership, ordered video links, per-video download buttons, browser play-all, and separate VLC video/audio-only M3U files; its Refresh playlist action explicitly re-fetches membership. `/downloads` shows active/recent download status, persistent attempt history, failed-download retry actions, and a remaining queue output. Playlist progress groups each item's video, audio, and metadata files beneath that item's title. `/downloaded` shows the same persistent completed/failed attempt history in a scrollable panel. `/video/<video_id>` shows the saved description collapsed by default, full metadata, every indexed file with size/type, playable video/audio links, and the VLC media URL. The main library restores active/recent queue entries from the server after refresh; its search and sort controls query the catalog server-side so large archives do not need to load and filter the entire catalog in the browser. Library cards show an artist line (true `artist`/`track` music metadata when present, else the uploader/channel name); the sort control includes Artist A–Z and search matches artist, uploader, and track as well as title and IDs. Playlist rows expose child video links and `playlist_index/total` progress as yt-dlp encounters each entry. Queue state changes are also written to the server log, including `Queue Empty` when all active downloads finish.
+The web UI is part of `app3.py`, not a separate server yet. It lists the archive (strict `data/media-strict/` first, then legacy `data/media-legacy/`, then `data/media-fallback/` playable entries last), batches thumbnail rendering, supports video/audio playback, exposes VLC URLs, loads per-video details lazily, and includes `/queue` for persistent manual/scheduled downloads. The default add behavior is immediate; changing the queue setting holds new items until manually started. An immediate video request, including a per-song Download button on the playlist page, promotes an existing paused row to pending. Jobs interrupted by a server restart are recovered as paused queue items and do not auto-resume; if an interrupted duplicate collides with an existing paused row, recovery keeps the existing paused item. Running queue rows can request a cooperative pause: a single video pauses after its current file, while a playlist pauses after its current child video and remains resumable. The queue page's playlist batch tool accepts bare IDs, `playlist <ID>` lines, URLs, and CSV-style watch rows; its preparation button creates missing playlist descriptor JSON files, skips valid existing descriptors, and reports each playlist's progress in the output box. `/playlists` provides named playlist membership, ordered video links, per-video download buttons, browser play-all, and separate VLC video/audio-only M3U files; its Refresh playlist action explicitly re-fetches membership. `/downloads` shows active/recent download status, persistent attempt history, failed-download retry actions, and a remaining queue output. Playlist progress groups each item's video, audio, and metadata files beneath that item's title. `/downloaded` shows the same persistent completed/failed attempt history in a scrollable panel. `/video/<video_id>` shows the saved description collapsed by default, full metadata, every indexed file with size/type, playable video/audio links, and the VLC media URL. The main library restores active/recent queue entries from the server after refresh; its search and sort controls query the catalog server-side so large archives do not need to load and filter the entire catalog in the browser. Library cards show an artist line (true `artist`/`track` music metadata when present, else the uploader/channel name); the sort control includes Artist A–Z and search matches artist, uploader, and track as well as title and IDs. Playlist rows expose child video links and `playlist_index/total` progress as yt-dlp encounters each entry. Queue state changes are also written to the server log, including `Queue Empty` when all active downloads finish.
 All non-library pages use the shared `templates/_header.html` navigation. The library header keeps primary library/download links; `/tools` is the hub for the catalog, tags, word cloud, tag cloud, Edge extension, status, downloaded-history, and library search/sort test tools. `/library-tests` is the dedicated test page with playlist selection by name, generated UI/API links, expected results, and live JSON output. Saved playlist cards show locally available versus total members, such as `9/10 videos`, and incomplete playlists sort first; empty metadata records show `0/0 · no members captured` rather than complete. The saved-playlists page hides `RD...` autogenerated Mix records by default with a browser-persistent toggle; local `SNAP_` snapshots can be removed without deleting downloaded media.
 
 The browser extension (version 1.9.0) tracks per-video YouTube visit counts in `chrome.storage.local`. When enabled, it auto-downloads missing videos after the configured visit threshold and notifies when the automatic request starts. It calls `/api/media/resolve/<video_id>` before posting a download request and skips the request if local media already exists. Resolve is strict-only (ignores `data/media-fallback/`), so fallback copies keep getting upgraded to strict downloads. Counts reset only once the video is found in the archive, so still-missing videos at or above the threshold are requested again on later visits. On YouTube `RD...` Mix watch pages, the popup can snapshot the loaded Mix members into a timestamped local playlist and optionally queue each video individually because yt-dlp cannot enumerate that autogenerated playlist type. Archived playback can use a preflight redirect, an in-page local player replacement, or an ask prompt. In-page replacement keeps YouTube around the player but still loads YouTube page resources; local autoplay starts muted because audible autoplay requires browser permission or a user gesture. The dihi downloads UI exposes source YouTube URLs as copy-only controls instead of direct links.
@@ -312,8 +319,29 @@ search/artist/sort/view state, grid/list cards, local queue persistence, and a
 fixed media player. The live download dashboard remains at `/downloads`; the
 dense catalog/status table remains at `/catalog` and is linked separately as
 Catalog / admin table. Its rebuild button remains on that admin page.
-The shared sidebar is responsive and keeps saved playlists visible while
+The shared sidebar is responsive, keeps all saved playlists reachable in a
+scrollable playlist section, and sorts the playlist links alphabetically while
 preserving the existing routes.
+Library grid cards use compact responsive tiles with visible tag chips. Clicking
+a thumbnail opens the in-page player with native video controls and keeps the
+fixed transport controls available; fullscreen is only entered through the
+explicit expand button.
+The Library script is loaded with a manually incremented query-string
+cache-buster (currently `library.js?v=9`) so browsers fetch frontend changes
+instead of reusing a stale cached script. Bump it whenever `library.js` changes;
+automatic content-hash asset versioning remains a future improvement. The
+player attaches indexed VTT/SRT files as native captions tracks and defaults
+to the first available track. The saved-playlists page supports A–Z and
+updated-date sorting; the root Library also provides a playlist filter and
+the same playlist sort choices. Explicit Library fullscreen includes Previous,
+Play/Pause, and Next controls that appear when the pointer reaches the bottom.
+Fullscreen removes the player-panel padding and uses a viewport-sized black
+stage with the video contained inside it, so any remaining black area is only
+aspect-ratio letterboxing rather than a page border.
+The fullscreen title and Close player control are hidden by default and appear
+when the pointer reaches the top edge, matching the bottom transport controls.
+Library playback actions explicitly play all shown/filtered files or play them
+in random order; the Up next panel also provides Play queue and Random queue.
 
 ## Roadmap / TODO
 
@@ -327,6 +355,9 @@ preserving the existing routes.
   7. **Visual consistency pass** — bring Downloads, Catalog, Playlists, Tags, Queue, and Tools onto the shared dark design without removing their existing functionality.
   8. **Navigation and route audit** — keep `/downloads` as live status, `/catalog` as admin table, and verify every existing route remains reachable from the sidebar or Tools/export area.
   9. **Browser smoke tests** — test card playback, queue ordering, audio-only mode, fullscreen exit, retry actions, responsive navigation, and playlist actions in a real browser.
+  10. **Cache coverage and invalidation** — cache tags, library exports, and short-lived system-size results by the validated catalog fingerprint; reduce repeated USB fingerprint walks. Tags, exports, system status caching, and a fast directory-structure fingerprint are now implemented; remaining work is broader invalidation/measurement.
+  11. **Debounced catalog refreshes** — coalesce post-download filesystem rescans and expose refresh progress so a playlist batch does not trigger one full scan per child. Post-download refreshes are now coalesced; progress reporting remains.
+  12. **Timestamp all cache and endpoint operations** — record request/start and completion timestamps, duration, last success, last failure, refresh source, and current phase for every row in the Status cache/endpoint table and relevant download/catalog logs.
 
 - **Recommended implementation order**
   1. Progressive Library loading and performance measurements.
@@ -337,6 +368,7 @@ preserving the existing routes.
 
 - Keep the browser extension mirrored with the active site flows and API endpoints. When queue, playlist, playback, settings, or response-shape behavior changes, update the extension code, extension README, and extension version together, then test the extension against the documented endpoints.
 - Serve the remaining scan-backed callers (`/api/media/tags` fallback already catalog-first; per-video details still reads the live directory lazily) from the SQLite catalog if they show up in profiling, and switch the web UI from client-side filtering to `/api/media/library?q=` on huge archives.
+- Extend the Status cache/endpoint table to cover every expensive route, with persisted last-run timings and safe scoped refresh actions.
 - Validate the WSL2 Windows USB workflow end to end: copy existing `data/` contents to the USB path, run `make data` with `.env` set, verify all Compose mounts, and document recovery if the drive is disconnected.
 - Measure USB/DrvFs performance for large media trees and decide whether media belongs on USB while the SQLite catalog, archive, and queue state remain on the native WSL filesystem.
 - Document a separate Docker Desktop disk-image relocation if Docker images/build cache—not DIHI media—are consuming the Windows C: drive.
@@ -348,7 +380,8 @@ preserving the existing routes.
   without waiting for playlist completion, and time out stalled member-detail
   requests with a retryable message. Playlist detail reads the SQLite catalog
   directly and must not trigger a full media-tree scan; saved descriptor JSON
-  is preferred and catalog enrichment uses only a short best-effort lock wait.
+  is preferred, and playlist listing/detail must return from descriptor/live-
+  media data even while the catalog writer is locked.
 - Keep `app3.py` as the active server unless explicitly asked to split the UI/API.
 - Do not commit cookies or downloaded media.
 - Do not stage or commit local runtime data: everything under `data/` is git-ignored.
@@ -357,6 +390,9 @@ preserving the existing routes.
 - SQLite catalog scans can hold the database write lock for a while; queue
   reads/writes use a long busy timeout so the scheduler waits rather than
   repeatedly logging transient `database is locked` failures.
+- Catalog refreshes and download-attempt writes use long SQLite busy timeouts,
+  and the expensive playlist-index build is serialized per worker so concurrent
+  playlist page requests do not rebuild 303 descriptors simultaneously.
 - Downloads failure/history endpoints must return JSON even when the catalog
   is busy; the UI should handle non-JSON responses without exposing a parser
   exception. Download-history reads must not run schema migrations on the

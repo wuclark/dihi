@@ -10,6 +10,8 @@ PYTEST := $(VENV)/bin/pytest
 DIHI := $(VENV)/bin/dihi
 YTDLP := $(VENV)/bin/yt-dlp
 DATA_DIR ?= $(if $(DIHI_DATA_DIR),$(DIHI_DATA_DIR),./data)
+USB_MOUNT ?= /mnt/usbdocker1
+USB_DRIVE ?= D:
 STATIC_CATALOG_PORT ?= 8765
 .DEFAULT_GOAL := help
 
@@ -18,7 +20,7 @@ _WIN_USER     := $(shell command -v cmd.exe >/dev/null 2>&1 && timeout 2s cmd.ex
 _CHROME_PROF  := /mnt/c/Users/$(_WIN_USER)/AppData/Local/Google/Chrome/User Data
 _EDGE_PROF    := /mnt/c/Users/$(_WIN_USER)/AppData/Local/Microsoft/Edge/User Data
 
-.PHONY: help startup setup install dev-install pot-provider docker-up docker-down docker-logs test-docker run clean test data data-size data-migrate catalog-static catalog-static-serve cookies cookies-browser install-chrome git-add git-commit-push
+.PHONY: help startup setup install dev-install pot-provider usb-mount storage-check docker-up docker-down docker-logs test-docker run clean test data data-size data-migrate catalog-static catalog-static-serve cookies cookies-browser install-chrome git-add git-commit-push
 
 help:
 	@echo 'Available targets:'
@@ -27,6 +29,8 @@ help:
 	@echo '  install          Alias for setup'
 	@echo '  dev-install      Install the dihi CLI in editable mode'
 	@echo '  pot-provider     Start the Docker PO Token service for host downloads'
+	@echo '  usb-mount        Mount the configured Windows USB drive (USB_DRIVE=D:)'
+	@echo '  storage-check    Verify the configured data root is readable/writable'
 	@echo '  docker-up        Build and start the dihi server and PO Token provider'
 	@echo '  docker-down      Stop the Docker Compose services'
 	@echo '  docker-logs      Follow Docker Compose service logs'
@@ -77,8 +81,36 @@ pot-provider:
 	@command -v docker >/dev/null || { echo 'Docker is required for the PO Token provider.'; exit 1; }
 	@docker compose up -d bgutil-provider
 
+# Mount the Windows USB drive at a stable WSL path. This is intentionally
+# explicit because sudo may prompt and the Windows drive letter can change.
+usb-mount:
+	@sudo mkdir -p "$(USB_MOUNT)"
+	@if mountpoint -q "$(USB_MOUNT)"; then \
+		if ! df -P "$(USB_MOUNT)" >/dev/null 2>&1; then \
+			echo "ERROR: $(USB_MOUNT) is mounted but unavailable; reconnect the drive or restart WSL, then retry."; exit 1; \
+		fi; \
+		echo "USB mount already available: $(USB_MOUNT)"; \
+	else \
+		sudo mount -t drvfs "$(USB_DRIVE)" "$(USB_MOUNT)"; \
+	fi
+	@test -d "$(USB_MOUNT)" && df -P "$(USB_MOUNT)" >/dev/null 2>&1 || { echo "ERROR: USB mount is not available at $(USB_MOUNT)."; exit 1; }
+
+# Fail before `make data` or Docker can create anything under a missing USB
+# mount. Local ./data workflows remain unaffected.
+storage-check:
+	@case "$(DATA_DIR)" in \
+		$(USB_MOUNT)/*) \
+			probe="$(DATA_DIR)/.dihi-storage-check-$$$$"; \
+			if ! test -d "$(DATA_DIR)" || ! df -P "$(DATA_DIR)" >/dev/null 2>&1 || ! test -r "$(DATA_DIR)" || ! ( : > "$$probe" && rm -f "$$probe" ); then \
+				echo "ERROR: configured data root is unavailable: $(DATA_DIR)"; \
+				echo "Run: make usb-mount USB_DRIVE=$(USB_DRIVE) USB_MOUNT=$(USB_MOUNT)"; \
+				exit 1; \
+			fi; \
+			;; \
+		esac
+
 # Build and start the complete Docker deployment, including the PO Token provider.
-docker-up: data
+docker-up: storage-check data
 	docker compose up -d --build
 
 docker-down:
@@ -117,7 +149,7 @@ git-commit-push: git-add
 # Initialise host data files required by docker-compose bind mounts.
 # Docker creates missing mount targets as directories; running this first
 # ensures they are plain files so yt-dlp can read/write them correctly.
-data:
+data: storage-check
 	mkdir -p $(DATA_DIR)/media-strict $(DATA_DIR)/media-legacy $(DATA_DIR)/media-fallback $(DATA_DIR)/playlists $(DATA_DIR)/audio
 	touch $(DATA_DIR)/archive.txt $(DATA_DIR)/cookies.txt $(DATA_DIR)/media-fallback/archive.txt $(DATA_DIR)/media-catalog.db
 

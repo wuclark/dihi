@@ -135,6 +135,14 @@ def _files(path: Path, channel_id: str, video_id: str, source_root: str) -> dict
                 "format_id": match_format.group(1) if match_format else None,
                 "kind": kind,
             }
+            if extension == ".m4a" and item.name.endswith(".out.m4a") and not match_format:
+                # AudioMetadataPostProcessor creates this clean derivative from
+                # a kept audio stream with -c:a copy; it is not a second source
+                # download and is normally a remux/tagging operation.
+                entry["delivery"] = "generated"
+                entry["processing"] = "remuxed/tagged"
+            elif match_format:
+                entry["delivery"] = "downloaded"
             if extension in {".vtt", ".srt"}:
                 match = re.search(r"\.out\.([^.]*)\.(?:vtt|srt)$", item.name)
                 entry["subtitle_language"] = match.group(1) if match else None
@@ -149,7 +157,7 @@ def refresh(merged_dir: Path | list[Path], database: Path, archive: Path | None 
     database.parent.mkdir(parents=True, exist_ok=True)
     count = 0
     known_roots: set[str] = set()
-    with sqlite3.connect(database, timeout=30) as db:
+    with sqlite3.connect(database, timeout=120) as db:
         db.executescript(SCHEMA)
         if "source_root" not in {row[1] for row in db.execute("PRAGMA table_info(videos)")}:  # rebuild old schema
             db.execute("DROP TABLE IF EXISTS videos")
@@ -357,7 +365,8 @@ def _ensure_read_columns(db: sqlite3.Connection) -> None:
 
 
 def _deduped_rows(db: sqlite3.Connection, order: str, limit: int | None = None,
-                  offset: int = 0, q: str | None = None) -> tuple[list[tuple], int]:
+                  offset: int = 0, q: str | None = None,
+                  include_metadata: bool = True) -> tuple[list[tuple], int]:
     """Return deduped video rows (preferring merged > legacy > bestfallback)."""
     _ensure_read_columns(db)
     needle = (q or "").strip().lower()
@@ -369,25 +378,49 @@ def _deduped_rows(db: sqlite3.Connection, order: str, limit: int | None = None,
                    OR lower(uploader) LIKE ? ESCAPE '\\' OR lower(track) LIKE ? ESCAPE '\\')"""
         pattern = f"%{_like_escape(needle)}%"
         params = [pattern, pattern, pattern, pattern, pattern, pattern]
+    deduped = """SELECT video_id, source_root, channel_id, title, upload_date,
+                         artist, uploader, track,
+                         ROW_NUMBER() OVER (PARTITION BY video_id
+                          ORDER BY CASE source_root WHEN 'merged' THEN 0 WHEN 'legacy' THEN 1 ELSE 2 END) AS rn
+                    FROM videos"""
     total = db.execute(
-        f"""SELECT COUNT(*) FROM
-            (SELECT v.*, ROW_NUMBER() OVER (PARTITION BY video_id
-             ORDER BY CASE source_root WHEN 'merged' THEN 0 WHEN 'legacy' THEN 1 ELSE 2 END) AS rn
-             FROM videos v) WHERE rn = 1{where}""",
+        f"""SELECT COUNT(*) FROM ({deduped}) WHERE rn = 1{where}""",
         params,
     ).fetchone()[0]
-    query = """SELECT video_id, source_root, channel_id, title, upload_date, artist,
-                        uploader, track, files_json, metadata_json
-                  FROM (SELECT v.*, ROW_NUMBER() OVER (PARTITION BY video_id
-                         ORDER BY CASE source_root WHEN 'merged' THEN 0 WHEN 'legacy' THEN 1 ELSE 2 END) AS rn
-                        FROM videos v) WHERE rn = 1"""
+    query = f"""SELECT video_id, source_root, channel_id, title, upload_date, artist,
+                        uploader, track
+                  FROM (SELECT video_id, source_root, channel_id, title, upload_date,
+                               artist, uploader, track,
+                               ROW_NUMBER() OVER (PARTITION BY video_id
+                                ORDER BY CASE source_root WHEN 'merged' THEN 0 WHEN 'legacy' THEN 1 ELSE 2 END) AS rn
+                        FROM videos) WHERE rn = 1"""
     query += where + f" ORDER BY {order}"
     if limit is not None:
         query += " LIMIT ? OFFSET ?"
         rows = db.execute(query, (*params, limit, offset)).fetchall()
     else:
         rows = db.execute(query, params).fetchall()
-    return rows, int(total or 0)
+    if not rows:
+        return [], int(total or 0)
+    ids = tuple(row[0] for row in rows)
+    placeholders = ",".join("?" for _ in ids)
+    payload_columns = "files_json, metadata_json" if include_metadata else "files_json"
+    payload_rows = db.execute(
+        f"SELECT video_id, source_root, {payload_columns} FROM videos WHERE video_id IN ({placeholders})",
+        ids,
+    ).fetchall()
+    payloads = {}
+    for row in payload_rows:
+        video_id, source_root, files_json = row[:3]
+        metadata_json = row[3] if include_metadata else None
+        key = (video_id, source_root)
+        payloads[key] = (files_json, metadata_json)
+    enriched = []
+    for row in rows:
+        video_id, source_root = row[0], row[1]
+        files_json, metadata_json = payloads.get((video_id, source_root), ("{}", "{}"))
+        enriched.append((*row, files_json, metadata_json if include_metadata else None))
+    return enriched, int(total or 0)
 
 
 def library_cards(database: Path, page: int | None = None, per_page: int = 200,
@@ -402,14 +435,14 @@ def library_cards(database: Path, page: int | None = None, per_page: int = 200,
     artist, uploader, and track).
     """
     order = _LIBRARY_SORTS.get(sort, _LIBRARY_SORTS["date-desc"])
-    with sqlite3.connect(database) as db:
+    with sqlite3.connect(database, timeout=120) as db:
         db.executescript(SCHEMA)
         if page is None:
-            rows, total = _deduped_rows(db, order, q=q)
+            rows, total = _deduped_rows(db, order, q=q, include_metadata=False)
         else:
             page = max(1, int(page))
             per_page = max(1, min(int(per_page), 2000))
-            rows, total = _deduped_rows(db, order, per_page, (page - 1) * per_page, q=q)
+            rows, total = _deduped_rows(db, order, per_page, (page - 1) * per_page, q=q, include_metadata=False)
     items = []
     for video_id, source_root, channel_id, title, upload_date, artist, uploader, track, files_json, _metadata_json in rows:
         try:
@@ -441,7 +474,7 @@ def library_files(database: Path) -> list[dict[str, Any]]:
     """
     with sqlite3.connect(database) as db:
         db.executescript(SCHEMA)
-        rows, _total = _deduped_rows(db, "video_id ASC")
+        rows, _total = _deduped_rows(db, "video_id ASC", include_metadata=False)
     files: list[dict[str, Any]] = []
     for video_id, _source_root, _channel_id, title, _date, _artist, _uploader, _track, files_json, _metadata in rows:
         try:
@@ -513,7 +546,7 @@ def library_tags(database: Path) -> dict[str, Any]:
     """
     with sqlite3.connect(database) as db:
         db.executescript(SCHEMA)
-        video_rows, _total = _deduped_rows(db, "video_id ASC")
+        video_rows, _total = _deduped_rows(db, "video_id ASC", include_metadata=False)
         cards = {}
         for video_id, source_root, channel_id, title, upload_date, artist, uploader, track, files_json, _meta in video_rows:
             try:
@@ -553,7 +586,7 @@ def library_tags(database: Path) -> dict[str, Any]:
 def record_attempt(database: Path, video_id: str, status: str, reason: str | None,
                    raw_error: str | None, retryable: bool, started_at: float, finished_at: float) -> None:
     database.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(database) as db:
+    with sqlite3.connect(database, timeout=120) as db:
         db.executescript(SCHEMA)
         db.execute("INSERT INTO download_attempts(video_id,status,reason,raw_error,retryable,started_at,finished_at) VALUES (?,?,?,?,?,?,?)",
                    (video_id, status, reason, raw_error, int(retryable), started_at, finished_at))
@@ -568,9 +601,10 @@ def _ensure_queue_columns(db: sqlite3.Connection) -> None:
 
 def playlists(database: Path) -> list[dict[str, Any]]:
     """Return playlists with total and locally playable member counts."""
-    with sqlite3.connect(database, timeout=120) as db:
-        db.executescript(SCHEMA)
-        _ensure_queue_columns(db)
+    # Playlist listing is a read-only UI path; fail quickly during a catalog
+    # rebuild so the API can use descriptor-backed fallback data.
+    database_uri = f"file:{database}?mode=ro&immutable=1"
+    with sqlite3.connect(database_uri, uri=True, timeout=0.1) as db:
         rows = db.execute(
             """SELECT p.playlist_id, p.title, p.webpage_url,
                       COUNT(pv.video_id), p.updated_at,
@@ -640,10 +674,10 @@ def playlist_video_ids(database: Path, playlist_id: str) -> list[dict[str, Any]]
 def record_playlist_membership(database: Path, playlist_id: str, title: str,
                                webpage_url: str | None, members: list[dict[str, Any]]) -> None:
     """Persist a playlist and its entries independently of video downloads."""
-    # Startup catalog refreshes can hold SQLite's writer lock while scanning
-    # a large library. Wait for that scan rather than reporting a misleading
-    # playlist metadata failure after the network extraction succeeded.
-    with sqlite3.connect(database, timeout=120) as db:
+    # The descriptor is written first by the server. If a catalog rebuild is
+    # holding SQLite's writer lock, callers can retain that descriptor and
+    # retry the indexed write later instead of blocking the refresh request.
+    with sqlite3.connect(database, timeout=0.25) as db:
         db.executescript(SCHEMA)
         db.execute(
             """INSERT INTO playlists(playlist_id,title,webpage_url,updated_at)
@@ -734,6 +768,40 @@ def queue_set_status(database: Path, item_id: int, status: str, **fields: Any) -
                 raise
             db.execute("DELETE FROM download_queue WHERE id = ?", (item_id,))
         db.commit()
+
+
+def queue_start_all(database: Path) -> int:
+    """Promote every paused queue item to pending in one transaction."""
+    now = time.time()
+    with sqlite3.connect(database, timeout=120) as db:
+        db.executescript(SCHEMA)
+        _ensure_queue_columns(db)
+        cursor = db.execute(
+            """UPDATE download_queue
+               SET status = 'pending', scheduled_at = ?
+             WHERE status = 'paused'""",
+            (now,),
+        )
+        db.commit()
+    return int(cursor.rowcount)
+
+
+def queue_clear(database: Path, protected_ids: set[int] | None = None) -> int:
+    """Remove pending and paused rows without touching active workers."""
+    protected = {int(value) for value in (protected_ids or set())}
+    with sqlite3.connect(database, timeout=120) as db:
+        db.executescript(SCHEMA)
+        _ensure_queue_columns(db)
+        if protected:
+            marks = ",".join("?" for _ in protected)
+            cursor = db.execute(
+                f"DELETE FROM download_queue WHERE status IN ('pending','paused') AND id NOT IN ({marks})",
+                tuple(protected),
+            )
+        else:
+            cursor = db.execute("DELETE FROM download_queue WHERE status IN ('pending','paused')")
+        db.commit()
+    return int(cursor.rowcount)
 
 
 def queue_set_kind(database: Path, item_id: int, kind: str) -> None:

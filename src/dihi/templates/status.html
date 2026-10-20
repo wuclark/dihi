@@ -1,1 +1,34 @@
-<!doctype html><meta charset="utf-8"><title>DIHI Status</title><style>body{background:#111;color:#eee;font:16px system-ui;margin:0}main{padding:24px;max-width:900px}.box{background:#222;border:1px solid #444;border-radius:10px;padding:18px;margin:12px 0}dt{color:#aaa;margin-top:8px}dd{margin:2px 0 0}.dir{display:flex;justify-content:space-between;border-top:1px solid #444;padding:8px 0;gap:10px}.dir:first-child{border-top:0}.path{overflow-wrap:anywhere}</style>{% include "_header.html" %}<main><h1>System status</h1><div id="status" class="box">Checking…</div></main><script>const statusEl=document.getElementById('status'),gb=n=>(n/1073741824).toFixed(2)+' GiB';fetch('/api/system/status').then(r=>r.json()).then(d=>{const c=d.cookies,dirs=Object.entries(d.directories||{}).map(([p,n])=>`<div class="dir"><span class="path">${p}</span><strong>${gb(n)}</strong></div>`).join('');statusEl.innerHTML=`<dl><dt>Disk</dt><dd>${gb(d.disk.free_bytes)} free of ${gb(d.disk.total_bytes)} (${d.disk.free_percent}%)</dd><dt>Media directories</dt><dd>${dirs||'No media directories found.'}</dd><dt>Cookies</dt><dd>${c.present?'Present':'Missing'} · ${c.netscape_format?'Netscape format':'Unknown format'} · ${c.count} entries · ${c.youtube_domains.length} YouTube/Google domains · ${c.expired} expired</dd></dl>`}).catch(()=>statusEl.textContent='Status unavailable')</script>
+<!doctype html>
+<meta charset="utf-8">
+<title>DIHI Status</title>
+<style>
+body{background:#111;color:#eee;font:16px system-ui;margin:0}main{padding:24px;max-width:1200px;margin:auto}.box{background:#222;border:1px solid #444;border-radius:10px;padding:18px;margin:12px 0}dt{color:#aaa;margin-top:8px}dd{margin:2px 0 0}.dir{display:flex;justify-content:space-between;border-top:1px solid #444;padding:8px 0;gap:10px}.dir:first-child{border-top:0}.path{overflow-wrap:anywhere}.table{overflow:auto}.row{display:grid;grid-template-columns:1.1fr 1.4fr 1fr .9fr 1.2fr 1.8fr auto;gap:10px;align-items:center;border-top:1px solid #444;padding:10px 0;min-width:1100px}.row.head{color:#aaa;font-size:13px;border-top:0;font-weight:600}.muted{color:#aaa;font-size:13px}.state{color:#8fd18f}.button{background:#333;color:#eee;border:1px solid #666;border-radius:6px;padding:6px 10px;cursor:pointer}.button:hover{border-color:#8bc7ff}.button:disabled{opacity:.5;cursor:wait}.message{margin-top:10px;color:#9ed0ff}
+</style>
+{% include "_header.html" %}
+<main>
+  <h1>System status</h1>
+  <div id="status" class="box">Checking storage and cookies…</div>
+  <section class="box">
+    <h2>Cache and endpoint health</h2>
+    <p class="muted">Persistent caches are validated against local data fingerprints. Live endpoints intentionally have no cache to clear.</p>
+    <div class="table" id="cache-table">Loading cache breakdown…</div>
+    <div id="cache-message" class="message" aria-live="polite"></div>
+  </section>
+  <section class="box" id="startup-history">
+    <h2>Startup timing history</h2>
+    <p class="muted">Cold runs rebuild the catalog; cache-hit runs reuse the persisted catalog. This history is stored under the configured data root.</p>
+    <div class="table" id="startup-history">Loading startup timings…</div>
+  </section>
+</main>
+<script>
+const statusEl=document.getElementById('status'), cacheEl=document.getElementById('cache-table'), historyEl=document.getElementById('startup-history'), messageEl=document.getElementById('cache-message');
+const gb=n=>(n/1073741824).toFixed(2)+' GiB';
+const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const when=v=>v?new Date(v*1000).toLocaleString():'—';
+async function loadStatus(){try{const r=await fetch('/api/system/status',{cache:'no-store'});if(!r.ok)throw Error('HTTP '+r.status);const d=await r.json(),c=d.cookies,dirs=Object.entries(d.directories||{}).map(([p,n])=>`<div class="dir"><span class="path">${esc(p)}</span><strong>${gb(n)}</strong></div>`).join('');statusEl.innerHTML=`<dl><dt>Disk</dt><dd>${gb(d.disk.free_bytes)} free of ${gb(d.disk.total_bytes)} (${d.disk.free_percent}%)</dd><dt>Media directories</dt><dd>${dirs||'No media directories found.'}</dd><dt>Cookies</dt><dd>${c.present?'Present':'Missing'} · ${c.netscape_format?'Netscape format':'Unknown format'} · ${c.count} entries · ${c.youtube_domains.length} YouTube/Google domains · ${c.expired} expired</dd></dl>`}catch(e){statusEl.textContent='Status unavailable: '+e.message}}
+function operation(x){const o=x.operation;if(!o)return '—';const duration=o.duration_seconds!=null?`${o.duration_seconds}s`:o.started_at?'running…':'—';return `${esc(o.source||'')}<br><span class="muted">${duration}${o.indexed_videos!=null?` · ${o.indexed_videos} videos`:''}</span>${o.last_error?`<br><span class="muted">${esc(o.last_error)}</span>`:''}`}
+async function loadCaches(){try{const r=await fetch('/api/system/cache-status',{cache:'no-store'});const d=await r.json();if(!r.ok)throw Error(d.error||`HTTP ${r.status}`);cacheEl.innerHTML=`<div class="row head"><div>Group</div><div>Endpoint</div><div>Source</div><div>State</div><div>Timing</div><div>Cache / note</div><div>Action</div></div>`+d.items.map(x=>`<div class="row"><div><strong>${esc(x.key)}</strong></div><div class="muted">${esc(x.endpoint)}</div><div>${esc(x.source)}</div><div class="state">${esc(x.state)}<br><span class="muted">${when(x.last_updated)}</span></div><div class="muted">${operation(x)}</div><div class="muted">${esc(x.cache)}<br>${esc(x.note)}</div><div><button class="button" data-refresh="${esc(x.key)}">Refresh</button></div></div>`).join('');cacheEl.querySelectorAll('[data-refresh]').forEach(b=>b.onclick=()=>refreshCache(b.dataset.refresh,b));}catch(e){cacheEl.textContent='Cache status unavailable: '+e.message}}
+async function loadHistory(){try{const r=await fetch('/api/system/startup-history',{cache:'no-store'});const d=await r.json();if(!r.ok)throw Error(d.error||`HTTP ${r.status}`);const rows=(d.runs||[]).slice().reverse();historyEl.innerHTML=rows.length?`<div class="row head"><div>Started</div><div>Source</div><div>Result</div><div>Duration</div><div>Videos</div><div>Error</div><div></div></div>`+rows.map(x=>`<div class="row"><div class="muted">${when(x.started_at)}</div><div>${esc(x.source||'')}</div><div class="state">${esc(x.phase||'')}</div><div>${esc(x.duration_seconds??'—')}s</div><div>${esc(x.indexed_videos??'—')}</div><div class="muted">${esc(x.error||'')}</div><div></div></div>`).join(''):'<p class="muted">No startup runs recorded yet.</p>'}catch(e){historyEl.textContent='Startup history unavailable: '+e.message}}
+async function refreshCache(key,button){button.disabled=true;button.textContent='Refreshing…';messageEl.textContent=`Refreshing ${key}…`;try{const r=await fetch('/api/system/cache-refresh/'+encodeURIComponent(key),{method:'POST'}),d=await r.json();if(!r.ok)throw Error(d.error||`HTTP ${r.status}`);messageEl.textContent=d.message||'Refresh requested';await loadCaches();}catch(e){messageEl.textContent=`Refresh failed: ${e.message}`}finally{button.disabled=false;button.textContent='Refresh'}}
+loadStatus();loadCaches();loadHistory();setInterval(loadHistory,5000);
+</script>

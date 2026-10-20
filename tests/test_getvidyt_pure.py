@@ -24,6 +24,7 @@ from getvidyt import (
     StandaloneAudioMetaPP,
     _datetime_now,
     _find_deno_path,
+    _has_playable_outputs,
     _parse_archive_line,
     _sub_to_text,
     build_ydl_opts,
@@ -489,6 +490,15 @@ class TestBuildYdlOpts:
             no_js=True,
         )
         assert opts["keepvideo"] is True
+
+
+def test_playable_pair_is_not_retried_after_optional_postprocessor_error(tmp_path, monkeypatch):
+    root = tmp_path / "media"
+    video_dir = root / "UCchannel" / "dQw4w9WgXcQ"
+    video_dir.mkdir(parents=True)
+    (video_dir / "UCchannel.dQw4w9WgXcQ.20260101.Title [dQw4w9WgXcQ].out.mkv").write_bytes(b"video")
+    (video_dir / "UCchannel.dQw4w9WgXcQ.20260101.Title [dQw4w9WgXcQ].out.m4a").write_bytes(b"audio")
+    assert _has_playable_outputs(root, "dQw4w9WgXcQ")
 
     def test_no_js_excludes_js_runtimes(self, tmp_path):
         opts = build_ydl_opts(

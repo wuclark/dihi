@@ -57,6 +57,11 @@ Current continuation
 - Fixed download-history HTTP 500s during catalog locks: history reads no
   longer execute schema migrations, use the long busy timeout, and return a
   JSON 503 when still unavailable. Focused HTTP/catalog tests pass (29).
+- Hardened playlist Refresh so unexpected extraction failures return JSON 503
+  rather than an HTML 500 page; the browser now reports a clear rebuild/
+  restart message for non-JSON refresh responses. The current screen still
+  requires the rebuilt Docker image to include the fast descriptor-based
+  playlist-detail endpoint.
 - Docker logs exposed transient `database is locked` errors while the startup
   catalog scan held SQLite's write lock. Queue add/list/status/kind operations
   now use a 120-second busy timeout so the scheduler waits through that scan.
@@ -79,7 +84,60 @@ Docker checkpoint
   health/library, catalog/extension download, and a catalog-backed media
   route.
 - `node --check src/dihi/static/js/library.js` and `git diff --check` pass.
-- This checkpoint is ready to commit; no runtime data is intended for staging.
+- The implementation checkpoint is committed; no runtime data is intended for
+  staging.
+
+Browser smoke verification
+--------------------------
+
+- Against the live Docker container, headless Chrome verified that the
+  Library renders 120 catalog cards, card playback selects a local media URL,
+  two queue buttons produce an ordered two-item Up next queue, the native
+  playlist dialog opens and confirms a selection, audio-only mode swaps to the
+  audio element, and the responsive navigation opens at a 390px viewport.
+- The headless environment did not grant a trusted fullscreen request, so
+  fullscreen enter/exit remains unverified rather than being reported as a
+  pass.
+- The current catalog had no retryable rows, so no retry action was exposed to
+  exercise in the browser.
+
+Paused queue start fix
+----------------------
+
+- Reproduced `/api/queue/start-all` hanging while active downloads were writing
+  SQLite; the queue page therefore looked like the button did nothing.
+- `catalog.queue_start_all()` now promotes paused rows in one transaction, and
+  the UI disables the button while waiting and reports the number started or a
+  useful error.
+- Focused catalog/HTTP tests pass (31 tests), and the Docker image was rebuilt
+  with the fix. The live bulk-start action was not invoked during verification
+  because it would intentionally launch the archived paused downloads.
+
+Cooperative pause for running downloads
+----------------------------------------
+
+- Running queue rows now expose `Pause after current file` for videos and
+  `Pause after current video` for playlists.
+- `POST /api/queue/<item_id>/pause` records an in-memory pause request. The
+  worker finishes its current yt-dlp boundary, marks the queue row paused, and
+  leaves completed playlist children intact for resume.
+- The container was rebuilt with this change. The live pause action was not
+  invoked against the real archive because it would alter an active download.
+
+Playlist catalog-lock fix
+-------------------------
+
+- Reproduced the `2026-10` failure: the saved descriptor contained all 85
+  members, but playlist listing/refresh could block behind the SQLite catalog
+  scan and the browser's 15-second detail timeout showed a misleading error.
+- Playlist refresh now writes the descriptor first and treats catalog
+  membership persistence as best-effort. Playlist listing uses saved
+  descriptors plus a targeted media-tree availability check, never waiting on
+  the catalog writer; detail still returns descriptor members when enrichment
+  is unavailable.
+- Focused HTTP/catalog tests pass (32 tests). The rebuilt live container now
+  returns `2026-10` with 85 members and 58 currently playable, and its detail
+  endpoint returns all 85 members; `/health` is 200.
 
 Current storage situation
 --------------------------
@@ -152,6 +210,45 @@ native WSL storage are still roadmap items.
 Recent code fixes
 -----------------
 
+- Library startup no longer falls back to a full USB scan while the catalog is
+  rebuilding. The API returns an explicit initializing response and the browser
+  retries automatically. Library SQL now dedupes/sorts lightweight columns,
+  fetches file payloads only for the selected page, and the frontend renders 30
+  cards first before loading later pages in the background. Live startup returned
+  the initializing response in milliseconds; focused tests passed (`32 passed`).
+
+- Startup diagnostics now emit INFO phase logs for catalog-build start/completion
+  with elapsed time and counts, queue-scheduler readiness/recovery, queue starts,
+  and playlist-index build timing. Flask logging is explicitly set to INFO so
+  these appear alongside Gunicorn logs. Live verification showed the catalog
+  phase remains visible while it is still scanning the USB-backed data root.
+
+- Playlist descriptor titles were verified against the live data: `D2021_2018-02`,
+  `D2021_2020-06`, and `Tech - 2024` are the saved YouTube titles, not playlist IDs.
+- Playlist list/detail responses no longer scan the USB media tree for every request.
+  Large descriptor-backed playlists render their saved ordered members immediately;
+  the rebuilt live container returned `2026-10` with 85 members in under the browser
+  timeout. Focused tests passed (`32 passed`).
+- Large playlist detail responses now reuse a lightweight catalog availability map.
+  This fixes the regression where all descriptor members appeared `not local` after
+  the timeout optimization. Live container verification returned `2026-10` with 88
+  members, 61 local, 27 missing, and no API error.
+- Retryable failure rows now offer retry-with-cookies even for generic incomplete
+  failures. yt-dlp logger output is captured into the persisted failure message so
+  the Downloads page can show the actual diagnostic instead of only the generic
+  missing-output summary.
+- Failed-download rows also include an `Open YouTube` link for checking whether the
+  source is still available, private, age-gated, or removed before retrying.
+- Downloads status now reports scheduler state and explains when queued work is
+  waiting for the startup catalog scan or scheduler initialization, instead of
+  presenting that interval as an unexplained `Starting…` delay.
+- Clean `.out.m4a` files are now labeled as generated `remuxed/tagged` audio
+  derivatives in catalog/detail metadata; raw `.out.f<format>.*` files remain
+  labeled as downloaded source streams. The canonical filenames are unchanged.
+- Make now has an explicit `usb-mount` target and a `storage-check` preflight;
+  `make docker-up` refuses to start against an unavailable `/mnt/usbdocker1`
+  data root and prints the remount command.
+
 - Queue recovery now handles duplicate status rows without scheduler loops.
 - Playlist per-song Download promotes paused queue items to pending.
 - Download completion checks fresh live media files before the catalog.
@@ -171,3 +268,133 @@ Repository notes
 - Runtime data is ignored and should not be committed.
 - There are existing uncommitted code/documentation changes in the working
   tree; preserve them when continuing.
+
+Startup acceleration
+--------------------
+
+Startup now persists validated readiness metadata plus a playlist-index cache.
+Repeated starts can reuse the SQLite catalog and local playlist index when
+media, archive, and descriptor fingerprints are unchanged; changes invalidate
+the cache and trigger the authoritative filesystem rebuild.
+
+Cache observability
+-------------------
+
+`/status` now includes a cache/endpoint health table with scoped Refresh buttons.
+`/api/system/cache-status` reports catalog, playlist-index, tags, exports,
+per-video details, cleanup, verification, system status, and queue coverage;
+`/api/system/cache-refresh/<key>` invalidates or starts the relevant refresh.
+The table is implemented but cannot be live-smoke-tested until the USB data
+mount is restored.
+
+Next roadmap item: timestamp every cache and endpoint operation, including
+start/completion, duration, last success/failure, refresh source, and phase for
+the Status table and relevant catalog/download logs.
+
+Active download controls
+- `/downloads` and `/queue` now expose Stop and Remove from queue controls for running video/playlist items.
+- Stop requests yt-dlp cancellation at the next progress callback and immediately persists the queue row as paused for later restart; active status remains `stopping` until the worker exits.
+- Remove from queue requests the same stop, then marks the running row cancelled once the worker exits; pending/paused rows are cancelled immediately.
+- Added `/api/queue/<item_id>/stop`; expanded `/api/queue/<item_id>/cancel` to handle running and paused rows.
+- Focused app3 tests pass; live Docker verification remains pending until the USB data mount is restored.
+- Pause requests are now reported as `pause_requested` in queue/download status and rendered as “Pause requested · finishing current boundary,” so a long playlist child is not mistaken for a stuck request.
+
+Library front-page UX
+- Library cards now use compact responsive tiles, show up to four catalog tags,
+  and make thumbnail buttons explicit non-navigation play controls.
+- Card playback now opens a visible in-page video player with native controls;
+  the persistent transport bar remains available, and fullscreen requires the
+  explicit expand button. Library JavaScript cache-buster is `v=4`.
+
+Stop/restart race fix
+- Stop now persists a running queue row as `paused` immediately while the
+  worker finishes cancellation at the next yt-dlp progress boundary. The
+  dashboard reports `stopping` during that handoff, and queue controls do not
+  offer a restart while cancellation is still active. This prevents a stopped
+  playlist from briefly reappearing as a fresh `downloading` item.
+- Focused app3 tests pass (85 tests).
+
+Completed-output retry fix
+- A video with both canonical playable outputs was being retried into
+  `media-fallback` after an optional postprocessor error such as thumbnail
+  embedding rejecting a kept WebM sidecar. `getvidyt.download_youtube` now
+  checks the target's output pair before launching fallback, and the worker
+  treats that pair as authoritative completion even if yt-dlp returned a
+  postprocessor warning code.
+- Added a regression fixture for the playable-pair detector; rerun the Docker
+  image before validating against the live queue.
+
+Queue clearing
+- Added `POST /api/queue/clear` and Clear queue buttons on Downloads and Queue.
+  It deletes only pending/paused rows, protects stop-in-progress workers, and
+  never interrupts active downloads.
+
+Player thumbnail fix
+- The persistent player now uses the same extension-based thumbnail fallback as
+  Library cards and hides the thumbnail element when no image exists, preventing
+  a tiny broken-image icon beside the currently playing title. Cache-buster is
+  now `library.js?v=5`.
+
+Artist filter fix
+- Fixed the artist-strip tuple mapping that rendered artist counts as labels and
+  showed `undefined` for every count. The Library cache-buster is now `v=6`.
+
+Frontend cache-buster convention
+- `index.html` loads `library.js` with a manually incremented `?v=N` query
+  string. Increment it after Library JavaScript changes to force browsers to
+  fetch the new script; automatic content-hash asset versioning is deferred.
+
+Captions restoration
+- Library in-page playback now attaches indexed VTT/SRT subtitle files as
+  native `<track kind="captions">` elements, with the first available track
+  enabled by default. Cache-buster is now `library.js?v=7`.
+
+Derived cache acceleration
+- Tags and library exports now persist under `data/derived-cache/` keyed by the validated startup/catalog fingerprint.
+- `/api/system/status` now uses a 15-second in-memory cache for expensive directory-size and cookie diagnostics; its Status row can invalidate it.
+- Completed downloads coalesce catalog refresh requests with a short timer, avoiding one catalog refresh per playlist child.
+- Startup and playlist-index media validation now use a directory-structure fingerprint that avoids per-file stat calls on USB/DrvFs. It intentionally does not detect in-place edits to an existing media file; explicit catalog refresh remains the recovery path.
+- Status cache rows now expose catalog refresh phase, source, duration, indexed count, and last error; the Status UI displays the timing column while a catalog refresh is running or complete.
+- Fixed the observed SQLite lock/thread failures by extending catalog refresh and download-attempt write waits to 120 seconds. Serialized playlist-index builds and switched cache writes to unique temporary filenames, preventing concurrent 303-playlist builds from racing on `playlist-index-cache.tmp`.
+- Added persisted `startup-history.json`, `/api/system/startup-history`, and a Startup timing history panel on `/status`. Each catalog startup/refresh records `full_scan`, `cache_hit`, or `error`, source, timestamps, duration, and indexed count. The live cold/warm benchmark is not yet recorded because `make storage-check` currently reports `/mnt/usbdocker1/docker/dihi/data` unavailable; do not invent timings until the USB mount is restored.
+- Live Docker verification was run against native `./data` after rebuilding: smoke tests passed 2 and skipped 1 empty-media test. The rebuilt container recorded a latest full scan of `0.058s` and a warm cache-hit restart of `0.021s`; this is a code-path benchmark, not the USB/DrvFs performance benchmark.
+- The live USB-backed container is now healthy after `docker compose up --build`: startup indexed 302 videos in about 70.6s and built 303 playlists / 13,513 members in about 29.7s. Direct smoke tests against the USB-backed container pass 3/3, including serving a real catalog media file. Startup history still contains an older `database is locked` refresh error from before the write-timeout fix; no such error appeared in the current container's recent logs.
+- Focused app3/catalog tests pass (99 tests). Remaining cache work is reducing recursive USB/DrvFs fingerprint walks, adding refresh progress, and measuring live second-start timings.
+
+Playlist sorting and fullscreen navigation
+- Saved playlists now sort A–Z, recently updated, or oldest updated, with the
+  preference stored in local browser storage.
+- Library fullscreen now covers the player panel and includes Previous,
+  Play/Pause, and Next controls instead of fullscreening only the raw video.
+  Cache-buster is now `library.js?v=8`.
+
+Fullscreen hover and root playlist controls
+- Fullscreen transport controls are hidden until the pointer reaches the bottom
+  edge, then fade away after a short idle period.
+- The root Library now provides saved-playlist sorting and a playlist filter,
+  with the selection reflected in the URL. Cache-buster is now `v=9`.
+
+Sidebar sorting and viewport fullscreen layout
+- The shared sidebar now sorts its saved playlist links alphabetically using
+  numeric, case-insensitive title ordering. Duplicate visible titles can still
+  represent different playlist IDs.
+- The sidebar no longer truncates the playlist list to 30 entries; the playlist
+  section remains internally scrollable so entries such as newer `2026-10`
+  playlists remain reachable.
+- Fullscreen now removes the inline player panel padding/border and makes the
+  player stage fill the viewport. The video uses `object-fit: contain`, so
+  aspect-ratio letterboxing may remain while artificial page-space borders are
+  removed. Transport controls remain hidden until the pointer reaches the
+  bottom edge.
+
+Fullscreen top chrome
+- The fullscreen video title and Close player control now hide by default and
+  fade in when the pointer reaches the top edge. They share the same short idle
+  timeout as the bottom Previous/Play/Next controls and are reset on exit.
+
+Library playback actions
+- The main Library actions now explicitly say `Play all shown` and `Play
+  random`, applying to the current search, artist, or playlist-filtered set.
+- The Up next panel now has `Play queue` and `Random queue`; playback advances
+  through the selected sequence instead of choosing only the first random
+  item and then falling back to the regular library order.

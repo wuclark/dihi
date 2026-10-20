@@ -27,7 +27,8 @@ def env(monkeypatch, tmp_path):
     monkeypatch.setattr(app3, "PLAYLIST_METADATA_DIR", (tmp_path / "playlists").resolve())
     monkeypatch.setattr(app3, "CATALOG_DB", (tmp_path / "catalog.db").resolve())
     monkeypatch.setattr(app3, "_LIBRARY_CACHE", {"fingerprint": None, "videos": []})
-    return {"merged": merged, "legacy": legacy, "fallback": fallback}
+    return {"merged": merged, "legacy": legacy, "fallback": fallback,
+            "playlists": tmp_path / "playlists"}
 
 
 @pytest.fixture()
@@ -51,6 +52,32 @@ def test_health_ok(client):
     r = client.get("/health")
     assert r.status_code == 200
     assert r.get_json()["ok"] is True
+
+
+def test_queue_start_all_promotes_paused_items(client, env, monkeypatch):
+    monkeypatch.setattr(app3.catalog, "queue_start_all", lambda _database: 3)
+    monkeypatch.setattr(app3, "_queue_wakeup", type("NoopEvent", (), {"set": lambda self: None})())
+
+    response = client.post("/api/queue/start-all")
+
+    assert response.status_code == 200
+    assert response.get_json() == {"ok": True, "started": 3}
+
+
+def test_playlists_fall_back_to_descriptors_when_catalog_is_locked(client, env, monkeypatch):
+    env["playlists"].mkdir()
+    (env["playlists"] / "PLdescriptor01.info.json").write_text(json.dumps({
+        "_type": "playlist", "id": "PLdescriptor01", "title": "Saved list",
+        "entries": [{"video_id": "dQw4w9WgXcQ", "playlist_index": 1}],
+        "saved_at": 123.0,
+    }))
+    monkeypatch.setattr(app3.catalog, "playlists", lambda *_args: (_ for _ in ()).throw(
+        app3.sqlite3.OperationalError("database is locked")))
+
+    response = client.get("/api/media/playlists")
+
+    assert response.status_code == 200
+    assert response.get_json()["playlists"][0]["video_count"] == 1
 
 
 def test_library_returns_slim_cards(client, env):

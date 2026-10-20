@@ -57,6 +57,7 @@ def reset_app3_state(monkeypatch):
     monkeypatch.setattr(app3, "_download_details", {})
     monkeypatch.setattr(app3, "_active_playlist_downloads", set())
     monkeypatch.setattr(app3, "_playlist_started_at", {})
+    monkeypatch.setattr(app3, "_pause_requests", set())
     monkeypatch.setattr(app3, "_playlist_download_results", {})
     monkeypatch.setattr(app3, "_playlist_result_timestamps", {})
     monkeypatch.setattr(app3, "_playlist_history", {})
@@ -143,6 +144,52 @@ def test_immediate_video_request_promotes_existing_paused_item(monkeypatch, tmp_
     assert (item_id, already) == (paused_id, True)
     item = next(item for item in app3.catalog.queue_items(db) if item["id"] == paused_id)
     assert item["status"] == "pending"
+
+
+def test_pause_running_queue_item_requests_cooperative_pause(monkeypatch, tmp_path):
+    db = tmp_path / "catalog.db"
+    item_id = app3.catalog.queue_add(db, "dQw4w9WgXcQ", "video", status="running")
+    monkeypatch.setattr(app3, "CATALOG_DB", db)
+    monkeypatch.setattr(app3, "_pause_requests", set())
+
+    response = app3.app.test_client().post(f"/api/queue/{item_id}/pause")
+
+    assert response.status_code == 200
+    assert response.get_json() == {"ok": True, "id": item_id, "status": "pausing"}
+    assert item_id in app3._pause_requests
+
+
+def test_stop_running_queue_item_requests_immediate_stop_and_keeps_paused(monkeypatch, tmp_path):
+    db = tmp_path / "catalog.db"
+    item_id = app3.catalog.queue_add(db, "dQw4w9WgXcQ", "video", status="running")
+    monkeypatch.setattr(app3, "CATALOG_DB", db)
+    monkeypatch.setattr(app3, "_cancel_requests", set())
+    monkeypatch.setattr(app3, "_remove_requests", set())
+
+    response = app3.app.test_client().post(f"/api/queue/{item_id}/stop")
+
+    assert response.status_code == 200
+    assert response.get_json() == {"ok": True, "id": item_id, "status": "stopping"}
+    assert item_id in app3._cancel_requests
+    assert item_id not in app3._remove_requests
+    stored = next(item for item in app3.catalog.queue_items(db) if item["id"] == item_id)
+    assert stored["status"] == "paused"
+    assert stored["error"] == "stop requested; finishing current boundary"
+
+
+def test_cancel_running_queue_item_requests_stop_and_removal(monkeypatch, tmp_path):
+    db = tmp_path / "catalog.db"
+    item_id = app3.catalog.queue_add(db, "dQw4w9WgXcQ", "video", status="running")
+    monkeypatch.setattr(app3, "CATALOG_DB", db)
+    monkeypatch.setattr(app3, "_cancel_requests", set())
+    monkeypatch.setattr(app3, "_remove_requests", set())
+
+    response = app3.app.test_client().post(f"/api/queue/{item_id}/cancel")
+
+    assert response.status_code == 200
+    assert response.get_json() == {"ok": True, "id": item_id, "status": "stopping", "removed": True}
+    assert item_id in app3._cancel_requests
+    assert item_id in app3._remove_requests
 
 
 def test_download_worker_checks_fresh_files_before_catalog(monkeypatch, tmp_path):

@@ -888,6 +888,34 @@ def _download_youtube_once(
         return ydl.download([target])
 
 
+def _has_playable_outputs(root: Path, video_id: str) -> bool:
+    """Return whether a video already has the canonical playable pair.
+
+    This is only called after a failed yt-dlp run, so the narrow one-video
+    directory walk is preferable to retrying a complete download merely
+    because an optional thumbnail postprocessor failed on a raw sidecar.
+    """
+    if not root.is_dir():
+        return False
+    marker = f"[{video_id}].out."
+    has_video = False
+    has_audio = False
+    try:
+        for path in root.rglob("*"):
+            if not path.is_file() or marker not in path.name:
+                continue
+            name = path.name
+            if name.endswith((".out.mkv", ".out.mp4")):
+                has_video = True
+            elif name.endswith((".out.m4a", ".out.opus", ".out.ogg")):
+                has_audio = True
+            if has_video and has_audio:
+                return True
+    except OSError:
+        return False
+    return False
+
+
 def download_youtube(
     target: str,
     *,
@@ -943,6 +971,13 @@ def download_youtube(
         quiet=quiet,
         audio_meta=audio_meta,
     )
+    # yt-dlp can return a non-zero code after the playable outputs already
+    # exist when an optional postprocessor rejects a kept sidecar (for example,
+    # EmbedThumbnail does not support raw WebM). Do not launch a second,
+    # lower-quality fallback download in that case.
+    video_match = re.search(r"[?&]v=([A-Za-z0-9_-]{11})", target_url)
+    if result and video_match and _has_playable_outputs(Path(merged_dir), video_match.group(1)):
+        return 0
     if result == 0 or not best_fallback:
         return result
 

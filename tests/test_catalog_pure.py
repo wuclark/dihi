@@ -7,7 +7,9 @@ from catalog import (
     library_tags,
     playlists,
     queue_add,
+    queue_clear,
     queue_items,
+    queue_start_all,
     queue_set_status,
     record_attempt,
     record_playlist_membership,
@@ -334,6 +336,33 @@ def test_queue_status_collision_keeps_existing_active_item(tmp_path):
     items = {item["id"]: item for item in queue_items(db)}
     assert stale_id not in items
     assert items[paused_id]["status"] == "paused"
+
+
+def test_queue_start_all_promotes_paused_items_in_one_update(tmp_path):
+    db = tmp_path / "catalog.db"
+    paused = queue_add(db, "aaaaaaaaaaa", "video", status="paused")
+    pending = queue_add(db, "bbbbbbbbbbb", "video", status="pending")
+
+    changed = queue_start_all(db)
+
+    assert changed == 1
+    items = {item["id"]: item for item in queue_items(db)}
+    assert items[paused]["status"] == "pending"
+    assert items[pending]["status"] == "pending"
+
+
+def test_queue_clear_removes_waiting_rows_but_preserves_running_and_protected(tmp_path):
+    db = tmp_path / "catalog.db"
+    pending = queue_add(db, "aaaaaaaaaaa", "video", status="pending")
+    paused = queue_add(db, "bbbbbbbbbbb", "video", status="paused")
+    running = queue_add(db, "ccccccccccc", "video", status="running")
+    kept_paused = queue_add(db, "ddddddddddd", "video", status="paused")
+
+    assert queue_clear(db, {kept_paused}) == 2
+    remaining = {item["id"]: item["status"] for item in queue_items(db)}
+    assert pending not in remaining and paused not in remaining
+    assert remaining[running] == "running"
+    assert remaining[kept_paused] == "paused"
 
 
 def test_refresh_keeps_renamed_media_roots_on_same_catalog_row(tmp_path):

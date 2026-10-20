@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import io
 import hashlib
+import logging
 import mimetypes
 import json
 import os
@@ -32,6 +33,7 @@ from library_helpers import clean_display_title, human_date
 
 app = Flask(__name__)
 CORS(app)  # Allow all origins
+app.logger.setLevel(logging.INFO)
 
 # Validate YouTube video IDs (11 chars: alphanumeric, underscore, dash)
 YOUTUBE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
@@ -89,10 +91,42 @@ _result_timestamps: dict[str, float] = {}
 _download_history: dict[str, str] = {}
 _download_history_timestamps: dict[str, float] = {}
 _download_details: dict[str, dict] = {}
+_queue_scheduler_ready = threading.Event()
+
+
+class _YTDlpLogCapture:
+    """Keep useful yt-dlp diagnostics with a download attempt."""
+
+    def __init__(self, video_id: str) -> None:
+        self.video_id = video_id
+        self.lines: list[str] = []
+
+    def _add(self, message: object) -> None:
+        text = str(message or "").strip()
+        if not text:
+            return
+        with _lock:
+            self.lines.append(text)
+            del self.lines[:-40]
+            detail = _download_details.setdefault(self.video_id, {"logs": []})
+            detail.setdefault("logs", []).append(text)
+            detail["logs"] = detail["logs"][-40:]
+
+    def debug(self, message: object) -> None:
+        self._add(message)
+
+    def warning(self, message: object) -> None:
+        self._add(message)
+
+    def error(self, message: object) -> None:
+        self._add(message)
 
 # Playlist download tracking
 _active_playlist_downloads: Set[str] = set()
 _playlist_started_at: dict[str, float] = {}
+_pause_requests: set[int] = set()
+_cancel_requests: set[int] = set()
+_remove_requests: set[int] = set()
 _playlist_download_results: dict[str, str] = {}  # playlist_id -> "completed" | "failed"
 _playlist_result_timestamps: dict[str, float] = {}
 _playlist_history: dict[str, str] = {}
@@ -102,21 +136,279 @@ _queue_wakeup = threading.Event()
 _cleanup_tasks: dict[str, dict] = {}
 _cleanup_report_cache: tuple[float, dict] | None = None
 _VERIFY_CACHE = Path(os.environ.get("DIHI_VERIFY_CACHE", str(DATA_ROOT / "media-verification.json"))).expanduser().resolve()
+_STARTUP_READINESS = Path(os.environ.get("DIHI_STARTUP_READINESS", str(DATA_ROOT / "startup-readiness.json"))).expanduser().resolve()
+_STARTUP_HISTORY = Path(os.environ.get("DIHI_STARTUP_HISTORY", str(DATA_ROOT / "startup-history.json"))).expanduser().resolve()
+_PLAYLIST_INDEX_CACHE = Path(os.environ.get("DIHI_PLAYLIST_INDEX_CACHE", str(DATA_ROOT / "playlist-index-cache.json"))).expanduser().resolve()
+_DERIVED_CACHE_DIR = Path(os.environ.get("DIHI_DERIVED_CACHE_DIR", str(DATA_ROOT / "derived-cache"))).expanduser().resolve()
+_TAGS_CACHE = _DERIVED_CACHE_DIR / "tags.json"
+_EXPORTS_CACHE = _DERIVED_CACHE_DIR / "exports.json"
+_READINESS_VERSION = 2
+_catalog_ready = threading.Event()
+_available_catalog_ids: set[str] = set()
+_playlist_index_cache_key: str | None = None
+_playlist_index_cache_cards: list[dict] | None = None
+_playlist_index_build_lock = threading.Lock()
+_catalog_refresh_lock = threading.Lock()
+_catalog_refresh_timer: threading.Timer | None = None
+_system_status_cache: tuple[float, dict] | None = None
+_catalog_refresh_state: dict = {
+    "phase": "starting", "source": "startup", "started_at": None,
+    "finished_at": None, "duration_seconds": None, "last_success": None,
+    "last_error": None, "indexed_videos": None,
+}
 
 
-def _refresh_catalog() -> None:
+def _catalog_cache_fingerprint() -> dict | None:
+    """Return the persisted catalog fingerprint without walking media."""
     try:
+        payload = json.loads(_STARTUP_READINESS.read_text(encoding="utf-8"))
+        if payload.get("version") == _READINESS_VERSION and CATALOG_DB.is_file():
+            return payload.get("fingerprint")
+    except (OSError, TypeError, ValueError):
+        pass
+    return None
+
+
+def _read_derived_cache(path: Path) -> object | None:
+    fingerprint = _catalog_cache_fingerprint()
+    if fingerprint is None:
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if payload.get("version") == _READINESS_VERSION and payload.get("fingerprint") == fingerprint:
+            return payload.get("value")
+    except (OSError, TypeError, ValueError):
+        pass
+    return None
+
+
+def _write_derived_cache(path: Path, value: object) -> None:
+    fingerprint = _catalog_cache_fingerprint()
+    if fingerprint is None:
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(json.dumps({"version": _READINESS_VERSION,
+                                         "fingerprint": fingerprint,
+                                         "saved_at": time.time(),
+                                         "value": value}), encoding="utf-8")
+        temporary.replace(path)
+    except (OSError, TypeError, ValueError):
+        app.logger.warning("Could not persist derived cache %s", path, exc_info=True)
+
+
+def _stat_fingerprint(roots: tuple[Path, ...]) -> str:
+    """Build a cheap change key from paths, sizes, and nanosecond mtimes."""
+    digest = hashlib.sha256()
+    for root in roots:
+        root = Path(root)
+        digest.update(str(root).encode())
+        if not root.exists():
+            digest.update(b"<missing>")
+            continue
+        if root.is_file():
+            try:
+                stat = root.stat()
+                digest.update(f"<file>|{stat.st_size}|{stat.st_mtime_ns}".encode())
+            except OSError:
+                digest.update(b"<unreadable>")
+            continue
+        try:
+            for current, directories, filenames in os.walk(root):
+                directories.sort()
+                filenames.sort()
+                for name in [*directories, *filenames]:
+                    path = Path(current) / name
+                    try:
+                        stat = path.stat()
+                    except OSError:
+                        continue
+                    digest.update(str(path.relative_to(root)).encode())
+                    digest.update(f"|{stat.st_size}|{stat.st_mtime_ns}".encode())
+        except OSError:
+            digest.update(b"<unreadable>")
+    return digest.hexdigest()
+
+
+def _directory_fingerprint(roots: tuple[Path, ...]) -> str:
+    """Fast structural fingerprint for media trees.
+
+    Media downloads change directory entries and directory mtimes. Avoiding
+    per-file stat calls is important on USB/DrvFs startup; the authoritative
+    catalog rebuild remains available through the explicit refresh action.
+    """
+    digest = hashlib.sha256()
+    for root in roots:
+        root = Path(root)
+        digest.update(str(root).encode())
+        if not root.exists():
+            digest.update(b"<missing>")
+            continue
+        try:
+            for current, directories, _filenames in os.walk(root):
+                directories.sort()
+                for name in directories:
+                    path = Path(current) / name
+                    try:
+                        stat = path.stat()
+                    except OSError:
+                        continue
+                    digest.update(str(path.relative_to(root)).encode())
+                    digest.update(f"|{stat.st_mtime_ns}".encode())
+        except OSError:
+            digest.update(b"<unreadable>")
+    return digest.hexdigest()
+
+
+def _startup_fingerprint() -> dict[str, str]:
+    return {
+        "media": _directory_fingerprint((MERGED_DIR, LEGACY_MERGED_DIR, FALLBACK_DIR)),
+        "playlists": _stat_fingerprint((PLAYLIST_METADATA_DIR,)),
+        "archive": _stat_fingerprint((CHECK_FILE,)),
+    }
+
+
+def _readiness_matches(fingerprint: dict[str, str]) -> bool:
+    try:
+        payload = json.loads(_STARTUP_READINESS.read_text(encoding="utf-8"))
+        return (
+            payload.get("version") == _READINESS_VERSION
+            and payload.get("fingerprint") == fingerprint
+            and CATALOG_DB.is_file()
+        )
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def _write_startup_readiness(fingerprint: dict[str, str], count: int) -> None:
+    payload = {"version": _READINESS_VERSION, "fingerprint": fingerprint,
+               "indexed_videos": count, "saved_at": time.time()}
+    _STARTUP_READINESS.parent.mkdir(parents=True, exist_ok=True)
+    temporary = _STARTUP_READINESS.with_suffix(".tmp")
+    temporary.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    temporary.replace(_STARTUP_READINESS)
+
+
+def _record_startup_run(*, source: str, started_at: float, finished_at: float,
+                        phase: str, indexed_videos: int | None = None,
+                        error: str | None = None) -> None:
+    """Persist a compact startup/catalog timing history for the Status page."""
+    run = {
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "duration_seconds": round(max(0.0, finished_at - started_at), 3),
+        "source": source,
+        "phase": phase,
+        "indexed_videos": indexed_videos,
+        "error": error,
+    }
+    try:
+        try:
+            history = json.loads(_STARTUP_HISTORY.read_text(encoding="utf-8"))
+        except (OSError, TypeError, ValueError):
+            history = []
+        if not isinstance(history, list):
+            history = []
+        history.append(run)
+        history = history[-30:]
+        _STARTUP_HISTORY.parent.mkdir(parents=True, exist_ok=True)
+        temporary = _STARTUP_HISTORY.with_suffix(".tmp")
+        temporary.write_text(json.dumps(history, indent=2), encoding="utf-8")
+        temporary.replace(_STARTUP_HISTORY)
+    except (OSError, TypeError, ValueError):
+        app.logger.warning("Could not persist startup timing history", exc_info=True)
+
+
+def _refresh_catalog_body(source: str = "startup") -> None:
+    global _catalog_refresh_state
+    started = time.perf_counter()
+    started_at = time.time()
+    with _lock:
+        _catalog_refresh_state = {**_catalog_refresh_state, "phase": "validating fingerprint",
+                                  "source": source, "started_at": started_at,
+                                  "finished_at": None, "duration_seconds": None,
+                                  "last_error": None}
+    app.logger.info(
+        "Startup: building media catalog (data=%s, strict=%s, legacy=%s, fallback=%s)",
+        DATA_ROOT, MERGED_DIR, LEGACY_MERGED_DIR, FALLBACK_DIR,
+    )
+    try:
+        fingerprint = _startup_fingerprint()
+        if _readiness_matches(fingerprint):
+            app.logger.info("Startup: validated persisted media catalog; skipping full scan")
+            finished_at = time.time()
+            _record_startup_run(source=source, started_at=started_at, finished_at=finished_at,
+                                phase="cache_hit", indexed_videos=None)
+            with _lock:
+                _catalog_refresh_state.update(
+                    phase="ready (cache hit)", finished_at=finished_at,
+                    duration_seconds=round(time.perf_counter() - started, 3),
+                )
+            _catalog_ready.set()
+            return
+        with _lock:
+            _catalog_refresh_state["phase"] = "scanning filesystem"
         count = catalog.refresh([MERGED_DIR, LEGACY_MERGED_DIR, FALLBACK_DIR], CATALOG_DB, CHECK_FILE,
                                 PLAYLIST_METADATA_DIR)
-        app.logger.info("Media catalog indexed %d videos", count)
+        _write_startup_readiness(_startup_fingerprint(), count)
+        finished_at = time.time()
+        _record_startup_run(source=source, started_at=started_at, finished_at=finished_at,
+                            phase="full_scan", indexed_videos=count)
+        app.logger.info("Startup: media catalog ready; indexed %d videos in %.1fs",
+                        count, time.perf_counter() - started)
+        with _lock:
+            _catalog_refresh_state.update(
+                phase="ready", finished_at=time.time(),
+                duration_seconds=round(time.perf_counter() - started, 3),
+                last_success=time.time(), indexed_videos=count,
+            )
         try:
             seeded = catalog.seed_settings_from_file(CATALOG_DB, SETTINGS_FILE)
             if seeded:
                 app.logger.info("Restored %d settings from %s", seeded, SETTINGS_FILE)
         except Exception:
             app.logger.exception("Settings restore failed")
-    except Exception:
-        app.logger.exception("Media catalog refresh failed")
+    except Exception as exc:
+        finished_at = time.time()
+        _record_startup_run(source=source, started_at=started_at, finished_at=finished_at,
+                            phase="error", error=str(exc))
+        with _lock:
+            _catalog_refresh_state.update(
+                phase="error", finished_at=time.time(),
+                duration_seconds=round(time.perf_counter() - started, 3),
+                last_error=str(exc),
+            )
+        app.logger.exception("Startup: media catalog refresh failed after %.1fs",
+                             time.perf_counter() - started)
+    finally:
+        _catalog_ready.set()
+
+
+def _refresh_catalog(source: str | None = None) -> None:
+    if not _catalog_refresh_lock.acquire(blocking=False):
+        app.logger.info("Catalog refresh already running")
+        return
+    try:
+        with _lock:
+            refresh_source = source or str(_catalog_refresh_state.get("source") or "startup")
+        _refresh_catalog_body(refresh_source)
+    finally:
+        _catalog_refresh_lock.release()
+
+
+def _request_catalog_refresh(reason: str = "change", delay: float = 1.5) -> None:
+    """Coalesce bursts of post-download catalog refresh requests."""
+    global _catalog_refresh_timer
+    with _lock:
+        if _catalog_refresh_timer and _catalog_refresh_timer.is_alive():
+            app.logger.info("Catalog refresh already scheduled (%s)", reason)
+            return
+        _catalog_refresh_state["source"] = reason
+        app.logger.info("Scheduling catalog refresh in %.1fs (%s)", delay, reason)
+        _catalog_refresh_timer = threading.Timer(delay, _refresh_catalog)
+        _catalog_refresh_timer.daemon = True
+        _catalog_refresh_timer.start()
 
 
 threading.Thread(target=_refresh_catalog, name="media-catalog", daemon=True).start()
@@ -152,6 +444,16 @@ def _save_playlist_metadata(playlist_id: str, title: str, webpage_url: str,
     temporary.replace(path)
 
 
+def _record_playlist_membership_best_effort(playlist_id: str, title: str,
+                                            webpage_url: str | None,
+                                            members: list[dict]) -> None:
+    """Keep the descriptor usable when SQLite is busy with a catalog scan."""
+    try:
+        catalog.record_playlist_membership(CATALOG_DB, playlist_id, title, webpage_url, members)
+    except (sqlite3.Error, OSError) as exc:
+        app.logger.info("Catalog busy; retained playlist descriptor for %s: %s", playlist_id, exc)
+
+
 def _fast_playlist_snapshot(playlist_id: str) -> tuple[dict, list[dict]] | None:
     """Read saved playlist membership without waiting on the catalog writer."""
     path = PLAYLIST_METADATA_DIR / f"{playlist_id}.info.json"
@@ -169,11 +471,21 @@ def _fast_playlist_snapshot(playlist_id: str) -> tuple[dict, list[dict]] | None:
              "webpage_url": payload.get("webpage_url"), "updated_at": payload.get("saved_at")}, members)
 
 
-def _fast_catalog_videos() -> dict[str, dict]:
+def _fast_catalog_videos(video_ids: Optional[set[str]] = None) -> dict[str, dict]:
     """Best-effort catalog enrichment with a sub-second lock wait."""
     try:
-        with sqlite3.connect(CATALOG_DB, timeout=0.25) as db:
-            rows = db.execute("SELECT video_id, title, files_json FROM videos ORDER BY CASE source_root WHEN 'merged' THEN 0 WHEN 'legacy' THEN 1 ELSE 2 END").fetchall()
+        database_uri = f"file:{CATALOG_DB}?mode=ro&immutable=1"
+        with sqlite3.connect(database_uri, uri=True, timeout=0.1) as db:
+            if video_ids:
+                placeholders = ",".join("?" for _ in video_ids)
+                rows = db.execute(
+                    f"SELECT video_id, title, files_json FROM videos "
+                    f"WHERE video_id IN ({placeholders}) "
+                    "ORDER BY CASE source_root WHEN 'merged' THEN 0 WHEN 'legacy' THEN 1 ELSE 2 END",
+                    tuple(video_ids),
+                ).fetchall()
+            else:
+                rows = db.execute("SELECT video_id, title, files_json FROM videos ORDER BY CASE source_root WHEN 'merged' THEN 0 WHEN 'legacy' THEN 1 ELSE 2 END").fetchall()
     except (sqlite3.Error, OSError):
         return {}
     videos = {}
@@ -187,6 +499,107 @@ def _fast_catalog_videos() -> dict[str, dict]:
         videos[video_id] = {"video_id": video_id, "title": title or video_id, "files": files}
     return videos
 
+
+def _descriptor_playlist_cards_body() -> list[dict]:
+    """Build a non-blocking playlist list from saved descriptor JSON."""
+    global _available_catalog_ids, _playlist_index_cache_key, _playlist_index_cache_cards
+    started = time.perf_counter()
+    cache_key = json.dumps({
+        "descriptors": _stat_fingerprint((PLAYLIST_METADATA_DIR,)),
+        "media": _directory_fingerprint((MERGED_DIR, LEGACY_MERGED_DIR, FALLBACK_DIR)),
+    }, sort_keys=True)
+    if _playlist_index_cache_key == cache_key and _playlist_index_cache_cards is not None:
+        return _playlist_index_cache_cards
+    try:
+        cached = json.loads(_PLAYLIST_INDEX_CACHE.read_text(encoding="utf-8"))
+        if cached.get("key") == cache_key:
+            cards = cached.get("cards")
+            available = cached.get("available_catalog_ids")
+            if isinstance(cards, list) and isinstance(available, list):
+                _playlist_index_cache_key = cache_key
+                _playlist_index_cache_cards = cards
+                _available_catalog_ids = set(str(item) for item in available)
+                app.logger.info("Playlist index cache hit: %d playlists", len(cards))
+                return cards
+    except (OSError, TypeError, ValueError):
+        pass
+    rows = []
+    wanted = set()
+    for path in sorted(PLAYLIST_METADATA_DIR.glob("*.info.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            continue
+        if not isinstance(payload, dict) or payload.get("_type") != "playlist":
+            continue
+        playlist_id = str(payload.get("id") or path.stem).strip()
+        if not PLAYLIST_ID_RE.match(playlist_id):
+            continue
+        entries = [item for item in (payload.get("entries") or [])
+                   if isinstance(item, dict) and item.get("video_id")]
+        rows.append((payload, playlist_id, entries))
+        wanted.update(str(item["video_id"]) for item in entries)
+
+    # Do not walk the bind-mounted media tree here. On a large USB/DrvFs
+    # archive that turns the playlist index request into a minutes-long scan.
+    # The catalog already contains the per-file snapshot needed for this
+    # count, and immutable read-only access does not contend with its writer.
+    available_ids = set()
+    if wanted:
+        database_uri = f"file:{CATALOG_DB}?mode=ro&immutable=1"
+        try:
+            with sqlite3.connect(database_uri, uri=True, timeout=0.1) as db:
+                catalog_rows = db.execute("SELECT video_id, files_json FROM videos").fetchall()
+            for video_id, raw_files in catalog_rows:
+                if video_id not in wanted:
+                    continue
+                try:
+                    files = json.loads(raw_files or "{}")
+                except (TypeError, ValueError):
+                    files = {}
+                kinds = {str(item.get("kind") or "") for item in files.values()
+                         if isinstance(item, dict)}
+                if "video" in kinds and "audio" in kinds:
+                    available_ids.add(video_id)
+        except (sqlite3.Error, OSError):
+            pass
+
+    cards = []
+    for payload, playlist_id, entries in rows:
+        available = sum(1 for item in entries if item["video_id"] in available_ids)
+        cards.append({
+            "playlist_id": playlist_id,
+            "title": payload.get("title") or playlist_id,
+            "webpage_url": payload.get("webpage_url") or f"https://www.youtube.com/playlist?list={playlist_id}",
+            "video_count": len(entries),
+            "available_count": available,
+            "missing_count": max(0, len(entries) - available),
+            "updated_at": payload.get("saved_at"),
+        })
+    cards.sort(key=lambda item: (-item["missing_count"], str(item["title"]).lower(), item["playlist_id"]))
+    _available_catalog_ids = available_ids
+    _playlist_index_cache_key = cache_key
+    _playlist_index_cache_cards = cards
+    try:
+        _PLAYLIST_INDEX_CACHE.parent.mkdir(parents=True, exist_ok=True)
+        temporary = _PLAYLIST_INDEX_CACHE.with_name(
+            f".{_PLAYLIST_INDEX_CACHE.name}.{uuid.uuid4().hex}.tmp"
+        )
+        temporary.write_text(json.dumps({"key": cache_key, "cards": cards,
+                                         "available_catalog_ids": sorted(available_ids)},
+                                        ensure_ascii=False), encoding="utf-8")
+        temporary.replace(_PLAYLIST_INDEX_CACHE)
+    except OSError:
+        app.logger.warning("Could not persist playlist index cache", exc_info=True)
+    app.logger.info("Playlist index built: %d descriptors, %d members, %d locally complete in %.1fs",
+                    len(cards), len(wanted), len(available_ids), time.perf_counter() - started)
+    return cards
+
+
+def _descriptor_playlist_cards() -> list[dict]:
+    """Serialize the expensive playlist-index build within this worker."""
+    with _playlist_index_build_lock:
+        return _descriptor_playlist_cards_body()
 
 def _recover_playlist_members_from_media(playlist_id: str) -> tuple[str, str, list[dict]] | None:
     """Recover membership from downloaded video info sidecars when a descriptor is empty."""
@@ -328,9 +741,17 @@ def _format_download_entries(
     return entries
 
 
-def _progress_hook(video_id: str):
+class _DownloadCancelled(Exception):
+    """Internal signal used to stop an in-flight yt-dlp transfer."""
+
+
+def _progress_hook(video_id: str, queue_item_id: int | None = None):
     """Create a yt-dlp hook that keeps concise progress text for the UI."""
     def hook(event: dict) -> None:
+        if queue_item_id:
+            with _lock:
+                if queue_item_id in _cancel_requests:
+                    raise _DownloadCancelled("download stopped by user")
         status = event.get("status", "")
         info = event.get("info_dict") or {}
         entry_id = str(info.get("id") or "").strip()
@@ -489,6 +910,21 @@ def _download_status_snapshot() -> dict:
     pending_videos = pending_playlists = 0
     try:
         persisted = catalog.queue_items(CATALOG_DB, 2000)
+        with _lock:
+            stopping_ids = {int(item["id"]) for item in persisted
+                            if item["status"] == "paused" and int(item["id"]) in _cancel_requests}
+        running_ids = {(item["target"], item["kind"]): int(item["id"])
+                       for item in persisted
+                       if item["status"] == "running" or int(item["id"]) in stopping_ids}
+        for entry in active:
+            queue_id = running_ids.get((entry["id"], entry["kind"]))
+            if queue_id is not None:
+                entry["queue_id"] = queue_id
+                with _lock:
+                    entry["pause_requested"] = queue_id in _pause_requests
+                    if queue_id in _cancel_requests:
+                        entry["status"] = "stopping"
+                        entry["stopping"] = True
         pending_videos = sum(1 for item in persisted if item["kind"] == "video" and item["status"] in {"running", "pending", "paused"})
         pending_playlists = sum(1 for item in persisted if item["kind"] == "playlist" and item["status"] in {"running", "pending", "paused"})
         remaining_videos = max(remaining_videos, pending_videos)
@@ -496,6 +932,15 @@ def _download_status_snapshot() -> dict:
     except (sqlite3.Error, OSError, ValueError):
         pass
     queue = _queue_summary_from_active(remaining_videos, remaining_playlists)
+    if not _catalog_ready.is_set():
+        queue["scheduler_state"] = "catalog_starting"
+        queue["scheduler_message"] = "Preparing the media catalog; queued items will start when the scan finishes."
+    elif not _queue_scheduler_ready.is_set():
+        queue["scheduler_state"] = "starting"
+        queue["scheduler_message"] = "Starting the download scheduler; queued items will begin shortly."
+    else:
+        queue["scheduler_state"] = "ready"
+        queue["scheduler_message"] = ""
     queue["pending_videos"] = max(0, pending_videos - len(active_videos))
     queue["pending_playlists"] = max(0, pending_playlists - len(active_playlists))
     return {
@@ -524,18 +969,21 @@ def _download_worker(video_id: str, cookies_browser: str | None = None, queue_it
     Tracks completion status for proper UI feedback.
     """
     success = False
+    paused = False
     error_text = ""
     started_at = time.time()
+    log_capture = _YTDlpLogCapture(video_id)
     try:
         result_code = getvidyt.download_youtube(
             video_id,
             audio_meta=True,
             cookies_browser=cookies_browser,
-            extra_opts={"progress_hooks": [_progress_hook(video_id)],
+            extra_opts={"progress_hooks": [_progress_hook(video_id, queue_item_id)],
                         "download_archive": None if (
                             _media_needs_archive_retry(video_id)
                             or _media_needs_sidecar_retry(video_id)
-                        ) else str(CHECK_FILE)},
+                        ) else str(CHECK_FILE),
+                        "logger": log_capture},
         )
         # Give filesystem time to sync archive.txt
         time.sleep(0.5)
@@ -556,15 +1004,31 @@ def _download_worker(video_id: str, cookies_browser: str | None = None, queue_it
             # yt-dlp's archive option, so archive membership is not available
             # as a completion signal here. The playable outputs are the
             # authoritative result of this download.
-            success = result_code == 0 and has_video and has_audio
+            # A playable pair is authoritative. yt-dlp may return non-zero
+            # after the media is complete when an optional postprocessor
+            # rejects a kept sidecar (notably thumbnail embedding on WebM).
+            # Treat that as complete instead of retrying into fallback forever.
+            success = has_video and has_audio
+            paused = bool(queue_item_id and queue_item_id in _pause_requests)
+            cancelled = bool(queue_item_id and queue_item_id in _cancel_requests)
+            if cancelled:
+                paused = queue_item_id not in _remove_requests
+                success = False
         if result_code:
             error_text = f"yt-dlp returned exit code {result_code}"
         elif not success:
             error_text = "download did not produce both a playable video and audio file"
+            if log_capture.lines:
+                error_text += "; " + " | ".join(log_capture.lines[-5:])
         if not success and _media_needs_archive_retry(video_id):
             _remove_from_archive(video_id)
         elif success:
             _add_to_archive(video_id)
+    except _DownloadCancelled as e:
+        error_text = str(e)
+        with _lock:
+            paused = bool(queue_item_id and queue_item_id not in _remove_requests)
+        success = False
     except Exception as e:
         error_text = str(e)
         app.logger.exception("Download failed for %s: %s", video_id, e)
@@ -573,7 +1037,11 @@ def _download_worker(video_id: str, cookies_browser: str | None = None, queue_it
         with _lock:
             _active_downloads.discard(video_id)
             # Store result for status endpoint
-            result = "completed" if success else "failed"
+            removed = bool(queue_item_id and queue_item_id in _remove_requests)
+            result = "cancelled" if removed else ("paused" if paused else ("completed" if success else "failed"))
+            _pause_requests.discard(queue_item_id)
+            _cancel_requests.discard(queue_item_id)
+            _remove_requests.discard(queue_item_id)
             finished_at = time.time()
             _download_results[video_id] = result
             _result_timestamps[video_id] = finished_at
@@ -586,8 +1054,14 @@ def _download_worker(video_id: str, cookies_browser: str | None = None, queue_it
             _cleanup_old_results()
             _cleanup_old_download_history()
             _log_queue_state_locked()
-        if success:
-            _refresh_catalog()
+        if removed:
+            if queue_item_id:
+                catalog.queue_set_status(CATALOG_DB, queue_item_id, "cancelled", error="removed by user", finished_at=time.time())
+        elif paused:
+            if queue_item_id:
+                catalog.queue_set_status(CATALOG_DB, queue_item_id, "paused", error="paused by user", finished_at=None)
+        elif success:
+            _request_catalog_refresh("completed download")
             catalog.record_attempt(CATALOG_DB, video_id, "completed", "authenticated" if cookies_browser else "standard", "", True, started_at, time.time())
             if queue_item_id:
                 catalog.queue_set_status(CATALOG_DB, queue_item_id, "completed", finished_at=time.time())
@@ -647,7 +1121,7 @@ def _prepare_playlist_membership(playlist_id: str, cookies_browser: str | None =
             if recovered:
                 title, webpage_url, members = recovered
                 _save_playlist_metadata(playlist_id, title, webpage_url, members)
-                catalog.record_playlist_membership(CATALOG_DB, playlist_id, title, webpage_url, members)
+                _record_playlist_membership_best_effort(playlist_id, title, webpage_url, members)
                 return members
             raise RuntimeError("YouTube returned no playlist members; it may be private, unavailable, or require authentication")
         members = []
@@ -669,7 +1143,7 @@ def _prepare_playlist_membership(playlist_id: str, cookies_browser: str | None =
         playlist_title = str(info.get("title") or info.get("playlist_title") or playlist_id)
         playlist_url = str(info.get("webpage_url") or f"https://www.youtube.com/playlist?list={playlist_id}")
         _save_playlist_metadata(playlist_id, playlist_title, playlist_url, members)
-        catalog.record_playlist_membership(CATALOG_DB, playlist_id, playlist_title, playlist_url, members)
+        _record_playlist_membership_best_effort(playlist_id, playlist_title, playlist_url, members)
         with _lock:
             detail = _download_details.setdefault(playlist_id, {"logs": []})
             detail["playlist_items"] = {
@@ -684,7 +1158,7 @@ def _prepare_playlist_membership(playlist_id: str, cookies_browser: str | None =
         if recovered:
             title, webpage_url, members = recovered
             _save_playlist_metadata(playlist_id, title, webpage_url, members)
-            catalog.record_playlist_membership(CATALOG_DB, playlist_id, title, webpage_url, members)
+            _record_playlist_membership_best_effort(playlist_id, title, webpage_url, members)
             return members
         app.logger.warning("Playlist preflight failed for %s; continuing download: %s", playlist_id, exc)
         return None
@@ -692,7 +1166,13 @@ def _prepare_playlist_membership(playlist_id: str, cookies_browser: str | None =
 
 def _playlist_download_worker(playlist_id: str, queue_item_id: int | None = None) -> None:
     """Download all videos from a YouTube playlist via getvidyt."""
-    members = _prepare_playlist_membership(playlist_id)
+    paused = False
+    success = False
+    try:
+        members = _prepare_playlist_membership(playlist_id)
+    except Exception:
+        app.logger.exception("Playlist refresh failed for %s", playlist_id)
+        return jsonify(ok=False, error="playlist refresh failed; check the server log and try again"), 503
     try:
         if members is not None:
             # Download each child independently. This keeps a strict success
@@ -700,10 +1180,13 @@ def _playlist_download_worker(playlist_id: str, queue_item_id: int | None = None
             # needs the fallback format.
             rc = 0
             for member in members:
+                if queue_item_id and (_pause_requested(queue_item_id) or _cancel_requested(queue_item_id)):
+                    paused = True
+                    break
                 child_rc = getvidyt.download_youtube(
                     member["video_id"],
                     audio_meta=True,
-                    extra_opts={"progress_hooks": [_progress_hook(playlist_id)],
+                    extra_opts={"progress_hooks": [_progress_hook(playlist_id, queue_item_id)],
                                 "download_archive": None if (
                                     _media_needs_archive_retry(member["video_id"])
                                     or _media_needs_sidecar_retry(member["video_id"])
@@ -711,6 +1194,9 @@ def _playlist_download_worker(playlist_id: str, queue_item_id: int | None = None
                 )
                 if child_rc:
                     rc = child_rc
+                if queue_item_id and (_pause_requested(queue_item_id) or _cancel_requested(queue_item_id)):
+                    paused = True
+                    break
         else:
             # If preflight cannot read the playlist, do not retry the entire
             # playlist into the fallback tree; that can duplicate successes.
@@ -718,31 +1204,62 @@ def _playlist_download_worker(playlist_id: str, queue_item_id: int | None = None
                 playlist_id,
                 audio_meta=True,
                 best_fallback=False,
-                extra_opts={"progress_hooks": [_progress_hook(playlist_id)]},
+                extra_opts={"progress_hooks": [_progress_hook(playlist_id, queue_item_id)]},
             )
         # Force cache refresh so status can report archive contents
         global _cached_mtime
         with _lock:
             _cached_mtime = None
         _ensure_cache()
-        success = rc == 0
+        with _lock:
+            cancelled = bool(queue_item_id and queue_item_id in _cancel_requests)
+        success = rc == 0 and not paused and not cancelled
+        if cancelled:
+            paused = queue_item_id not in _remove_requests
+    except _DownloadCancelled:
+        with _lock:
+            paused = bool(queue_item_id and queue_item_id not in _remove_requests)
+        success = False
     except Exception as e:
         app.logger.exception("Playlist download failed for %s: %s", playlist_id, e)
         success = False
     finally:
         with _lock:
             _active_playlist_downloads.discard(playlist_id)
-            result = "completed" if success else "failed"
+            removed = bool(queue_item_id and queue_item_id in _remove_requests)
+            result = "cancelled" if removed else ("paused" if paused else ("completed" if success else "failed"))
+            _pause_requests.discard(queue_item_id)
+            _cancel_requests.discard(queue_item_id)
+            _remove_requests.discard(queue_item_id)
             finished_at = time.time()
             _playlist_download_results[playlist_id] = result
             _playlist_result_timestamps[playlist_id] = finished_at
             _playlist_history[playlist_id] = result
             _playlist_history_timestamps[playlist_id] = finished_at
             if queue_item_id:
-                catalog.queue_set_status(CATALOG_DB, queue_item_id, result, finished_at=finished_at)
+                if removed:
+                    catalog.queue_set_status(CATALOG_DB, queue_item_id, "cancelled", error="removed by user", finished_at=finished_at)
+                elif paused:
+                    catalog.queue_set_status(CATALOG_DB, queue_item_id, "paused", error="paused by user", finished_at=None)
+                else:
+                    catalog.queue_set_status(CATALOG_DB, queue_item_id, result, finished_at=finished_at)
             _cleanup_old_playlist_results()
             _cleanup_old_playlist_history()
             _log_queue_state_locked()
+
+
+def _pause_requested(queue_item_id: int | None) -> bool:
+    if not queue_item_id:
+        return False
+    with _lock:
+        return queue_item_id in _pause_requests
+
+
+def _cancel_requested(queue_item_id: int | None) -> bool:
+    if not queue_item_id:
+        return False
+    with _lock:
+        return queue_item_id in _cancel_requests
 
 
 def _start_queue_item(item: dict) -> bool:
@@ -759,6 +1276,7 @@ def _start_queue_item(item: dict) -> bool:
         _download_details[target] = {"phase": "queued", "percent": 0, "filename": "", "files": {}, "logs": []}
         _log_queue_state_locked()
     catalog.queue_set_status(CATALOG_DB, item_id, "running", started_at=started)
+    app.logger.info("Queue start: id=%d kind=%s target=%s", item_id, kind, target)
     worker = _download_worker if kind == "video" else _playlist_download_worker
     args = (target, item.get("cookies_browser"), item_id) if kind == "video" else (target, item_id)
     threading.Thread(target=worker, args=args, daemon=True).start()
@@ -781,14 +1299,17 @@ def _recover_running_queue_items() -> int:
 
 
 def _queue_scheduler() -> None:
+    app.logger.info("Startup: download queue scheduler starting")
     recovered = False
     while True:
         try:
             now = time.time()
             if not recovered:
-                _recover_running_queue_items()
+                recovered_count = _recover_running_queue_items()
                 _repair_queue_kinds(catalog.queue_items(CATALOG_DB, 100))
+                app.logger.info("Startup: queue scheduler ready; recovered %d interrupted item(s)", recovered_count)
                 recovered = True
+                _queue_scheduler_ready.set()
             for item in catalog.queue_items(CATALOG_DB, 100):
                 if item["status"] != "pending":
                     continue
@@ -903,13 +1424,18 @@ def _file_kind(path: Path) -> str:
 
 def _media_file_entry(path: Path, channel_id: str, video_id: str, media_prefix: str = "/media") -> dict:
     stat = path.stat()
-    return {
+    entry = {
         "name": path.name,
         "url": f"{media_prefix}/{quote(channel_id, safe='')}/{quote(video_id, safe='')}/{quote(path.name, safe='')}",
         "kind": _file_kind(path),
         "size": stat.st_size,
         "mtime": stat.st_mtime,
     }
+    if path.suffix.lower() == ".m4a" and path.name.endswith(".out.m4a") and not _SIDECAR_RE.search(path.name):
+        entry.update(delivery="generated", processing="remuxed/tagged")
+    elif _SIDECAR_RE.search(path.name):
+        entry["delivery"] = "downloaded"
+    return entry
 
 
 def _media_file_url(channel_id: str, video_id: str, filename: str) -> str:
@@ -1975,7 +2501,10 @@ def api_docs_page():
         ("GET", "/api/queue", "Persistent queue items and default mode"),
         ("POST", "/api/queue", "Add a video or playlist to the queue"),
         ("POST", "/api/queue/<item_id>/start", "Start a paused queue item"),
-        ("POST", "/api/queue/<item_id>/cancel", "Cancel a pending queue item"),
+        ("POST", "/api/queue/<item_id>/pause", "Pause a running queue item after its current download boundary"),
+        ("POST", "/api/queue/<item_id>/stop", "Stop a running queue item and leave it paused"),
+        ("POST", "/api/queue/<item_id>/cancel", "Cancel a pending or running queue item; running items stop first"),
+        ("POST", "/api/queue/clear", "Remove pending and paused queue items without interrupting active downloads"),
         ("GET/POST", "/api/settings", "Read or update queue defaults"),
         ("GET", "/api/media/library", "List local media"),
         ("GET", "/api/media/library/files", "List links for every local library file"),
@@ -1997,6 +2526,8 @@ def api_docs_page():
         ("GET", "/api/media/download-history", "Persistent download history"),
         ("GET", "/api/media/wordcloud", "Description word frequencies"),
         ("GET", "/api/system/status", "Disk, directory, and cookie diagnostics"),
+        ("GET", "/api/system/cache-status", "Cache coverage and refresh state"),
+        ("GET", "/api/system/startup-history", "Persisted cold/warm startup timings"),
     ]
     return render_template("api-docs.html", endpoints=endpoints)
 
@@ -2170,6 +2701,9 @@ def api_media_library():
     # request must return the complete matching card set. Explicit ``page``
     # requests remain available for API consumers.
     paginated = request.args.get("page") is not None
+    if not _catalog_ready.is_set():
+        return jsonify(videos=[], page=page, per_page=per_page, total=0, pages=0,
+                       initializing=True, message="Media catalog is still building")
     try:
         if paginated:
             items, total = catalog.library_cards(
@@ -2197,9 +2731,13 @@ def api_media_library():
 
 @app.get("/api/media/library/files")
 def api_media_library_files():
+    cached = _read_derived_cache(_EXPORTS_CACHE)
+    if isinstance(cached, dict) and isinstance(cached.get("files"), list):
+        return jsonify(files=cached["files"], count=len(cached["files"]))
     try:
         files = catalog.library_files(CATALOG_DB)
         if files:
+            _write_derived_cache(_EXPORTS_CACHE, {"files": files})
             return jsonify(files=files, count=len(files))
     except (sqlite3.Error, OSError, ValueError):
         pass
@@ -2207,32 +2745,32 @@ def api_media_library_files():
     for video in _scan_library_cached():
         for item in video.get("details", {}).get("files", []):
             files.append({"video_id": video["video_id"], "title": video["title"], **item})
+    _write_derived_cache(_EXPORTS_CACHE, {"files": files})
     return jsonify(files=files, count=len(files))
 
 
 @app.get("/api/media/library/files.txt")
 def api_media_library_files_text():
-    try:
-        files = catalog.library_files(CATALOG_DB)
-        if files:
-            lines = [f"{item['video_id']}\t{item['title']}\t{item['name']}\t{request.host_url.rstrip('/')}{item['url']}"
-                     for item in files if item.get("url")]
-            return Response("\n".join(lines) + ("\n" if lines else ""), mimetype="text/plain",
-                            headers={"Content-Disposition": "attachment; filename=dihi-library-files.txt"})
-    except (sqlite3.Error, OSError, ValueError):
-        pass
-    lines = []
-    for video in _scan_library_cached():
-        for item in video.get("details", {}).get("files", []):
-            lines.append(f"{video['video_id']}\t{video['title']}\t{item['name']}\t{request.host_url.rstrip('/')}{item['url']}")
+    cached = _read_derived_cache(_EXPORTS_CACHE)
+    files = cached.get("files") if isinstance(cached, dict) else None
+    if not isinstance(files, list):
+        response = api_media_library_files()
+        files = response.get_json().get("files", [])
+    lines = [f"{item['video_id']}\t{item['title']}\t{item['name']}\t{request.host_url.rstrip('/')}{item['url']}"
+             for item in files if item.get("url")]
     return Response("\n".join(lines) + ("\n" if lines else ""), mimetype="text/plain",
                     headers={"Content-Disposition": "attachment; filename=dihi-library-files.txt"})
 
 
 def _library_youtube_exports() -> tuple[list[str], list[str]]:
+    cached = _read_derived_cache(_EXPORTS_CACHE)
+    cached_payload = cached if isinstance(cached, dict) else {}
+    if isinstance(cached, dict) and isinstance(cached.get("youtube"), list) and isinstance(cached.get("ids"), list):
+        return cached["youtube"], cached["ids"]
     try:
         links, ids = catalog.library_exports(CATALOG_DB)
         if links or ids:
+            _write_derived_cache(_EXPORTS_CACHE, {"files": cached_payload.get("files", []), "youtube": links, "ids": ids})
             return links, ids
     except (sqlite3.Error, OSError, ValueError):
         pass
@@ -2256,7 +2794,9 @@ def _library_youtube_exports() -> tuple[list[str], list[str]]:
                 playlists.append(str(playlist.get("webpage_url") or f"https://www.youtube.com/playlist?list={playlist_id}"))
     except sqlite3.Error:
         pass
-    return videos + playlists, [*(f"video {value}" for value in video_ids), *(f"playlist {value}" for value in playlist_ids)]
+    links, ids = videos + playlists, [*(f"video {value}" for value in video_ids), *(f"playlist {value}" for value in playlist_ids)]
+    _write_derived_cache(_EXPORTS_CACHE, {"files": cached_payload.get("files", []), "youtube": links, "ids": ids})
+    return links, ids
 
 
 @app.get("/api/media/library/youtube.txt")
@@ -2275,7 +2815,13 @@ def api_media_library_ids_text():
 
 @app.get("/api/media/playlists")
 def api_media_playlists():
-    return jsonify(playlists=catalog.playlists(CATALOG_DB))
+    descriptors = _descriptor_playlist_cards()
+    if descriptors:
+        return jsonify(playlists=descriptors)
+    try:
+        return jsonify(playlists=catalog.playlists(CATALOG_DB))
+    except (sqlite3.Error, OSError, ValueError):
+        return jsonify(playlists=_descriptor_playlist_cards())
 
 
 @app.post("/api/media/playlists/snapshot")
@@ -2310,7 +2856,7 @@ def api_media_playlist_snapshot():
     source_url = str(payload.get("webpage_url") or f"https://www.youtube.com/playlist?list={source_id}")
     snapshot_title = f"{title} — snapshot {time.strftime('%Y-%m-%d %H:%M', time.localtime(now))}"
     _save_playlist_metadata(snapshot_id, snapshot_title, source_url, members)
-    catalog.record_playlist_membership(CATALOG_DB, snapshot_id, snapshot_title, source_url, members)
+    _record_playlist_membership_best_effort(snapshot_id, snapshot_title, source_url, members)
     queued = 0
     if payload.get("queue"):
         start_now = bool(payload.get("start_now", False))
@@ -2356,7 +2902,33 @@ def api_media_playlist(playlist_id: str):
             playlist = None
     if not playlist:
         return jsonify(error="playlist not found"), 404
-    videos_by_id = _fast_catalog_videos()
+    # Never fall back to one filesystem walk per member here. A large
+    # playlist can contain thousands of unavailable IDs, and each walk scans
+    # every channel directory on a USB/DrvFs archive. Missing catalog rows
+    # remain represented by ``video: null`` and can be refreshed/retried.
+    # Large saved descriptors must render while the catalog may still be
+    # rebuilding on a USB-backed data root. Returning the saved member rows is
+    # preferable to holding the request at the browser's timeout boundary;
+    # smaller/indexed playlists still receive playable catalog enrichment.
+    if snapshot and len(snapshot_members) > 50:
+        # The playlist descriptor is the fast source of truth for large
+        # playlists. Reuse the availability map built for the playlist cards
+        # so downloaded members are not mislabeled "not local" merely because
+        # we skipped expensive per-member metadata enrichment.
+        videos_by_id = {
+            str(member["video_id"]): {
+                "video_id": str(member["video_id"]),
+                "title": member.get("title") or member["video_id"],
+                "files": {
+                    "video": {"kind": "video"},
+                    "audio": {"kind": "audio"},
+                },
+            }
+            for member in snapshot_members
+            if str(member["video_id"]) in _available_catalog_ids
+        }
+    else:
+        videos_by_id = _fast_catalog_videos({str(member["video_id"]) for member in snapshot_members})
     members = []
     for member in snapshot_members:
         video = videos_by_id.get(member["video_id"])
@@ -2392,8 +2964,8 @@ def api_media_playlist_add(playlist_id: str):
     members.append(member)
     webpage_url = playlist.get("webpage_url") or f"https://www.youtube.com/playlist?list={playlist_id}"
     _save_playlist_metadata(playlist_id, playlist.get("title") or playlist_id, webpage_url, members)
-    catalog.record_playlist_membership(CATALOG_DB, playlist_id, playlist.get("title") or playlist_id,
-                                       webpage_url, members)
+    _record_playlist_membership_best_effort(playlist_id, playlist.get("title") or playlist_id,
+                                            webpage_url, members)
     return jsonify(ok=True, playlist_id=playlist_id, video_id=video_id,
                    already_present=False, members=len(members))
 
@@ -2403,7 +2975,8 @@ def api_media_playlist_refresh(playlist_id: str):
     """Refresh membership only; never removes local media files."""
     if not PLAYLIST_ID_RE.match(playlist_id):
         return jsonify(error="invalid playlist id"), 400
-    had_members = bool(catalog.playlist_video_ids(CATALOG_DB, playlist_id))
+    snapshot = _fast_playlist_snapshot(playlist_id)
+    had_members = bool(snapshot and snapshot[1])
     members = _prepare_playlist_membership(playlist_id)
     if members is None:
         return jsonify(ok=False, error="could not refresh playlist metadata; YouTube returned no members and no local metadata was available"), 503
@@ -2468,13 +3041,19 @@ def api_media_playlist_m3u(playlist_id: str):
 
 @app.get("/api/media/tags")
 def api_media_tags():
+    cached = _read_derived_cache(_TAGS_CACHE)
+    if isinstance(cached, dict) and "tags" in cached:
+        return jsonify(cached)
     try:
         grouped = catalog.library_tags(CATALOG_DB)
         if grouped.get("tags"):
+            _write_derived_cache(_TAGS_CACHE, grouped)
             return jsonify(grouped)
     except (sqlite3.Error, OSError, ValueError):
         pass
-    return jsonify(_scan_tags())
+    grouped = _scan_tags()
+    _write_derived_cache(_TAGS_CACHE, grouped)
+    return jsonify(grouped)
 
 
 @app.get("/api/media/resolve/<string:video_id>")
@@ -2497,7 +3076,12 @@ def api_downloads_status():
 
 @app.get("/api/queue")
 def api_queue_list():
-    return jsonify(items=_repair_queue_kinds(catalog.queue_items(CATALOG_DB)),
+    items = _repair_queue_kinds(catalog.queue_items(CATALOG_DB))
+    with _lock:
+        for item in items:
+            item["pause_requested"] = int(item["id"]) in _pause_requests
+            item["stopping"] = int(item["id"]) in _cancel_requests
+    return jsonify(items=items,
                    default_mode=catalog.setting(CATALOG_DB, "default_download_mode", "immediate"))
 
 
@@ -2548,24 +3132,65 @@ def api_queue_start(item_id: int):
     return jsonify(ok=False, error="pending queue item not found"), 404
 
 
+@app.post("/api/queue/<int:item_id>/pause")
+def api_queue_pause(item_id: int):
+    for item in catalog.queue_items(CATALOG_DB, 2000):
+        if int(item["id"]) == item_id and item["status"] == "running":
+            with _lock:
+                _pause_requests.add(item_id)
+            return jsonify(ok=True, id=item_id, status="pausing")
+    return jsonify(ok=False, error="running queue item not found"), 404
+
+
 @app.post("/api/queue/<int:item_id>/cancel")
 def api_queue_cancel(item_id: int):
     for item in catalog.queue_items(CATALOG_DB, 2000):
+        if int(item["id"]) == item_id and item["status"] == "running":
+            with _lock:
+                _cancel_requests.add(item_id)
+                _remove_requests.add(item_id)
+            return jsonify(ok=True, id=item_id, status="stopping", removed=True)
         if int(item["id"]) == item_id and item["status"] == "pending":
             catalog.queue_set_status(CATALOG_DB, item_id, "cancelled", finished_at=time.time())
+            return jsonify(ok=True, id=item_id)
+        if int(item["id"]) == item_id and item["status"] == "paused":
+            catalog.queue_set_status(CATALOG_DB, item_id, "cancelled", finished_at=time.time(), error="removed by user")
             return jsonify(ok=True, id=item_id)
     return jsonify(ok=False, error="pending queue item not found"), 404
 
 
+@app.post("/api/queue/<int:item_id>/stop")
+def api_queue_stop(item_id: int):
+    for item in catalog.queue_items(CATALOG_DB, 2000):
+        if int(item["id"]) == item_id and item["status"] == "running":
+            with _lock:
+                _cancel_requests.add(item_id)
+                _remove_requests.discard(item_id)
+            # Keep the worker active until yt-dlp reaches its next callback,
+            # but persist paused immediately so the scheduler cannot treat the
+            # requested stop as a runnable item or make it look restarted.
+            catalog.queue_set_status(
+                CATALOG_DB, item_id, "paused",
+                error="stop requested; finishing current boundary",
+                finished_at=None,
+            )
+            return jsonify(ok=True, id=item_id, status="stopping")
+    return jsonify(ok=False, error="running queue item not found"), 404
+
+
 @app.post("/api/queue/start-all")
 def api_queue_start_all():
-    changed = 0
-    for item in catalog.queue_items(CATALOG_DB, 2000):
-        if item["status"] == "paused":
-            catalog.queue_set_status(CATALOG_DB, int(item["id"]), "pending", scheduled_at=time.time())
-            changed += 1
+    changed = catalog.queue_start_all(CATALOG_DB)
     _queue_wakeup.set()
     return jsonify(ok=True, started=changed)
+
+
+@app.post("/api/queue/clear")
+def api_queue_clear():
+    with _lock:
+        protected = set(_cancel_requests)
+    cleared = catalog.queue_clear(CATALOG_DB, protected)
+    return jsonify(ok=True, cleared=cleared)
 
 
 @app.post("/api/queue/cancel-all")
@@ -2797,6 +3422,11 @@ def api_media_download_history():
 @app.get("/api/system/status")
 def api_system_status():
     """Return safe operational diagnostics without exposing cookie contents."""
+    global _system_status_cache
+    now = time.time()
+    with _lock:
+        if _system_status_cache and now - _system_status_cache[0] < 15:
+            return jsonify(_system_status_cache[1])
     usage = shutil.disk_usage(Path.cwd())
     # Cookies live at data/cookies.txt in both host and container layouts.
     # The old root ./cookies.txt is kept as a legacy fallback candidate.
@@ -2828,7 +3458,105 @@ def api_system_status():
                 except ValueError: pass
             result["cookies"]["youtube_domains"] = sorted(set(result["cookies"]["youtube_domains"]))
         except OSError: pass
+    with _lock:
+        _system_status_cache = (time.time(), result)
     return jsonify(result)
+
+
+def _cache_file_status(path: Path) -> tuple[str, float | None]:
+    try:
+        return ("available", path.stat().st_mtime) if path.is_file() else ("missing", None)
+    except OSError:
+        return "unavailable", None
+
+
+@app.get("/api/system/cache-status")
+def api_system_cache_status():
+    readiness, readiness_at = _cache_file_status(_STARTUP_READINESS)
+    playlist_cache, playlist_cache_at = _cache_file_status(_PLAYLIST_INDEX_CACHE)
+    verify_cache, verify_cache_at = _cache_file_status(_VERIFY_CACHE)
+    cleanup_state = "cached" if _cleanup_report_cache and time.time() - _cleanup_report_cache[0] < 15 else "live/on demand"
+    with _lock:
+        system_cache_at = _system_status_cache[0] if _system_status_cache else None
+    tags_cache, tags_cache_at = _cache_file_status(_TAGS_CACHE)
+    exports_cache, exports_cache_at = _cache_file_status(_EXPORTS_CACHE)
+    with _lock:
+        catalog_operation = dict(_catalog_refresh_state)
+    return jsonify(items=[
+        {"key": "catalog", "endpoint": "/api/media/library", "source": "SQLite catalog", "state": catalog_operation.get("phase") or ("ready" if _catalog_ready.is_set() else "building"), "cache": readiness, "last_updated": readiness_at, "refreshable": True, "note": "Validated media/archive/descriptor fingerprint", "operation": catalog_operation},
+        {"key": "playlist-index", "endpoint": "/api/media/playlists", "source": "Local playlist descriptors + SQLite", "state": "cached" if playlist_cache == "available" else "on demand", "cache": playlist_cache, "last_updated": playlist_cache_at, "refreshable": True, "note": "Names, members, ordering, and local availability"},
+        {"key": "tags", "endpoint": "/api/media/tags", "source": "SQLite catalog", "state": "cached" if tags_cache == "available" else "on demand", "cache": tags_cache, "last_updated": tags_cache_at, "refreshable": True, "note": "Persisted by catalog fingerprint"},
+        {"key": "exports", "endpoint": "/api/media/library/files* and exports", "source": "SQLite catalog", "state": "cached" if exports_cache == "available" else "on demand", "cache": exports_cache, "last_updated": exports_cache_at, "refreshable": True, "note": "Files and YouTube/ID exports share one fingerprinted cache"},
+        {"key": "video-details", "endpoint": "/api/media/details and /api/media/resolve", "source": "SQLite + live video directory", "state": "live query", "cache": "none", "last_updated": None, "refreshable": True, "note": "Per-video reads stay current"},
+        {"key": "cleanup-report", "endpoint": "/api/media/cleanup-report", "source": "Filesystem + FFprobe", "state": cleanup_state, "cache": "15-second memory cache", "last_updated": _cleanup_report_cache[0] if _cleanup_report_cache else None, "refreshable": True, "note": "Potentially heavy filesystem analysis"},
+        {"key": "verification", "endpoint": "/api/media/cleanup/verify", "source": "Filesystem + FFmpeg + MD5", "state": "cached per file" if verify_cache == "available" else "on demand", "cache": verify_cache, "last_updated": verify_cache_at, "refreshable": True, "note": "Full verification is intentionally explicit"},
+        {"key": "system-status", "endpoint": "/api/system/status", "source": "Disk/cookie scan", "state": "cached" if system_cache_at else "on demand", "cache": "15-second memory cache", "last_updated": system_cache_at, "refreshable": True, "note": "Directory sizes are refreshed periodically"},
+        {"key": "queue", "endpoint": "/api/queue and /api/downloads/status", "source": "SQLite + in-memory workers", "state": "live query", "cache": "none", "last_updated": None, "refreshable": True, "note": "Must remain current"},
+    ])
+
+
+@app.get("/api/system/startup-history")
+def api_system_startup_history():
+    try:
+        history = json.loads(_STARTUP_HISTORY.read_text(encoding="utf-8"))
+        if not isinstance(history, list):
+            history = []
+    except (OSError, TypeError, ValueError):
+        history = []
+    return jsonify(runs=history[-30:])
+
+
+@app.post("/api/system/cache-refresh/<string:key>")
+def api_system_cache_refresh(key: str):
+    global _playlist_index_cache_key, _playlist_index_cache_cards, _cleanup_report_cache, _system_status_cache
+    valid = {"catalog", "playlist-index", "tags", "exports", "video-details", "cleanup-report", "verification", "system-status", "queue"}
+    if key not in valid:
+        return jsonify(ok=False, error="unknown cache or endpoint group"), 404
+    if key == "catalog":
+        _catalog_ready.clear()
+        _playlist_index_cache_key = None
+        _playlist_index_cache_cards = None
+        for path in (_STARTUP_READINESS, _PLAYLIST_INDEX_CACHE):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        threading.Thread(target=_refresh_catalog, kwargs={"source": "manual refresh"}, name="manual-catalog-refresh", daemon=True).start()
+        return jsonify(ok=True, status="building", message="Catalog refresh started"), 202
+    if key == "playlist-index":
+        _playlist_index_cache_key = None
+        _playlist_index_cache_cards = None
+        try:
+            _PLAYLIST_INDEX_CACHE.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return jsonify(ok=True, status="invalidated", message="Playlist index will rebuild on its next request")
+    if key == "tags":
+        try:
+            _TAGS_CACHE.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return jsonify(ok=True, status="invalidated", message="Tags cache cleared; it will rebuild on its next request")
+    if key == "exports":
+        try:
+            _EXPORTS_CACHE.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return jsonify(ok=True, status="invalidated", message="Export cache cleared; it will rebuild on its next request")
+    if key == "cleanup-report":
+        _cleanup_report_cache = None
+        return jsonify(ok=True, status="invalidated", message="Cleanup report cache cleared")
+    if key == "verification":
+        try:
+            _VERIFY_CACHE.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return jsonify(ok=True, status="invalidated", message="Verification cache cleared; next verification will recheck files")
+    if key == "system-status":
+        with _lock:
+            _system_status_cache = None
+        return jsonify(ok=True, status="invalidated", message="System status cache cleared")
+    return jsonify(ok=True, status="live", message="This endpoint is live and has no persistent cache to clear")
 
 
 @app.get("/api/youtube/status/<string:video_id>")
@@ -2901,7 +3629,7 @@ def api_youtube_playlist_prepare(playlist_id: str):
                     if recovered:
                         title, webpage_url, members = recovered
                         _save_playlist_metadata(pid, title, webpage_url, members)
-                        catalog.record_playlist_membership(CATALOG_DB, pid, title, webpage_url, members)
+                        _record_playlist_membership_best_effort(pid, title, webpage_url, members)
                         return jsonify(ok=True, id=pid, prepared=True, existing=True,
                                        repaired=True, members=len(members))
                 return jsonify(ok=True, id=pid, prepared=True, existing=True, members=len(members))
