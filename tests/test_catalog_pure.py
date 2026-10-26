@@ -1,4 +1,5 @@
 import json
+import catalog
 
 from catalog import (
     library_cards,
@@ -44,6 +45,37 @@ def test_refresh_indexes_metadata_files_and_subtitle_languages(tmp_path):
     assert files["Title [video-id].out.en.vtt"]["source_root"] == tmp_path.name
     assert files["Title [video-id].out.en-orig.vtt"]["subtitle_language"] == "en-orig"
     assert tags == [("music",)]
+
+
+def test_refresh_skips_unchanged_video_metadata(tmp_path, monkeypatch):
+    root = tmp_path / "media"
+    _make_video(root, "channel", "aaaaaaaaaaa", "Stable")
+    db = tmp_path / "catalog.db"
+    assert refresh(root, db) == 1
+
+    monkeypatch.setattr(catalog, "_info", lambda _path: (_ for _ in ()).throw(
+        AssertionError("unchanged video metadata should not be reparsed")))
+
+    assert refresh(root, db) == 1
+
+
+def test_incremental_refresh_updates_one_video_without_pruning_other_rows(tmp_path):
+    root = tmp_path / "media"
+    first = _make_video(root, "channel", "aaaaaaaaaaa", "First")
+    _make_video(root, "channel", "bbbbbbbbbbb", "Second")
+    db = tmp_path / "catalog.db"
+    assert refresh(root, db) == 2
+
+    info_path = next(first.glob("*.info.json"))
+    info = json.loads(info_path.read_text(encoding="utf-8"))
+    info["title"] = "First updated"
+    info_path.write_text(json.dumps(info), encoding="utf-8")
+
+    assert refresh(root, db, only_video_ids={"aaaaaaaaaaa"}) == 1
+    cards, total = library_cards(db)
+    assert total == 2
+    titles = {card["video_id"]: card["title"] for card in cards}
+    assert titles == {"aaaaaaaaaaa": "First updated", "bbbbbbbbbbb": "Second"}
 
 
 def test_refresh_restores_playlist_from_descriptor(tmp_path):

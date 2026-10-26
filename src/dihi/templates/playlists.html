@@ -94,7 +94,7 @@ list.addEventListener('click', async event => {
     videoButton.textContent = 'Queuing…';
     try {
       const response = await fetch(`/api/youtube/get/${encodeURIComponent(videoButton.dataset.downloadVideo)}`, {method:'POST'});
-      const data = await response.json();
+      const data = await jsonResponse(response);
       if (!response.ok || !data.ok) throw new Error(data.error || `HTTP ${response.status}`);
       videoButton.textContent = data.already_running ? 'Already queued' : 'Queued';
     } catch (error) { videoButton.textContent = `Failed: ${error.message}`; videoButton.disabled = false; }
@@ -107,8 +107,9 @@ list.addEventListener('click', async event => {
   button.textContent = 'Checking…';
   try {
     const response = await fetch(`/api/media/playlists/${encodeURIComponent(article.dataset.id)}/finish`, {method:'POST'});
-    const data = await response.json();
+    const data = await jsonResponse(response);
     if (!response.ok || !data.ok) throw new Error(data.error || `HTTP ${response.status}`);
+    article.querySelectorAll('.download-video').forEach(videoButton => { videoButton.disabled = true; videoButton.textContent = 'Queued'; });
     button.textContent = data.queued ? `Queued ${data.queued} missing` : data.already_queued ? 'Already queued' : `All ${data.skipped_complete || 0} already downloaded`;
   } catch (error) { button.textContent = `Failed: ${error.message}`; button.disabled = false; }
 });

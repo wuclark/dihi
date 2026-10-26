@@ -57,7 +57,11 @@ def test_health_ok(client):
 def test_queue_start_all_promotes_paused_items(client, env, monkeypatch):
     monkeypatch.setattr(app3.catalog, "queue_start_all", lambda _database: 3)
     monkeypatch.setattr(app3, "_queue_wakeup", type(
-        "NoopEvent", (), {"set": lambda self: None, "clear": lambda self: None}
+        "NoopEvent", (), {
+            "set": lambda self: None,
+            "clear": lambda self: None,
+            "wait": lambda self, _timeout=None: None,
+        }
     )())
 
     response = client.post("/api/queue/start-all")
@@ -252,7 +256,11 @@ def test_playlist_finish_queues_members_independently(client, env, monkeypatch):
     queued = []
     monkeypatch.setattr(app3, "_enqueue_target", lambda target, kind, **kwargs: (queued.append((target, kind)) or (len(queued), False)))
     monkeypatch.setattr(app3, "_queue_wakeup", type(
-        "NoopEvent", (), {"set": lambda self: None, "clear": lambda self: None}
+        "NoopEvent", (), {
+            "set": lambda self: None,
+            "clear": lambda self: None,
+            "wait": lambda self, _timeout=None: None,
+        }
     )())
 
     response = client.post("/api/media/playlists/PLtestplaylist01/finish")
@@ -261,6 +269,47 @@ def test_playlist_finish_queues_members_independently(client, env, monkeypatch):
     assert queued == [("dQw4w9WgXcQ", "video"), ("kIll0-AyMa0", "video")]
     assert response.get_json()["queued"] == 2
     assert response.get_json()["members"] == 2
+
+
+def test_playlist_finish_uses_saved_descriptor_when_catalog_membership_is_missing(client, env, monkeypatch):
+    env["playlists"].mkdir()
+    (env["playlists"] / "PLdescriptor01.info.json").write_text(json.dumps({
+        "_type": "playlist", "id": "PLdescriptor01", "title": "Saved list",
+        "entries": [
+            {"video_id": "dQw4w9WgXcQ", "playlist_index": 1},
+            {"video_id": "kIll0-AyMa0", "playlist_index": 2},
+        ],
+    }))
+    queued = []
+    monkeypatch.setattr(app3, "_enqueue_target", lambda target, kind, **kwargs: (queued.append((target, kind)) or (len(queued), False)))
+    monkeypatch.setattr(app3, "_queue_wakeup", type(
+        "NoopEvent", (), {
+            "set": lambda self: None,
+            "clear": lambda self: None,
+            "wait": lambda self, _timeout=None: None,
+        }
+    )())
+
+    response = client.post("/api/media/playlists/PLdescriptor01/finish")
+
+    assert response.status_code == 200
+    assert queued == [("dQw4w9WgXcQ", "video"), ("kIll0-AyMa0", "video")]
+    assert response.get_json()["queued"] == 2
+
+
+def test_video_queue_returns_json_when_catalog_is_temporarily_unavailable(client, env, monkeypatch):
+    monkeypatch.setattr(app3, "_media_needs_archive_retry", lambda _video_id: False)
+    monkeypatch.setattr(app3.catalog, "setting", lambda *_args: (_ for _ in ()).throw(
+        app3.sqlite3.OperationalError("database is locked")))
+
+    response = client.post("/api/youtube/get/dQw4w9WgXcQ")
+
+    assert response.status_code == 503
+    assert response.is_json
+    assert response.get_json() == {
+        "ok": False,
+        "error": "download queue is temporarily unavailable; try again shortly",
+    }
 
 
 def test_playlist_prepare_repairs_empty_descriptor_from_video_metadata(client, env):

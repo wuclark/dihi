@@ -113,17 +113,17 @@ h2 { font-size: 0.95rem; font-weight: 650; }
 
 <main>
   <div class="section-head">
-    <h1>Downloads</h1>
+    <h1>Download activity</h1>
     <span class="muted" id="updated"></span>
   </div>
 
   <section class="queue-output" aria-live="polite">
     <div>
-      <div class="queue-title">Queue</div>
+      <div class="queue-title">Queue summary</div>
       <div class="queue-value" id="queue-output">Loading...</div>
     </div>
     <span class="muted" id="queue-detail"></span>
-    <span class="links"><button class="hbtn" id="start-all-paused">Start all paused</button><button class="hbtn" id="clear-queue">Clear queue</button><a class="hbtn" href="/queue">Manage queue</a></span>
+    <span class="links"><a class="hbtn" href="/queue">Open queue &amp; controls</a></span>
   </section>
   <section class="queue-output"><div><div class="queue-title">System status</div><div class="muted" id="system-status">Checking disk and cookies…</div></div></section>
 
@@ -169,37 +169,6 @@ async function loadStatus() {
     $('updated').textContent = `Failed to load downloads: ${e.message}`;
   }
 }
-
-$('start-all-paused').onclick = async () => {
-  const button = $('start-all-paused');
-  button.disabled = true;
-  button.textContent = 'Starting…';
-  try {
-    const body = await fetchJson('/api/queue/start-all', {method: 'POST'});
-    button.textContent = body.started ? `Started ${body.started}` : 'Nothing paused';
-    setTimeout(() => { button.textContent = 'Start all paused'; loadStatus(); }, 1500);
-  } catch (error) {
-    button.disabled = false;
-    button.textContent = 'Start failed';
-    button.title = error.message;
-  }
-};
-
-$('clear-queue').onclick = async () => {
-  if (!confirm('Clear all pending and paused queue items? Active downloads will continue.')) return;
-  const button = $('clear-queue');
-  button.disabled = true;
-  button.textContent = 'Clearing…';
-  try {
-    const body = await fetchJson('/api/queue/clear', {method: 'POST'});
-    button.textContent = body.cleared ? `Cleared ${body.cleared}` : 'Queue already clear';
-    setTimeout(() => { button.textContent = 'Clear queue'; button.disabled = false; loadStatus(); }, 1500);
-  } catch (error) {
-    button.disabled = false;
-    button.textContent = 'Clear failed';
-    button.title = error.message;
-  }
-};
 
 function render(data) {
   const counts = data.counts || {};

@@ -2,7 +2,7 @@
 
 const $ = (id) => document.getElementById(id);
 const esc = (value) => String(value ?? '').replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const state = {items: [], filtered: [], query: '', artist: '', sort: 'date-desc', view: localStorage.getItem('dihi-view') || 'grid', limit: 120, current: null, mode: localStorage.getItem('dihi-audio-only') === '1' ? 'audio' : 'video', queue: JSON.parse(localStorage.getItem('dihi-player-queue') || '[]'), playback: null, playbackIndex: -1, playlist: '', playlistSort: localStorage.getItem('dihi-playlist-sort') || 'title', playlistMembers: null, playlists: []};
+const state = {items: [], filtered: [], query: '', artist: '', sort: 'date-desc', view: localStorage.getItem('dihi-view') || 'grid', limit: 120, current: null, mode: localStorage.getItem('dihi-audio-only') === '1' ? 'audio' : 'video', queue: JSON.parse(localStorage.getItem('dihi-player-queue') || '[]'), playback: null, playbackIndex: -1, playlist: '', playlistSort: localStorage.getItem('dihi-playlist-sort') || 'title', playlistMembers: null, playlists: [], tags: {}, generation: 0, nextPage: 1, pages: 1, total: 0, loading: false};
 const videoEl = $('player-video');
 const audioEl = $('player-audio');
 const fullscreenControls = document.createElement('div');
@@ -19,7 +19,7 @@ function entries(video) { return Object.values(video.files || {}).map((item) => 
 function media(video, kind) { return entries(video).find((item) => item.kind === kind || (!item.kind && new RegExp(kind === 'video' ? '\\.(mkv|mp4|webm)(?:\\?|$)' : '\\.(m4a|opus|webm)(?:\\?|$)', 'i').test(item.url || ''))); }
 function subtitles(video) { return entries(video).filter((item) => item.kind === 'subtitle' || item.kind === 'subtitles' || /\.(vtt|srt)(?:\?|$)/i.test(item.url || '')); }
 function attachSubtitles(video) { videoEl.querySelectorAll('track').forEach((track) => track.remove()); subtitles(video).forEach((item, index) => { const track = document.createElement('track'); track.kind = 'captions'; track.label = item.subtitle_language || (index ? `Subtitle ${index + 1}` : 'English'); track.srclang = String(item.subtitle_language || 'en').split('-')[0].toLowerCase(); track.src = item.url; track.default = index === 0; videoEl.appendChild(track); }); }
-function normalize(video, tags) { return {...video, files: video.files || {}, display_title: video.display_title || video.title, upload_date: video.upload_date || video.date || '', human_date: video.human_date || video.date || '', formats: video.formats || [], tags: tags?.[video.video_id] || []}; }
+function normalize(video, tags = state.tags) { return {...video, files: video.files || {}, display_title: video.display_title || video.title, upload_date: video.upload_date || video.date || '', human_date: video.human_date || video.date || '', formats: video.formats || [], tags: tags?.[video.video_id] || []}; }
 const playlistSortControl = document.createElement('select'); playlistSortControl.className = 'library-select'; playlistSortControl.setAttribute('aria-label', 'Sort playlists'); playlistSortControl.innerHTML = '<option value="title">Playlists A–Z</option><option value="updated-desc">Playlists recently updated</option><option value="updated-asc">Playlists oldest updated</option>'; playlistSortControl.value = state.playlistSort;
 const playlistSelect = document.createElement('select'); playlistSelect.className = 'library-select'; playlistSelect.setAttribute('aria-label', 'Filter by playlist'); playlistSelect.innerHTML = '<option value="">All playlists</option>'; document.querySelector('.library-toolbar').append(playlistSortControl, playlistSelect);
 function populatePlaylists() { const ordered = [...state.playlists].filter((item) => !String(item.playlist_id).startsWith('RD')).sort((a, b) => state.playlistSort === 'title' ? String(a.title || a.playlist_id).localeCompare(String(b.title || b.playlist_id)) : state.playlistSort === 'updated-asc' ? Number(a.updated_at || 0) - Number(b.updated_at || 0) : Number(b.updated_at || 0) - Number(a.updated_at || 0)); playlistSelect.innerHTML = '<option value="">All playlists</option>' + ordered.map((item) => `<option value="${esc(item.playlist_id)}">${esc(item.title || item.playlist_id)}</option>`).join(''); playlistSelect.value = state.playlist; }
@@ -79,7 +79,59 @@ async function loadFast() {
   } catch (error) { $('library-grid').innerHTML = `<div class="empty">Could not load library: ${esc(error.message)}</div>`; }
 }
 
-document.querySelectorAll('[data-sort]').forEach((button) => button.onclick = () => { state.sort = button.dataset.sort; apply(); });
+// Keep the first page interactive while the remaining catalog pages arrive.
+// The older loader above is retained only as a reference for the migration;
+// this implementation is the active path.
+loadFast = async function progressiveLoadFast() {
+  const generation = ++state.generation;
+  state.loading = true; state.nextPage = 1; state.pages = 1; state.total = 0; state.items = []; state.tags = {};
+  try {
+    const params = new URLSearchParams(location.search);
+    state.query = params.get('q') || ''; state.artist = params.get('artist') || ''; state.playlist = params.get('playlist') || '';
+    state.sort = params.get('sort') || state.sort || 'date-desc'; state.view = params.get('view') || state.view;
+    $('library-search').value = state.query;
+    const response = await fetch(`/api/media/library?page=1&per_page=30&sort=${encodeURIComponent(state.sort)}`, {cache: 'no-store'});
+    const first = await response.json();
+    if (generation !== state.generation) return;
+    if (first.initializing) { $('library-grid').innerHTML = `<div class="empty">${esc(first.message || 'Media catalog is still building…')}<br><small>Retrying automatically.</small></div>`; $('library-sub').textContent = 'Catalog startup scan in progress…'; setTimeout(loadFast, 3000); return; }
+    if (!response.ok) throw new Error(first.error || `HTTP ${response.status}`);
+    state.total = first.total || 0; state.pages = first.pages || 1; state.nextPage = 2;
+    state.items = (first.videos || []).map(normalize); apply();
+    $('library-sub').textContent = `Showing ${state.items.length} of ${state.total} cataloged videos…`;
+    const pagesDone = (async () => {
+      while (generation === state.generation && state.nextPage <= state.pages) {
+        const page = state.nextPage++;
+        try {
+          const nextResponse = await fetch(`/api/media/library?page=${page}&per_page=30&sort=${encodeURIComponent(state.sort)}`, {cache: 'no-store'});
+          const next = await nextResponse.json();
+          if (!nextResponse.ok) throw new Error(next.error || `HTTP ${nextResponse.status}`);
+          if (generation !== state.generation) return;
+          state.items = state.items.concat((next.videos || []).map(normalize)); apply();
+          $('library-sub').textContent = `Showing ${state.items.length} of ${state.total} cataloged videos…`;
+          await new Promise((resolve) => setTimeout(resolve, 0));
+        } catch (_) { break; }
+      }
+      if (generation === state.generation) { state.loading = false; $('library-sub').textContent = `${state.items.length} cataloged videos`; apply(); }
+    })();
+    try {
+      const playlistData = await (await fetch('/api/media/playlists', {cache: 'no-store'})).json();
+      if (generation !== state.generation) return;
+      state.playlists = playlistData.playlists || []; populatePlaylists(); if (state.playlist) await selectPlaylist(state.playlist);
+    } catch (_) { /* playlist filtering is optional */ }
+    try {
+      const tagData = await (await fetch('/api/media/tags', {cache: 'no-store'})).json();
+      if (generation !== state.generation) return;
+      state.tags = {}; Object.entries(tagData.videos_by_tag || {}).forEach(([tag, videos]) => videos.forEach((video) => (state.tags[video.video_id] ||= []).push(tag)));
+      state.items = state.items.map(normalize); apply();
+    } catch (_) { /* tags are optional; keep the loaded library visible */ }
+    await pagesDone;
+    renderQueue();
+  } catch (error) {
+    if (generation === state.generation) { state.loading = false; $('library-grid').innerHTML = `<div class="empty">Could not load library: ${esc(error.message)}</div>`; }
+  }
+};
+
+document.querySelectorAll('[data-sort]').forEach((button) => button.onclick = () => { if (state.sort !== button.dataset.sort) { state.sort = button.dataset.sort; updateUrl(); loadFast(); } });
 document.querySelectorAll('[data-view]').forEach((button) => button.onclick = () => { state.view = button.dataset.view; localStorage.setItem('dihi-view', state.view); apply(); });
 playlistSortControl.onchange = () => { state.playlistSort = playlistSortControl.value; localStorage.setItem('dihi-playlist-sort', state.playlistSort); populatePlaylists(); };
 playlistSelect.onchange = () => selectPlaylist(playlistSelect.value);

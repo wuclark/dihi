@@ -5,6 +5,7 @@ runtime acceleration index and can be deleted and rebuilt at any time.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sqlite3
@@ -18,7 +19,7 @@ CREATE TABLE IF NOT EXISTS videos (
   video_id TEXT NOT NULL, source_root TEXT NOT NULL, channel_id TEXT NOT NULL, title TEXT,
   artist TEXT, album TEXT, uploader TEXT, track TEXT, upload_date TEXT, duration REAL,
   metadata_json TEXT NOT NULL, files_json TEXT NOT NULL, scanned_at REAL NOT NULL,
-  formats_json TEXT NOT NULL DEFAULT '[]',
+  formats_json TEXT NOT NULL DEFAULT '[]', scan_fingerprint TEXT NOT NULL DEFAULT '',
   PRIMARY KEY(video_id, source_root)
 );
 CREATE TABLE IF NOT EXISTS video_tags (video_id TEXT NOT NULL, tag TEXT NOT NULL,
@@ -104,6 +105,20 @@ def _formats(path: Path) -> list[dict[str, Any]]:
     return []
 
 
+def _scan_fingerprint(path: Path) -> str:
+    """Fingerprint one video folder without parsing its metadata."""
+    try:
+        entries = []
+        for item in sorted(path.iterdir(), key=lambda candidate: candidate.name):
+            if not item.is_file():
+                continue
+            stat = item.stat()
+            entries.append(f"{item.name}\0{stat.st_size}\0{stat.st_mtime_ns}")
+    except OSError:
+        return ""
+    return hashlib.sha256("\n".join(entries).encode("utf-8", "surrogateescape")).hexdigest()
+
+
 def _files(path: Path, channel_id: str, video_id: str, source_root: str) -> dict[str, dict[str, Any]]:
     result = {}
     for item in path.iterdir():
@@ -151,8 +166,13 @@ def _files(path: Path, channel_id: str, video_id: str, source_root: str) -> dict
 
 
 def refresh(merged_dir: Path | list[Path], database: Path, archive: Path | None = None,
-            playlist_metadata_dir: Path | None = None) -> int:
-    """Scan all local video directories and return the indexed video count."""
+            playlist_metadata_dir: Path | None = None,
+            only_video_ids: set[str] | None = None) -> int:
+    """Scan local video directories and return the indexed video count.
+
+    ``only_video_ids`` performs a non-pruning incremental refresh for completed
+    downloads. Normal calls retain full rebuild/reconcile behavior.
+    """
     roots = [Path(merged_dir)] if isinstance(merged_dir, (str, Path)) else [Path(p) for p in merged_dir]
     database.parent.mkdir(parents=True, exist_ok=True)
     count = 0
@@ -166,42 +186,59 @@ def refresh(merged_dir: Path | list[Path], database: Path, archive: Path | None 
             db.execute("ALTER TABLE videos ADD COLUMN formats_json TEXT NOT NULL DEFAULT '[]'")
         if "track" not in {row[1] for row in db.execute("PRAGMA table_info(videos)")}:
             db.execute("ALTER TABLE videos ADD COLUMN track TEXT")
+        if "scan_fingerprint" not in {row[1] for row in db.execute("PRAGMA table_info(videos)")}:
+            db.execute("ALTER TABLE videos ADD COLUMN scan_fingerprint TEXT NOT NULL DEFAULT ''")
         for root in roots:
           # ``merged/`` and legacy ``data/merged/`` share a basename.
           source_root = "legacy" if root.as_posix().rstrip("/").endswith("data/merged") else _SOURCE_ROOT_ALIASES.get(root.name, root.name)
           known_roots.add(source_root)
           seen_video_ids: set[str] = set()
+          fingerprints = {
+              row[0]: row[1]
+              for row in db.execute(
+                  "SELECT video_id, scan_fingerprint FROM videos WHERE source_root = ?",
+                  (source_root,),
+              )
+          }
           for channel_dir in sorted(root.iterdir()) if root.is_dir() else []:
             if not channel_dir.is_dir():
                 continue
             for video_dir in sorted(channel_dir.iterdir()):
                 if not video_dir.is_dir():
                     continue
+                video_id = video_dir.name
+                if only_video_ids is not None and video_id not in only_video_ids:
+                    continue
+                seen_video_ids.add(video_id)
+                fingerprint = _scan_fingerprint(video_dir)
+                if only_video_ids is None and fingerprints.get(video_id) == fingerprint and fingerprint:
+                    count += 1
+                    continue
                 info = _info(video_dir)
                 if info.get("_type") == "playlist":
                     continue
-                video_id = video_dir.name
-                seen_video_ids.add(video_id)
                 uploader = info.get("uploader") or info.get("channel") or channel_dir.name
                 artist = info.get("artist") or info.get("creator") or uploader
                 track = info.get("track") or ""
                 album = info.get("album") or info.get("playlist_title") or "Uncategorized"
                 db.execute("""INSERT INTO videos
                   (video_id, source_root, channel_id, title, artist, album, uploader, track, upload_date,
-                  duration, metadata_json, files_json, scanned_at, formats_json)
-                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s','now'), ?)
+                  duration, metadata_json, files_json, scanned_at, formats_json, scan_fingerprint)
+                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s','now'), ?, ?)
                   ON CONFLICT(video_id, source_root) DO UPDATE SET
                    channel_id=excluded.channel_id, title=excluded.title,
                    artist=excluded.artist, album=excluded.album, uploader=excluded.uploader,
                    track=excluded.track,
                    upload_date=excluded.upload_date, duration=excluded.duration,
                    metadata_json=excluded.metadata_json, files_json=excluded.files_json,
-                   scanned_at=excluded.scanned_at, formats_json=excluded.formats_json""", (
+                   scanned_at=excluded.scanned_at, formats_json=excluded.formats_json,
+                   scan_fingerprint=excluded.scan_fingerprint""", (
                     video_id, source_root, channel_dir.name, info.get("title") or video_id,
                     str(artist), str(album), str(uploader), str(track), info.get("upload_date"),
                     info.get("duration"), json.dumps(info, ensure_ascii=False, default=str),
                     json.dumps(_files(video_dir, channel_dir.name, video_id, source_root), ensure_ascii=False),
                     json.dumps(_formats(video_dir), ensure_ascii=False, default=str),
+                    fingerprint,
                 ))
                 db.execute("DELETE FROM video_tags WHERE video_id = ?", (video_id,))
                 for tag in info.get("tags") or []:
@@ -232,6 +269,8 @@ def refresh(merged_dir: Path | list[Path], database: Path, archive: Path | None 
                          info.get("title") or video_id, info.get("webpage_url")),
                     )
                 count += 1
+          if only_video_ids is not None:
+              continue
           if seen_video_ids:
               placeholders = ",".join("?" for _ in seen_video_ids)
               db.execute(
@@ -240,7 +279,7 @@ def refresh(merged_dir: Path | list[Path], database: Path, archive: Path | None 
               )
           else:
               db.execute("DELETE FROM videos WHERE source_root = ?", (source_root,))
-        if archive and Path(archive).is_file():
+        if only_video_ids is None and archive and Path(archive).is_file():
             db.execute("DELETE FROM archive_entries")
             rows = db.execute("SELECT video_id, files_json FROM videos").fetchall()
             indexed = {}
@@ -257,7 +296,7 @@ def refresh(merged_dir: Path | list[Path], database: Path, archive: Path | None 
                 has_partial = any(name.endswith((".part", ".ytdl")) for name in files)
                 status = "complete" if has_primary else "interrupted" if has_partial else "missing"
                 db.execute("INSERT OR REPLACE INTO archive_entries VALUES (?, ?, strftime('%s','now'))", (video_id, status))
-        if playlist_metadata_dir and Path(playlist_metadata_dir).is_dir():
+        if only_video_ids is None and playlist_metadata_dir and Path(playlist_metadata_dir).is_dir():
             for descriptor_path in sorted(Path(playlist_metadata_dir).glob("*.info.json")):
                 try:
                     descriptor = json.loads(descriptor_path.read_text(encoding="utf-8"))

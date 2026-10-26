@@ -137,7 +137,11 @@ def test_immediate_video_request_promotes_existing_paused_item(monkeypatch, tmp_
     db = tmp_path / "catalog.db"
     monkeypatch.setattr(app3, "CATALOG_DB", db)
     monkeypatch.setattr(app3, "_queue_wakeup", type(
-        "NoopEvent", (), {"set": lambda self: None, "clear": lambda self: None}
+        "NoopEvent", (), {
+            "set": lambda self: None,
+            "clear": lambda self: None,
+            "wait": lambda self, _timeout=None: None,
+        }
     )())
     paused_id = app3.catalog.queue_add(db, "dQw4w9WgXcQ", "video", status="paused")
 

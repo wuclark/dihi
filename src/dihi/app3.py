@@ -142,7 +142,7 @@ _PLAYLIST_INDEX_CACHE = Path(os.environ.get("DIHI_PLAYLIST_INDEX_CACHE", str(DAT
 _DERIVED_CACHE_DIR = Path(os.environ.get("DIHI_DERIVED_CACHE_DIR", str(DATA_ROOT / "derived-cache"))).expanduser().resolve()
 _TAGS_CACHE = _DERIVED_CACHE_DIR / "tags.json"
 _EXPORTS_CACHE = _DERIVED_CACHE_DIR / "exports.json"
-_READINESS_VERSION = 2
+_READINESS_VERSION = 3
 _catalog_ready = threading.Event()
 _available_catalog_ids: set[str] = set()
 _playlist_index_cache_key: str | None = None
@@ -150,6 +150,7 @@ _playlist_index_cache_cards: list[dict] | None = None
 _playlist_index_build_lock = threading.Lock()
 _catalog_refresh_lock = threading.Lock()
 _catalog_refresh_timer: threading.Timer | None = None
+_catalog_refresh_dirty = False
 _system_status_cache: tuple[float, dict] | None = None
 _catalog_refresh_state: dict = {
     "phase": "starting", "source": "startup", "started_at": None,
@@ -385,22 +386,63 @@ def _refresh_catalog_body(source: str = "startup") -> None:
         _catalog_ready.set()
 
 
-def _refresh_catalog(source: str | None = None) -> None:
+def _refresh_catalog_video(video_id: str) -> None:
+    """Index one completed video without parsing the full archive."""
+    global _catalog_refresh_dirty
+    if not YOUTUBE_ID_RE.match(str(video_id)):
+        return
     if not _catalog_refresh_lock.acquire(blocking=False):
-        app.logger.info("Catalog refresh already running")
+        with _lock:
+            _catalog_refresh_dirty = True
+        app.logger.info("Deferring incremental catalog update for %s; refresh already running", video_id)
         return
     try:
+        count = catalog.refresh(
+            [MERGED_DIR, LEGACY_MERGED_DIR, FALLBACK_DIR],
+            CATALOG_DB,
+            only_video_ids={str(video_id)},
+        )
+        app.logger.info("Incremental catalog update: %s (%d source row(s))", video_id, count)
+    except Exception:
         with _lock:
-            refresh_source = source or str(_catalog_refresh_state.get("source") or "startup")
-        _refresh_catalog_body(refresh_source)
+            _catalog_refresh_dirty = True
+        app.logger.exception("Incremental catalog update failed for %s", video_id)
     finally:
         _catalog_refresh_lock.release()
 
 
-def _request_catalog_refresh(reason: str = "change", delay: float = 1.5) -> None:
-    """Coalesce bursts of post-download catalog refresh requests."""
-    global _catalog_refresh_timer
+def _refresh_catalog(source: str | None = None) -> None:
+    global _catalog_refresh_dirty, _catalog_refresh_timer
+    if not _catalog_refresh_lock.acquire(blocking=False):
+        with _lock:
+            _catalog_refresh_dirty = True
+        app.logger.info("Catalog refresh already running")
+        return
+    try:
+        with _lock:
+            _catalog_refresh_timer = None
+            _catalog_refresh_dirty = False
+            refresh_source = source or str(_catalog_refresh_state.get("source") or "startup")
+        _refresh_catalog_body(refresh_source)
+    finally:
+        _catalog_refresh_lock.release()
     with _lock:
+        rerun = _catalog_refresh_dirty and not _active_downloads
+    if rerun:
+        _request_catalog_refresh("changes during catalog refresh", delay=1.5)
+
+
+def _request_catalog_refresh(reason: str = "change", delay: float = 1.5) -> None:
+    """Refresh once after the queue is idle, coalescing completion bursts."""
+    global _catalog_refresh_timer, _catalog_refresh_dirty
+    with _lock:
+        _catalog_refresh_dirty = True
+        if _active_downloads:
+            app.logger.info("Deferring catalog refresh until the download queue is idle (%s)", reason)
+            return
+        if _catalog_refresh_lock.locked():
+            app.logger.info("Deferring catalog refresh; current scan will reconcile it (%s)", reason)
+            return
         if _catalog_refresh_timer and _catalog_refresh_timer.is_alive():
             app.logger.info("Catalog refresh already scheduled (%s)", reason)
             return
@@ -1061,6 +1103,7 @@ def _download_worker(video_id: str, cookies_browser: str | None = None, queue_it
             if queue_item_id:
                 catalog.queue_set_status(CATALOG_DB, queue_item_id, "paused", error="paused by user", finished_at=None)
         elif success:
+            _refresh_catalog_video(video_id)
             _request_catalog_refresh("completed download")
             catalog.record_attempt(CATALOG_DB, video_id, "completed", "authenticated" if cookies_browser else "standard", "", True, started_at, time.time())
             if queue_item_id:
@@ -2989,9 +3032,20 @@ def api_media_playlist_finish(playlist_id: str):
     """Queue each incomplete member independently so one unavailable video cannot block the playlist."""
     if not PLAYLIST_ID_RE.match(playlist_id):
         return jsonify(error="invalid playlist id"), 400
-    if not any(item["playlist_id"] == playlist_id for item in catalog.playlists(CATALOG_DB)):
-        return jsonify(error="playlist not found"), 404
-    members = catalog.playlist_video_ids(CATALOG_DB, playlist_id)
+    # The playlist page may be served from the descriptor JSON while the
+    # rebuildable catalog is still locked, or before its membership rows have
+    # been imported. Use that same descriptor as the action's source of truth
+    # so a visible playlist can always queue its saved members.
+    snapshot = _fast_playlist_snapshot(playlist_id)
+    if snapshot is not None:
+        members = snapshot[1]
+    else:
+        try:
+            if not any(item["playlist_id"] == playlist_id for item in catalog.playlists(CATALOG_DB)):
+                return jsonify(error="playlist not found"), 404
+            members = catalog.playlist_video_ids(CATALOG_DB, playlist_id)
+        except (sqlite3.Error, OSError, ValueError):
+            return jsonify(error="playlist catalog is busy; try again shortly"), 503
     try:
         cards, _total = catalog.library_cards(CATALOG_DB)
     except (sqlite3.Error, OSError, ValueError):
@@ -3355,14 +3409,18 @@ def api_youtube_get(video_id: str):
     vid = _normalize_id(video_id)
     if not vid:
         return jsonify(ok=False, error="invalid video id"), 400
-    permanent = _permanent_failure(vid)
-    if permanent:
-        return jsonify(ok=False, error=f"not retryable: {permanent[0]} — {permanent[1]}"), 409
-    if _media_needs_archive_retry(vid):
-        _remove_from_archive(vid)
+    try:
+        permanent = _permanent_failure(vid)
+        if permanent:
+            return jsonify(ok=False, error=f"not retryable: {permanent[0]} — {permanent[1]}"), 409
+        if _media_needs_archive_retry(vid):
+            _remove_from_archive(vid)
 
-    queue_status = "pending" if catalog.setting(CATALOG_DB, "default_download_mode", "immediate") == "immediate" else "paused"
-    item_id, already_queued = _enqueue_target(vid, "video", status=queue_status)
+        queue_status = "pending" if catalog.setting(CATALOG_DB, "default_download_mode", "immediate") == "immediate" else "paused"
+        item_id, already_queued = _enqueue_target(vid, "video", status=queue_status)
+    except (OSError, sqlite3.Error, ValueError) as exc:
+        app.logger.warning("Could not queue video %s: %s", vid, exc)
+        return jsonify(ok=False, error="download queue is temporarily unavailable; try again shortly"), 503
 
     return jsonify(
         ok=True,

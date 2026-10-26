@@ -3,8 +3,49 @@ DIHI handoff notes
 
 Date: 2026-10-20
 
+Latest continuation
+-------------------
+
+- Fixed the scheduler test double warning by adding the missing `wait()` method
+  to the pure-test `NoopEvent`.
+- Improved the active Library loader so the first 30 cards render immediately
+  while later catalog pages load in the background. Sort changes invalidate the
+  previous load and restart pagination cleanly; tags and playlist filters remain
+  applied as data arrives.
+- Bumped the Library JavaScript cache-buster to `library.js?v=11`.
+- Verification: `node --check src/dihi/static/js/library.js`, `git diff
+  --check`, and `venv/bin/pytest` all pass; the full suite is 186 passed and
+  3 skipped. `make test-docker` also passes all 3 live smoke tests after a
+  rebuilt container.
+
 Current continuation
 --------------------
+
+- Fixed playlist bulk download queuing when a saved descriptor is visible but
+  its SQLite membership rows are missing or temporarily unavailable. The
+  finish endpoint now uses descriptor members first, returns JSON for a busy
+  catalog, and loaded per-video buttons update to “Queued” after success.
+- Added an HTTP regression test for descriptor-only playlist finishing.
+- Fixed individual playlist-member Download buttons returning an HTML 500
+  parser error during transient catalog/queue failures. The API now returns a
+  JSON 503 with a retryable message, and the browser uses the safe JSON parser
+  for this action too.
+- Latest verification: `venv/bin/pytest` passed 184 tests with 3 Docker smoke
+  tests skipped; `git diff --check` passed.
+- Implemented catalog performance improvements: completed videos use a
+  targeted incremental refresh, full refreshes wait for queue idle and mark
+  changes during a scan dirty for one follow-up pass, and unchanged video
+  folders are skipped using a persisted scan fingerprint. Added catalog tests
+  for fingerprint skipping and non-pruning incremental updates.
+- Bumped the startup readiness version so existing installations perform one
+  migration scan to populate fingerprints after upgrade.
+- Clarified the two download pages: `/downloads` is now labeled Download
+  activity and keeps monitoring, history, failures, and a queue summary;
+  `/queue` is labeled Queue & controls and owns queue actions, scheduling,
+  batch input, and concurrency settings. Removed duplicate start/clear queue
+  controls from the activity page without changing backend routes.
+- Latest performance-change verification: focused catalog/app tests passed 104
+  tests; full-suite verification remains to be run after the final docs check.
 
 - The Library redesign is committed; the current worktree has only the
   housekeeping edits from this continuation pending local commit.
